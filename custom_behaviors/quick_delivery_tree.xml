@@ -1,0 +1,100 @@
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence>
+      <Script
+        code="audio_short_punchy_path := robot_task_backend_path + '/sound/short-punchy-sine-wave.mp3'" />
+
+      <PlayAudio file_path="{audio_short_punchy_path}" async="true" volume="90" />
+      <DockRobot dock_method="undocking" dock_name="{dock_name}" dock_type="{dock_type}"
+        max_staging_time="{dock_max_staging_time}" _skipIf="!docking_feature_enabled" />
+
+      <!-- Main Delivery Loop -->
+      <CheckBatteryLevel min_level="20.0" />
+
+
+      <!-- Set velocity smoother parameters (double arrays for [x, y, theta]) -->
+      <ParamSet node_name="velocity_smoother"
+        param_name="max_velocity"
+        param_value="{max_speed_array}"
+        param_type="double_array" />
+      <ParamSet node_name="velocity_smoother"
+        param_name="max_accel"
+        param_value="{max_accel_array}"
+        param_type="double_array" />
+      <ParamSet node_name="velocity_smoother"
+        param_name="max_decel"
+        param_value="{max_decel_array}"
+        param_type="double_array" />
+      <!-- Set inflation radius in the global costmap -->
+      <ParamSet node_name="global_costmap/global_costmap"
+        param_name="inflation_layer.inflation_radius"
+        param_value="{inflation_radius}"
+        param_type="double" />
+
+      <!-- Optionally set cost scaling factor -->
+      <ParamSet node_name="global_costmap/global_costmap"
+        param_name="inflation_layer.cost_scaling_factor"
+        param_value="{cost_scaling}"
+        param_type="double" />
+
+
+      <Sequence>
+        <LoadNextDelivery />
+
+
+        <!-- TODO: go to patient.. starts  -->
+        <!-- <RetryUntilSuccessful num_attempts="10">
+              <NavigateTo location="{bed_location}" />
+            </RetryUntilSuccessful> -->
+        <Parallel success_count="2" failure_count="1">
+          <SpeakText text="{message_to_play}"
+            voice="en_US-amy-medium"
+            speed="0.9"
+            volume="100"
+          />
+          <NotifyPatient tray="{current_tray}" />
+        </Parallel>
+        <SpeakText text="Thank you for using our service. Have a great day!"
+          voice="en_US-amy-medium"
+          speed="0.9"
+          volume="100"
+        />
+
+
+      </Sequence>
+
+      <DockRobot dock_method="docking" dock_name="{dock_name}" dock_type="{dock_type}"
+        max_staging_time="{dock_max_staging_time}" _skipIf="!docking_feature_enabled" />
+
+      <ParamSet node_name="velocity_smoother"
+        param_name="max_velocity"
+        param_value="{max_return_speed_array}"
+        param_type="double_array" />
+      <!-- <NavigateTo location="{auto_docking_location}" _skipIf="docking_feature_enabled" /> -->
+
+
+    </Sequence>
+  </BehaviorTree>
+
+
+  <TreeNodesModel>
+    <Action ID="LoadNextDelivery" />
+    <Action ID="NavigateTo">
+      <input_port name="location" />
+    </Action>
+    <Action ID="LoadItems" />
+    <Action ID="NotifyPatient">
+      <input_port name="tray" />
+    </Action>
+    <Action ID="JSONPublisher">
+      <input_port name="type" />
+      <input_port name="task" />
+      <input_port name="param1" />
+      <input_port name="param2" />
+    </Action>
+    <Action ID="CheckBatteryLevel">
+      <input_port name="min_level" />
+    </Action>
+  </TreeNodesModel>
+
+</root>

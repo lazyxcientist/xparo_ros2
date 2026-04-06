@@ -1,0 +1,14 @@
+xparo_c:
+  ros__parameters:
+    example_param: "abc"
+
+xparo:
+  ros__parameters:
+    xparo_secret_key: "default_value"
+    xparo_project_id: "default_value"
+    xparo_chatgpt_api_key: "your-api-key"
+    xparo_connection_type: "hybrid"
+    xparo_custom_aiml_path: "./aiml"
+    xparo_custom_sets_path: "./sets"
+    xparo_custom_maps_path: "./maps"
+
