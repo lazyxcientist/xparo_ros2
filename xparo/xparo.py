@@ -228,7 +228,6 @@ class Engine():
     def on_ws_message(self, ws, message):
         print(message)
         print("json recived...")
-        print(type(message))
         if type(message)!=dict:
             message = json.loads(message)
         for k,val in message.items():

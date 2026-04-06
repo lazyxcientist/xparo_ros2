@@ -38,8 +38,8 @@ class Xparo(Node):
         # xparo_config.get("", "")
         ################################################
         ## parameters
-        self.xparo_project_id = self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "d6f86221-67c4-4068-9ac4-05c95e9b5ca9")  ).value
-        self.xparo_secret_key = self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "135b4434b014355ee4bfab455bb6d81a09463a169b6b6bc70907f0946c9a995c") ).value
+        self.xparo_project_id = self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value
+        self.xparo_secret_key = self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value
         self.xparo_connection_type = self.declare_parameter("xparo_connection_type", xparo_config.get("xparo_connection_type", "websocket")  ).value
         self.xparo_folder = self.declare_parameter("xparo_folder", base_path_for_package  ).value
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
