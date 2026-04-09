@@ -10,7 +10,7 @@ try:
 except:
     from xparo.database import XP_Database
 
-local = True
+local = False
 
 # Status mapping
 STATUS_MAP = {
