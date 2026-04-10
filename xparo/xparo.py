@@ -11,6 +11,8 @@ except:
     from xparo.database import XP_Database
 
 local = False
+record_bags = False
+xparo_database_size =  80
 
 # Status mapping
 STATUS_MAP = {
@@ -35,9 +37,9 @@ class Xparo_socket(websocket.WebSocketApp):
 
 class Engine():
     def __init__(self,secret_key,project_id,connection_type = "websocket"):
+        global xparo_database_size
         self.websocket_connected = False
         self.tmp_folder = "."
-        xparo_database_size = 100
         xparo_database_path = os.path.join(self.tmp_folder,"xparo",project_id,'database')
         self.BAG_DIR = os.path.join(self.tmp_folder,"xparo",project_id,'ros_bags')
         self.xparo_folder = os.path.abspath(os.path.join( os.path.dirname(__file__), os.pardir))
@@ -51,7 +53,7 @@ class Engine():
         self.xparo_custom_behaviors_folder_path = os.path.join(self.xparo_folder,'custom_behaviors')
         self.xparo_custom_files_folder_path = os.path.join(self.xparo_folder,'custom_files')
         self.xparo_custom_evns_folder_path = os.path.join(self.xparo_folder,'custom_envs')
-        self.record_bags = False
+        self.record_bags = record_bags
         self.files = {'behavior'         : self.xparo_behavior_path,
                     'file'         : self.xparo_file_path,
                     'env'         : self.xparo_env_path,

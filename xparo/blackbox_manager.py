@@ -17,7 +17,7 @@ class BlackboxOrchestrator:
         self.recorder_process = None
         self.running = True
         self.ROBOT_ID = ROBOT_ID
-        self.API_TOKEN ="b38885455b8b0da286d92b8ee226458d8f136bdf"
+        self.API_TOKEN ="2ec6003e332a15a5a70bee22e8e1a14218f14f67"
         self.xparo_website_url = xparo_website_url
         self.BAG_DIR = BAG_DIR
         self.CONFIG_PATH = os.path.join(self.BAG_DIR, "blackbox_record.yaml")
