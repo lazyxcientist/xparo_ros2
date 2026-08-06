@@ -225,6 +225,10 @@ class Engine():
         except Exception as e:
             print(e)
             if command_for!="rest":
+                # The socket may have died without a clean close frame (common on
+                # flaky networks) -- on_ws_close never fires, so websocket_connected
+                # stays incorrectly True and connect() would otherwise no-op forever.
+                self.websocket_connected = False
                 self.connect()
 
     def on_ws_message(self, ws, message):
