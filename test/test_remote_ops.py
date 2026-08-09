@@ -144,6 +144,28 @@ def test_handle_delete_file_path_traversal_denied(tmp_path):
         outside.unlink(missing_ok=True)
 
 
+def test_handle_delete_file_denies_sibling_directory_prefix_match(tmp_path):
+    """A bare startswith(base) guard (the pattern this was ported from)
+    would wrongly accept a sibling directory whose name happens to share
+    base's string as a prefix, e.g. base=".../data" matching
+    ".../data_evil/x" -- confirms the os.sep-boundary check actually closes
+    that, not just the plain "../" case the other traversal test covers.
+    """
+    base = tmp_path / "data"
+    base.mkdir()
+    sibling = tmp_path / "data_evil"
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("secret")
+    try:
+        responses = []
+        remote_ops.handle_delete_file(str(base), "../data_evil/secret.txt", responses.append)
+        assert responses[0]["DELETE_ACK"]["success"] is False
+        assert "traversal" in responses[0]["DELETE_ACK"]["message"].lower()
+        assert (sibling / "secret.txt").exists()
+    finally:
+        (sibling / "secret.txt").unlink(missing_ok=True)
+
+
 def test_handle_delete_file_not_found(tmp_path):
     responses = []
     remote_ops.handle_delete_file(str(tmp_path), "nope.txt", responses.append)
@@ -203,6 +225,22 @@ def test_download_round_trip(tmp_path):
     reassembled = b"".join(base64.b64decode(c["data"]) for c in chunk_msgs)
     assert reassembled == b"a" * 200000
     assert complete_msgs[0]["expected"] == 200000
+
+
+def test_download_denies_sibling_directory_prefix_match(tmp_path):
+    base = tmp_path / "data"
+    base.mkdir()
+    sibling = tmp_path / "data_evil"
+    sibling.mkdir()
+    (sibling / "secret.bin").write_bytes(b"nope")
+    try:
+        session = remote_ops.FileTransferSession(str(base))
+        responses = []
+        session.handle_file_req({"filename": "../data_evil/secret.bin", "direction": "download"}, responses.append)
+        assert "error" in responses[0]
+        assert "traversal" in responses[0]["error"]["message"].lower()
+    finally:
+        (sibling / "secret.bin").unlink(missing_ok=True)
 
 
 def test_download_missing_file_sends_error(tmp_path):

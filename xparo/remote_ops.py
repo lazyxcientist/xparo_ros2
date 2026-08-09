@@ -11,6 +11,7 @@ see transports/base.py) without caring which one delivered the message --
 that's the actual point of Phase 2's Transport abstraction.
 """
 import base64
+import os
 import subprocess
 from pathlib import Path
 
@@ -148,13 +149,17 @@ def handle_list_files(base_dir, send_response):
 
 def handle_delete_file(base_dir, rel_path, send_response):
     """rel_path is untrusted input from the wire -- resolve() + a
-    startswith(base) check is the path-traversal guard (ported verbatim
-    from _delete_jetson_file).
+    startswith(base + os.sep) check is the path-traversal guard (the
+    original _delete_jetson_file this was ported from used a bare
+    startswith(base), which wrongly accepts a sibling directory whose name
+    happens to share base's string as a prefix, e.g. base="/x/data" would
+    let rel_path="../data_evil/f" through -- not reachable against this
+    package's fixed transfer_dir layout today, but cheap to close anyway).
     """
     base = Path(base_dir).resolve()
     try:
         target = (base / rel_path).resolve()
-        if not str(target).startswith(str(base)):
+        if target != base and not str(target).startswith(str(base) + os.sep):
             send_response({"DELETE_ACK": {"success": False, "message": "Path traversal denied"}})
             return
         if not target.exists():
@@ -218,8 +223,9 @@ class FileTransferSession:
 
             elif direction == "download":
                 rel = req.get("filename", "")
+                transfer_base = self.base_dir.resolve()
                 file_path = (self.base_dir / rel).resolve()
-                if not str(file_path).startswith(str(self.base_dir.resolve())):
+                if file_path != transfer_base and not str(file_path).startswith(str(transfer_base) + os.sep):
                     send_response({"error": {"message": "Path traversal denied"}})
                     return
                 if not file_path.exists():
