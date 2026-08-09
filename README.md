@@ -21,6 +21,11 @@ github: https://github.com/lazyxcientist/xparo_ros
 
 email:   xpassistantpersonal@gmail.com
 
+Looking to exercise everything this package's API can do (remote
+exec, teleop, file transfer, rosbag, credentials, ...) against a real
+running robot? See [TESTING.md](TESTING.md). For the automated `pytest`
+suite, see [test/README.md](test/README.md).
+
 
 
 <br>
