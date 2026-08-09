@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+import sys
+
+# print() throughout this process (here, engine.py, database.py,
+# transports/django_ws.py, ...) is how an operator running via `ros2 run`/
+# `ros2 launch` sees live connection status -- but Python fully
+# block-buffers stdout whenever it isn't a TTY, which is exactly what both
+# of those wrap it in (a pipe, to prefix each line with the node name).
+# Without this, real, successful output (connection banner, credential
+# issuance, synced project data) can sit invisible in the buffer for a
+# very long time, looking indistinguishable from a genuine hang -- this is
+# not hypothetical, it's exactly what made a real ros2 launch run look
+# stuck for tens of seconds despite the node having already connected
+# successfully. Reconfiguring here, once, at the real process entry point,
+# fixes it process-wide regardless of which module the print() is in.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
