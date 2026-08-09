@@ -4,4 +4,4 @@ vosk-model-*
 .vscode
 snap/xparo-ros_0.1_amd64.snap
 snap/xparo_0.1_amd64.snap
-snap/pypackage/
+snap/pypackage/__pycache__/

@@ -1,18 +1,19 @@
-import websocket
 import json
 import threading
-import requests
 import time
 import os
 from datetime import datetime
-try:
-    from .database import XP_Database
-except:
-    from xparo.database import XP_Database
+from .database import XP_Database
+from .transports.django_ws import DjangoWsTransport
+from . import remote_ops
 
-local = False
 record_bags = False
 xparo_database_size =  80
+
+# Pairs with apps.analytics.models.ROBOT_ONLINE_THRESHOLD_SECONDS (90s) on
+# the Django side -- sending every 30s tolerates one missed beat before a
+# robot flips to "offline" there.
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 # Status mapping
 STATUS_MAP = {
@@ -24,26 +25,31 @@ STATUS_MAP = {
 }
 
 
-
-############### websocket #############
-#######################################
-class Xparo_socket(websocket.WebSocketApp):
-    def __init__(self, *args, **kwargs):
-        super(Xparo_socket, self).__init__(*args, **kwargs)
-
-
-
-
-
 class Engine():
-    def __init__(self,secret_key,project_id,connection_type = "websocket"):
+    def __init__(self,secret_key,project_id,connection_type = "websocket",record_bags=record_bags,BAG_DIR=None,environment=None,rosbag_control=None,joy_publish=None,xparo_transport="django_ws",tethered_channels_config=None):
         global xparo_database_size
-        self.websocket_connected = False
         self.tmp_folder = "."
         xparo_database_path = os.path.join(self.tmp_folder,"xparo",project_id,'database')
-        self.BAG_DIR = os.path.join(self.tmp_folder,"xparo",project_id,'ros_bags')
+        # BAG_DIR must arrive through the constructor, same reasoning as
+        # record_bags just below -- XP_Database (and, if recording, the
+        # BlackboxOrchestrator it starts) is built before __init__ returns,
+        # so a caller setting self.BAG_DIR afterward (as xparo_ros.py used
+        # to) has no effect on where bags actually get written.
+        self.BAG_DIR = BAG_DIR or os.path.join(self.tmp_folder,"xparo",project_id,'ros_bags')
         self.xparo_folder = os.path.abspath(os.path.join( os.path.dirname(__file__), os.pardir))
         self.connection_type = connection_type #"websocket" # "rest" , "websocket" , "hybrid" , "offline"
+        # joy_publish(axes, buttons) -> None -- publishing a real
+        # sensor_msgs/Joy message needs an actual ROS2 node context, which
+        # Engine deliberately doesn't depend on (it's usable standalone --
+        # see the __main__ block at the bottom of this file). xparo_ros.py
+        # supplies the real one; defaults to a no-op so TELEOP is a safe
+        # no-op (still acks) rather than a crash outside a live node.
+        self.joy_publish = joy_publish or (lambda axes, buttons: None)
+        # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
+        # separate from BAG_DIR (rosbag sessions) and the xparo_* config
+        # paths below (behavior trees/env/properties, a different concept).
+        self.transfer_dir = os.path.join(self.xparo_folder, 'transferred_files')
+        self.file_transfer = remote_ops.FileTransferSession(self.transfer_dir)
 
         self.xparo_behavior_path = os.path.join(self.xparo_folder,'config','default.xml')
         self.xparo_file_path = os.path.join(self.xparo_folder,'config','default.txt')
@@ -53,6 +59,14 @@ class Engine():
         self.xparo_custom_behaviors_folder_path = os.path.join(self.xparo_folder,'custom_behaviors')
         self.xparo_custom_files_folder_path = os.path.join(self.xparo_folder,'custom_files')
         self.xparo_custom_evns_folder_path = os.path.join(self.xparo_folder,'custom_envs')
+        # Per-robot credential (apps/analytics/models.py's RobotCredential),
+        # issued once by ADD_robots_info the first time this device_id is
+        # ever seen and persisted here so every reconnect after that uses
+        # it instead of the project-wide secret_key constructor arg -- see
+        # the ROBOT_CREDENTIAL branch in on_ws_message below for where it's
+        # written, and the loader right after this dict for where it's read
+        # back on startup.
+        self.xparo_credential_path = os.path.join(self.xparo_folder,'config','credential.json')
         self.record_bags = record_bags
         self.files = {'behavior'         : self.xparo_behavior_path,
                     'file'         : self.xparo_file_path,
@@ -63,69 +77,104 @@ class Engine():
                     'xparo_custom_files_folder_path'   : self.xparo_custom_files_folder_path,
                     'xparo_custom_evns_folder_path'   : self.xparo_custom_evns_folder_path,
                         }
-        
 
-        website_url = ("http" if local else "https") + '://'+('127.0.0.1:8000' if local else 'xparo.in')
-        socket_url = ("ws" if local else "wss") + '://'+('127.0.0.1:8000' if local else 'xparo.in')
-        self.website_full_url = website_url +'/chatbot_api/'+secret_key+'/'+project_id+'/'
-        self.socket_full_url = socket_url + '/ws/chatbot_api/'+str(secret_key)+'/'+str(project_id)+'/'
+        effective_secret = self._load_persisted_credential() or secret_key
 
+        # Everything about *how* a message actually gets to its peer lives
+        # in the transport (see transports/base.py's Transport ABC
+        # docstring) -- Engine only knows how to build/interpret messages,
+        # and drives the transport through on_message (dispatch table
+        # below) and on_connected (initial handshake). xparo_transport
+        # picks which one: "django_ws" (networked robots, the only option
+        # that existed before Phase 4) or "tethered_tcp" (a physically-
+        # tethered ROV with no path to Django at all -- see
+        # transports/tethered_tcp.py's module docstring). Both call the
+        # exact same on_ws_message dispatch table below.
+        if xparo_transport == "tethered_tcp":
+            from .transports.tethered_tcp import TetheredTcpTransport
+            self.transport = TetheredTcpTransport(
+                on_message=self.on_ws_message,
+                on_connected=self.send_initial_data,
+                channels_config=tethered_channels_config,
+            )
+        else:
+            self.transport = DjangoWsTransport(
+                effective_secret, project_id,
+                on_message=self.on_ws_message,
+                on_connected=self.send_initial_data,
+                connection_type=connection_type,
+                environment=environment,
+            )
 
+        # tethered_tcp has no Django to talk to at all (that's the whole
+        # reason it exists) -- website_base_url only exists on
+        # DjangoWsTransport. record_bags still records locally either way
+        # (RosbagControl doesn't touch Django); the cloud-upload half of
+        # that feature (BlackboxOrchestrator._process_uploads) simply has
+        # nowhere to POST to under tethered_tcp and safely no-ops (its own
+        # try/except already treats a failed upload as "retry next cycle",
+        # not a crash).
+        xparo_website_url = getattr(self.transport, 'website_base_url', None)
         self.local_database = XP_Database(xparo_database_size,
                                             xparo_database_path,
-                                            website_url,
-                                            self.BAG_DIR,self.record_bags)
+                                            xparo_website_url,
+                                            self.BAG_DIR,self.record_bags,rosbag_control)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
         except:
             print("you are offline")
 
+    def _load_persisted_credential(self):
+        """Returns the raw credential value from a prior ROBOT_CREDENTIAL
+        response, or None if this device has never been issued one yet
+        (brand new robot, or a pre-Phase-1 deployment that hasn't
+        reconnected since). Never raises -- a missing/corrupt file just
+        means "fall back to the constructor's secret_key", same as before
+        this existed.
+        """
+        try:
+            with open(self.xparo_credential_path, 'r') as file:
+                return json.load(file).get('value') or None
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
 
+    def _persist_credential(self, raw_value):
+        os.makedirs(os.path.dirname(self.xparo_credential_path), exist_ok=True)
+        with open(self.xparo_credential_path, 'w') as file:
+            json.dump({'value': raw_value}, file)
 
     def _logging_update_loop(self):
-        while not self.local_database._stop_updates:
-            time.sleep(self.local_database.update_interval)
-            if self.local_database.session_id:
-                self.local_database.update_logging_session(self.private_send)
+        # Heartbeat runs unconditionally, every HEARTBEAT_INTERVAL_SECONDS,
+        # independent of _stop_updates/session_id -- Robots.is_online must
+        # not depend on a rosbag/logging session being active. The original
+        # resource/log-session update keeps its own cadence and gating,
+        # folded into the same loop rather than a second thread.
+        seconds_since_resource_update = 0
+        while True:
+            time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+            self.private_send(json.dumps({"ROBOT_HEARTBEAT": {"device_id": self.local_database.unique_id}}),
+                               command_for="rest")
+
+            seconds_since_resource_update += HEARTBEAT_INTERVAL_SECONDS
+            if seconds_since_resource_update >= self.local_database.update_interval:
+                seconds_since_resource_update = 0
+                if not self.local_database._stop_updates and self.local_database.session_id:
+                    self.local_database.update_logging_session(self.private_send)
 
     #########################################################################################
     def connect(self):
-        print('''
+        self.transport.connect()
 
-        connencting to ...
-        ██╗░░██╗██████╗░░█████╗░██████╗░░█████╗░
-        ╚██╗██╔╝██╔══██╗██╔══██╗██╔══██╗██╔══██╗
-        ░╚███╔╝░██████╔╝███████║██████╔╝██║░░██║
-        ░██╔██╗░██╔═══╝░██╔══██║██╔══██╗██║░░██║
-        ██╔╝╚██╗██║░░░░░██║░░██║██║░░██║╚█████╔╝
-        ╚═╝░░╚═╝╚═╝░░░░░╚═╝░░╚═╝╚═╝░░╚═╝░╚════╝░
+    def private_send(self,message,command_for=None):
+        return self.transport.send(message, command_for=command_for)
 
-        ''')
-        print("the AI Engine")
-        if self.connection_type=="websocket":
-            if not self.websocket_connected:
-                self.ws = Xparo_socket(str(self.socket_full_url),
-                                on_message=self.on_ws_message,
-                                on_error=self.on_ws_error,
-                                on_open=self.on_ws_open,
-                                on_close=self.on_ws_close,
-                                )
-                self.websocket_connected = True
-                threading.Thread(target=self.ws.run_forever).start()
-            else:
-                print("already connected to xparo remote")
-        elif self.connection_type=="rest":
-            response = requests.get(self.website_full_url)
-            if response.status_code == 201:
-                data = response.json()
-                self.on_ws_message('self.ws',data)
-                threading.Thread(target=self.start_reset_framework).start()
-            else:
-                print("no response")
-        elif self.connection_type=="offline":
-            print("offline mode with custom llm is comming soon...")
-        ###################################################
-        #### getting initial data..
+    def _send_dict(self, payload):
+        """remote_ops.py's handlers take a send_response(dict) callback
+        (transport-agnostic -- see its module docstring); private_send
+        wants a JSON string. This is the adapter between the two.
+        """
+        self.private_send(json.dumps(payload))
 
     def send(self,message,remote_name="default"):
         filtered_data = json.dumps({"ask_bot_api":{"unique_id":self.local_database.unique_id, "data":{"from robot":"testing one.."},"question":message}})
@@ -134,7 +183,7 @@ class Engine():
                           )
 
     def add_task_history(self,message):
-        filtered_data = json.dumps({"ADD_Task_history_database":{"unique_id":self.local_database.unique_id,     
+        filtered_data = json.dumps({"ADD_Task_history_database":{"unique_id":self.local_database.unique_id,
                                                                 "input_data": message.get("input_data", {}),
                                                                 "output_data": message.get("output_data", {}),
                                                                 "type": message.get("type", "generic_task"),
@@ -145,8 +194,8 @@ class Engine():
                           )
 
     def add_live_update(self,message):
-        filtered_data = json.dumps({"ADD_live_update_bt":{"unique_id":self.local_database.unique_id, 
-                                                                  
+        filtered_data = json.dumps({"ADD_live_update_bt":{"unique_id":self.local_database.unique_id,
+
                                                                 "node_name": message.get("node_name", ""),
                                                                 "node_type": message.get("node_type", ""),
                                                                 "uid": message.get("uid", 0),
@@ -165,7 +214,7 @@ class Engine():
     def live_updates(self, msg):
         try:
             data = json.loads(msg.data)
-            
+
             # Extract fields with defaults
             node_name = data.get("node_name", "")
             node_type = data.get("node_type", "")
@@ -174,22 +223,22 @@ class Engine():
             curr = data.get("curr", "")
             timestamp = data.get("timestamp")
             datetime_str = data.get("datetime", "")
-            
+
             # Generate timestamp if missing
             if timestamp is None:
                 timestamp = time.time()
             elif isinstance(timestamp, str):
                 # Attempt to parse string timestamp? Not likely; assume numeric.
                 timestamp = float(timestamp)
-            
+
             # Generate datetime if missing
             if not datetime_str:
                 dt = datetime.fromtimestamp(timestamp)
                 datetime_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-                        
-            
+
+
             filtered_data = json.dumps({"ADD_live_update_database":{
-                                                                    "unique_id":self.local_database.unique_id, 
+                                                                    "unique_id":self.local_database.unique_id,
                                                                     "node_name": node_name,
                                                                     "node_type": node_type,
                                                                     "uid": uid,
@@ -203,33 +252,6 @@ class Engine():
                             )
         except Exception as e:
             print(f'Failed to process live history: {str(e)}')
-
-
-
-    def private_send(self,message,command_for=None):
-        # print(f"command reviev for brain {message} and type is {command_for}")
-        if not command_for:
-            command_for=self.connection_type
-        try:
-            if command_for=="websocket":
-                self.ws.send(message)
-            elif command_for=="rest":
-                response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json'})
-                if response.status_code == 201:
-                    self.on_ws_message('rest', response.json())
-                    return True
-                else:
-                    print(str(response))
-            elif command_for=="offline":
-                pass
-        except Exception as e:
-            print(e)
-            if command_for!="rest":
-                # The socket may have died without a clean close frame (common on
-                # flaky networks) -- on_ws_close never fires, so websocket_connected
-                # stays incorrectly True and connect() would otherwise no-op forever.
-                self.websocket_connected = False
-                self.connect()
 
     def on_ws_message(self, ws, message):
         print(message)
@@ -245,7 +267,7 @@ class Engine():
                 pass
             elif k=="rules":
                 pass
-            elif k=="aiml": 
+            elif k=="aiml":
                 content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
 {val}
@@ -299,8 +321,8 @@ class Engine():
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
                         file.write(content)
-            elif k=="eval":
-                return eval(val)
+            elif k=="ROBOT_CREDENTIAL":
+                self._persist_credential(val)
             elif k=="get_initial_local_env_data":
                 self.get_initial_local_env_data()
             elif k=="sync_local_database":
@@ -308,6 +330,43 @@ class Engine():
             elif k=="log_updated":
                 self.local_database.dashboard_receive({"log_updated":val},self.private_send)
                 self.local_database._stop_updates = False
+            elif k=="REST_API_TOKEN":
+                # dashboard_receive already has a correct handler for this
+                # (arms orchestrator.API_TOKEN and flushes any queued
+                # uploads) -- it was just never reachable from here.
+                self.local_database.dashboard_receive({"REST_API_TOKEN":val},self.private_send)
+            # ---- Phase 4 remote-ops -- see remote_ops.py's module
+            # docstring for why these are plain function calls here rather
+            # than inline logic: the exact same handlers drive both this
+            # transport and transports/tethered_tcp.py.
+            elif k=="RUN_COMMAND":
+                command = val.get("command", "")
+                request_id = val.get("request_id")
+                timeout = remote_ops.clamp_command_timeout(val.get("timeout"))
+                if command.strip():
+                    threading.Thread(
+                        target=remote_ops.handle_run_command,
+                        args=(command, request_id, timeout, self._send_dict),
+                        daemon=True,
+                    ).start()
+                else:
+                    self._send_dict({"COMMAND_RESULT": {
+                        "request_id": request_id, "command": command,
+                        "success": False, "exit_code": None, "timed_out": False,
+                        "output": "(empty command)", "truncated": False,
+                    }})
+            elif k=="TELEOP":
+                remote_ops.handle_teleop(val.get("axes", []), val.get("buttons", []), self.joy_publish, self._send_dict)
+            elif k=="LIST_FILES":
+                remote_ops.handle_list_files(self.transfer_dir, self._send_dict)
+            elif k=="DELETE_FILE":
+                remote_ops.handle_delete_file(self.transfer_dir, val.get("path", ""), self._send_dict)
+            elif k=="FILE_REQ":
+                self.file_transfer.handle_file_req(val, self._send_dict)
+            elif k=="FILE_CHUNK":
+                self.file_transfer.handle_file_chunk(val)
+            elif k=="FILE_COMPLETE":
+                self.file_transfer.handle_file_complete(self._send_dict)
             else:
                 self.call_message(message)
 
@@ -423,56 +482,9 @@ class Engine():
             print(e)
             return ""
 
-
-
-
-    def on_ws_error(self, ws, error):
-        print(error)
-        print(f'''
-        Truble shooting:
-            1. check your internet connection
-            2. if that not working download latest version of xparo or from github = https://github.com/lazyxcientist/xparo
-            3. try to switch to websocket connection or rest framework
-        ''')
-
-    def on_ws_open(self, ws, *args):
-        self.websocket_connected = True
-        print('''
-        \\\\Connection Sussessfull//
-           \\\\X.P.A.R.O remote//
-            \\\\is 🄻🄸🅅🄴 now//
-        ''')
-        self.send_initial_data()
-        
     def send_initial_data(self):
         # self.private_send(json.dumps({"initisilaze_api":{}}))
         self.local_database.dashboard_receive({"needed_robot_data":{"sent":True}},self.private_send)
-
-    def on_ws_close(self, ws, *args):
-        self.websocket_connected = False
-        print('''
-
-            xparo brain is
-        █▀▀ █── █▀▀█ █▀▀ █▀▀ █▀▀▄ 
-        █── █── █──█ ▀▀█ █▀▀ █──█ 
-        ▀▀▀ ▀▀▀ ▀▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀─
-            retry again !!!
-
-        ''')
-
-    def start_reset_framework(self):
-        print("starting reset framework")
-        check = self.private_send(json.dumps({"initiliaze":True}))
-        if check:
-            while True:
-                response = requests.get(self.website_full_url)
-                if response.status_code == 201:
-                    data = response.json()
-                    self.on_ws_message('self.ws',data)
-                time.sleep(0.2)
-        else:
-            print("unable to connect with X.P.A.R.O server")
-            self.on_ws_close('self.ws')
 
     ##################################
     ###### function override #########
@@ -483,11 +495,6 @@ class Engine():
 
 
     #################################################################################
-
-
-
-
-
 
 
 if __name__ == "__main__":

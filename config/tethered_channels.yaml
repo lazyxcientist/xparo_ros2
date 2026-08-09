@@ -1,0 +1,19 @@
+# Redundant tether channels for xparo_transport:=tethered_tcp -- each is a
+# separate RS-485<->Ethernet bridge pair. Priority is list order: the first
+# entry is preferred "active" whenever it's connected, the last is pure
+# backup. See transports/tethered_tcp.py's module docstring for what
+# "active"/"secondary"/"backup" mean.
+#
+# Loaded by xparo_ros.py's tethered_channels_config_path parameter --
+# point that at a copy of this file with your actual deployment's
+# host/port pairs. Ignored entirely under xparo_transport:=django_ws.
+channels:
+  - name: CH-A
+    host: 192.168.1.203
+    port: 6000
+  - name: CH-B
+    host: 192.168.1.201
+    port: 5005
+  - name: CH-C
+    host: 192.168.1.202
+    port: 6000

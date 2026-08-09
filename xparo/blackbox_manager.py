@@ -2,94 +2,67 @@ import os
 import time
 import shutil
 import signal
-import subprocess
-import yaml
 import glob
 import requests
 from threading import Thread
 from datetime import datetime
 
+from .rosbag_control import PAUSED, WRITING
+
 # --- CONFIGURATION ---
 
 
 class BlackboxOrchestrator:
-    def __init__(self,ROBOT_ID,xparo_website_url,BAG_DIR):
-        self.recorder_process = None
+    """Disk lifecycle + cloud upload -- recording itself is delegated to
+    RosbagControl (rosbag_control.py, a genuinely more robust strategy
+    ported from tethered_module: verify-after-action, retry-with-backoff,
+    a watchdog, and actual knowledge of whether a session is open/writing
+    via the native rosbag2_recorder service interface) rather than the old
+    subprocess.Popen("ros2 bag record", ...) wrapper, which had no way to
+    tell a died/hung recorder from a healthy one.
+    """
+
+    def __init__(self,ROBOT_ID,xparo_website_url,BAG_DIR,rosbag_control=None):
         self.running = True
         self.ROBOT_ID = ROBOT_ID
-        self.API_TOKEN ="2ec6003e332a15a5a70bee22e8e1a14218f14f67"
+        # Empty until a REST_API_TOKEN dispatch key arrives (see
+        # engine.py's on_ws_message) -- manage_disk_and_upload below treats
+        # an empty token as "not armed yet" and skips uploads until then.
+        self.API_TOKEN = ""
         self.xparo_website_url = xparo_website_url
         self.BAG_DIR = BAG_DIR
-        self.CONFIG_PATH = os.path.join(self.BAG_DIR, "blackbox_record.yaml")
+        # None when there's no live rclpy node to drive recording through
+        # (e.g. Engine constructed standalone/under test, outside
+        # xparo_ros.py) -- start_recording()/stop_recording() become no-ops
+        # in that case rather than crashing, same spirit as record_bags
+        # itself being an opt-in.
+        self.rosbag_control = rosbag_control
         # Production Thresholds
         self.DISK_MAX_PCT = 90.0
         self.DISK_TARGET_PCT = 70.0
         self.CHECK_INTERVAL = 15  # Faster checks for testing
-        
+
         if not os.path.exists(self.BAG_DIR):
             os.makedirs(self.BAG_DIR, exist_ok=True)
-            
-        self._ensure_config_exists()
-        
+
         # --- INITIAL LOAD SYNC ---
         # Run one cleanup and upload cycle before starting the new recorder
         print("[INFO] Initial sync: Checking for unsent logs...")
         # self._process_uploads()
 
-    def _ensure_config_exists(self):
-        """Creates a configuration with 1MB limits for testing."""
-        if not os.path.exists(self.CONFIG_PATH):
-            config = {
-                "storage": "mcap",
-                "max_bag_size": 104857600, ### 100mb ,,  ##1048576, # 1 MB for testing
-                "compression_format": "zstd",
-                # "topics": ["/tf", "/tf_static", "/cmd_vel", "/diagnostics", "/odom"]
-            }
-            with open(self.CONFIG_PATH, 'w') as f:
-                yaml.dump(config, f)
-            print(f"[INFO] Created test config (1MB limit) at {self.CONFIG_PATH}")
-
     def start_recording(self):
-        """Builds a robust, timestamped recording command."""
-        print("[INFO] Starting ROS 2 Recorder...")
-        
-        with open(self.CONFIG_PATH, 'r') as f:
-            cfg = yaml.safe_load(f)
-
-        # FIX: Generate a unique folder name using timestamp to avoid [ERROR] folder exists
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(self.BAG_DIR, f"log_{timestamp}")
-
-        cmd = [
-            "ros2", "bag", "record",
-            "-o", output_path,
-            "--storage", cfg.get("storage", "mcap"),
-            "--max-bag-size", str(cfg.get("max_bag_size", 1048576)),
-            "--compression-mode", "file",
-            "--compression-format", cfg.get("compression_format", "zstd"),
-        ]
-
-        topics = cfg.get("topics", [])
-        if topics:
-            cmd.extend(topics)
-        else:
-            cmd.append("--all")
-
-        print(f"[EXEC] {' '.join(cmd)}")
-        self.recorder_process = subprocess.Popen(
-            cmd, preexec_fn=os.setsid, stdout=subprocess.DEVNULL
-        )
+        if self.rosbag_control is None:
+            print("[WARN] No RosbagControl available -- cannot start recording "
+                  "(Engine isn't running inside a live rclpy node).")
+            return
+        print("[INFO] Starting ROS 2 Recorder via RosbagControl...")
+        self.rosbag_control.handle_start()
 
     def stop_recording(self):
-        if self.recorder_process:
-            print("[INFO] Stopping ROS 2 Recorder...")
-            try:
-                # Kill the entire process group gracefully
-                os.killpg(os.getpgid(self.recorder_process.pid), signal.SIGINT)
-                self.recorder_process.wait(timeout=10)
-            except Exception as e:
-                print(f"[ERROR] Shutdown error: {e}")
-            print("[INFO] Recorder stopped.")
+        if self.rosbag_control is None:
+            return
+        print("[INFO] Stopping ROS 2 Recorder via RosbagControl...")
+        self.rosbag_control.handle_stop()
 
     def get_disk_usage(self):
         stats = shutil.disk_usage(self.BAG_DIR)
@@ -131,9 +104,12 @@ class BlackboxOrchestrator:
         # Sort by modification time (oldest first)
         all_bags.sort(key=os.path.getmtime)
         
-        # If the recorder is running, ignore the absolute newest file (active file)
-        # If it's the initial sync and recorder isn't started yet, we can try all.
-        target_bags = all_bags[:-1] if self.recorder_process else all_bags
+        # If a session is currently open (writing or merely paused -- either
+        # way its .mcap is still being appended to), ignore the absolute
+        # newest file. If it's the initial sync and nothing is recording
+        # yet, we can try all.
+        session_open = self.rosbag_control is not None and self.rosbag_control.state in (WRITING, PAUSED)
+        target_bags = all_bags[:-1] if session_open else all_bags
 
         if not target_bags:
             return

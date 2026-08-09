@@ -13,14 +13,11 @@ import urllib.request
 import ipaddress
 import signal
 from threading import Thread
-try:
-    from .blackbox_manager import BlackboxOrchestrator
-except:
-    from xparo.blackbox_manager import BlackboxOrchestrator
+from .blackbox_manager import BlackboxOrchestrator
 
 
 class XP_Database():
-    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags):
+    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None):
         # Parameters
         self.xparo_database_size = xparo_database_size  # Size in MB
         self.xparo_database_path = xparo_database_path
@@ -41,9 +38,9 @@ class XP_Database():
 
 
         ###################################################
-        self.orchestrator = None 
+        self.orchestrator = None
         if record_bags:
-            self.orchestrator = BlackboxOrchestrator(self.unique_id,xparo_website_url,BAG_DIR)
+            self.orchestrator = BlackboxOrchestrator(self.unique_id,xparo_website_url,BAG_DIR,rosbag_control)
             
             
             def handle_exit(signum, frame):
@@ -52,13 +49,7 @@ class XP_Database():
                 exit(0)
             signal.signal(signal.SIGINT, handle_exit)
             signal.signal(signal.SIGTERM, handle_exit)
-            
-            self.orchestrator.API_TOKEN = ""
-            self.orchestrator.DISK_MAX_PCT = 90.0
-            self.orchestrator.DISK_TARGET_PCT = 70.0
-            self.orchestrator.CHECK_INTERVAL = 15 
 
-            
             # Run manager in background
             manager_thread = Thread(target=self.orchestrator.manage_disk_and_upload, daemon=True)
             manager_thread.start()
@@ -201,9 +192,10 @@ class XP_Database():
         return_dict['mac_address'] = ':'.join(['{:02x}'.format((uuid.getnode() >> ele) & 0xff) for ele in range(0,8*6,8)][::-1])
         # Local IP
         try:
-            return_dict['ip_address'] = self.get_best_ip()
+            return_dict['ip_address'], return_dict['ip_source'] = self.get_best_ip()
         except socket.gaierror:
             return_dict['ip_address'] = "127.0.0.1"
+            return_dict['ip_source'] = "localhost"
         # Hardware metrics
         return_dict['cpu_model'] = platform.processor()
         return_dict['cpu_count'] = psutil.cpu_count(logical=True)
@@ -264,19 +256,24 @@ class XP_Database():
         2. True Public Internet IP
         3. Default Outbound Local IP
         4. Localhost (127.0.0.1)
+
+        Returns a (ip, source) tuple -- `source` matches
+        apps.analytics.models.Robots.IpSource's choices so Django can tell
+        "Tailscale IP, mesh-reachable" from "public IP that's actually a NAT
+        gateway, reachable by nobody" instead of just seeing a bare address.
         """
-        
+
         # --- STEP 1: Look for a Tailscale / Overlay IP ---
         try:
             # Tailscale uses Carrier Grade NAT: 100.64.0.0 to 100.127.255.255
             ts_network = ipaddress.ip_network('100.64.0.0/10')
-            
+
             for interface, snics in psutil.net_if_addrs().items():
                 for snic in snics:
                     if snic.family == socket.AF_INET:  # We only want IPv4
                         ip = snic.address
                         if ipaddress.ip_address(ip) in ts_network:
-                            return ip  # Found the Tailscale IP!
+                            return ip, "tailscale"  # Found the Tailscale IP!
         except Exception as e:
             print(f"Interface check failed: {e}")
 
@@ -285,7 +282,7 @@ class XP_Database():
             # We use a 3-second timeout so your script doesn't hang if the internet is down
             req = urllib.request.Request('https://api.ipify.org', headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=3) as response:
-                return response.read().decode('utf8').strip()
+                return response.read().decode('utf8').strip(), "public_unreachable"
         except Exception:
             pass # Internet might be down, move to next fallback
 
@@ -295,12 +292,12 @@ class XP_Database():
             # It does not actually send data, so it works even if 8.8.8.8 is unreachable.
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.connect(('8.8.8.8', 80))
-                return s.getsockname()[0]
+                return s.getsockname()[0], "lan"
         except Exception:
             pass
 
         # --- STEP 4: Ultimate Fallback ---
-        return "127.0.0.1"
+        return "127.0.0.1", "localhost"
 
     def scan_hardware_peripherals(self):
         """Scans for connected USB, I2C, and UART devices."""

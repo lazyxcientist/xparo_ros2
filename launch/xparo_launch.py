@@ -1,7 +1,8 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
 from launch_ros.actions import Node
 from launch.substitutions import LaunchConfiguration
 
@@ -14,6 +15,10 @@ def generate_launch_description():
     xparo_project_id =                  LaunchConfiguration('xparo_project_id',                     default="")
     xparo_secret_key =                  LaunchConfiguration('xparo_secret_key',                     default="")
     xparo_connection_type =             LaunchConfiguration('xparo_connection_type',                default="websocket")
+    # "production" (xparo.in) or "local" (127.0.0.1:8000, for developing
+    # against a local Django server) -- see transports/django_ws.py's
+    # DEFAULT_ENVIRONMENT.
+    xparo_environment =                 LaunchConfiguration('xparo_environment',                    default="production")
     xparo_behavior_path =               LaunchConfiguration('xparo_behavior_path',                  default=os.path.join(current_dir,'config','default.xml'))
     xparo_file_path =                   LaunchConfiguration('xparo_file_path',                      default=os.path.join(current_dir,'config','default.yaml'))
     xparo_env_path =                    LaunchConfiguration('xparo_env_path',                       default=os.path.join(current_dir,'config','default.env'))
@@ -23,6 +28,21 @@ def generate_launch_description():
     xparo_custom_files_folder_path =    LaunchConfiguration('xparo_custom_files_folder_path',       default=os.path.join(current_dir,'custom_files'))
     xparo_custom_evns_folder_path =     LaunchConfiguration('xparo_custom_evns_folder_path',        default=os.path.join(current_dir,'custom_envs'))
     record_bags =                       LaunchConfiguration('record_bags',                          default=False)
+    # Must be shared between the xparo_ros node and the rosbag2 recorder
+    # process below -- RosbagControl (rosbag_control.py) opens sessions
+    # under this exact path via the Record service, so both sides need to
+    # agree on it. Declared as its own launch arg (rather than left to
+    # xparo_ros.py's internal per-project default) specifically so that
+    # agreement is guaranteed rather than coincidental.
+    bag_dir =                           LaunchConfiguration('BAG_DIR',                               default=os.path.join(current_dir,'ros_bags'))
+    # "django_ws" (networked robots) or "tethered_tcp" (a physically-
+    # tethered ROV with no path to Django) -- see
+    # transports/tethered_tcp.py's module docstring.
+    xparo_transport =                   LaunchConfiguration('xparo_transport',                       default="django_ws")
+    # Only read when xparo_transport=="tethered_tcp" -- path to a copy of
+    # config/tethered_channels.yaml with this deployment's actual
+    # host/port pairs. Empty default falls back to loopback test values.
+    tethered_channels_config_path =     LaunchConfiguration('tethered_channels_config_path',         default="")
 
 
     ####################################
@@ -35,6 +55,7 @@ def generate_launch_description():
             DeclareLaunchArgument('xparo_project_id',                   default_value=xparo_project_id,                 description='your project key'),
             DeclareLaunchArgument('xparo_secret_key',                   default_value=xparo_secret_key,                 description='your genrated secret key'),
             DeclareLaunchArgument('xparo_connection_type',              default_value=xparo_connection_type,            description='websocket or restframework connection'),
+            DeclareLaunchArgument('xparo_environment',                  default_value=xparo_environment,                description='"production" (xparo.in) or "local" (127.0.0.1:8000)'),
             DeclareLaunchArgument('xparo_behavior_path',                default_value=xparo_behavior_path,              description='path for AUTO-genrated behaviour tree.'),
             DeclareLaunchArgument('xparo_file_path',                    default_value=xparo_file_path,                  description='path for AUTO-genrated file'),
             DeclareLaunchArgument('xparo_env_path',                     default_value=xparo_env_path,                   description='path for AUTO-genrated env/blackbord'),
@@ -44,6 +65,9 @@ def generate_launch_description():
             DeclareLaunchArgument('xparo_custom_files_folder_path',     default_value=xparo_custom_files_folder_path,   description='path where your all custom files are saved'),
             DeclareLaunchArgument('xparo_custom_evns_folder_path',      default_value=xparo_custom_evns_folder_path,    description='path where your all custom evns are saved'),
             DeclareLaunchArgument('record_bags',                        default_value=record_bags,                      description='record ros bag or not.'),
+            DeclareLaunchArgument('BAG_DIR',                            default_value=bag_dir,                          description='where rosbag sessions are written; shared with the rosbag2 recorder process.'),
+            DeclareLaunchArgument('xparo_transport',                    default_value=xparo_transport,                  description='"django_ws" or "tethered_tcp"'),
+            DeclareLaunchArgument('tethered_channels_config_path',      default_value=tethered_channels_config_path,    description='path to a tethered_channels.yaml, only used when xparo_transport=="tethered_tcp"'),
 
 
 
@@ -56,6 +80,7 @@ def generate_launch_description():
                             'xparo_project_id':                     xparo_project_id,
                             'xparo_secret_key':                     xparo_secret_key,
                             'xparo_connection_type':                xparo_connection_type,
+                            'xparo_environment':                    xparo_environment,
                             'xparo_behavior_path':                  xparo_behavior_path,
                             'xparo_file_path':                      xparo_file_path,
                             'xparo_env_path':                       xparo_env_path,
@@ -65,11 +90,62 @@ def generate_launch_description():
                             'xparo_custom_files_folder_path':       xparo_custom_files_folder_path,
                             'xparo_custom_evns_folder_path':        xparo_custom_evns_folder_path,
                             'record_bags':                          record_bags,
-                            
+                            'BAG_DIR':                               bag_dir,
+                            'xparo_transport':                      xparo_transport,
+                            'tethered_channels_config_path':        tethered_channels_config_path,
+
                             }],
                 output='screen'),
             ###############################################
-        
+
+            # rosbag2's own recorder process -- RosbagControl
+            # (rosbag_control.py, held by the xparo_ros node above) drives
+            # it entirely through its service interface (Record/Stop/
+            # Resume/IsPaused/IsDiscoveryRunning), the same interface any
+            # `ros2 bag record` process exposes regardless of how it's
+            # invoked. Only started when record_bags:=true.
+            #
+            # --start-paused: confirmed empirically that the recorder
+            # always auto-opens a session at its own launch (there's no
+            # way to have it start fully idle) -- RosbagControl closes this
+            # one out as its first action (see rosbag_control.py's
+            # __init__) before ever opening a real, timestamped session via
+            # the Record service, so --start-paused just avoids wasting a
+            # few seconds of real topic data into a throwaway boot file in
+            # the meantime.
+            #
+            # No --max-bag-size / --max-bag-duration: single-mcap-file-per-
+            # session mode (matches tethered_module's rosbag_node.py, which
+            # this control logic was ported from) -- see rosbag_control.py's
+            # module docstring for the durability tradeoff this implies and
+            # how --compression-mode file/--compression-format zstd
+            # (kept from xparo's own prior defaults) partially offsets it.
+            #
+            # -o's boot_session_$(date ...) suffix must be a literal shell
+            # command substitution (run via `bash -c`, not a launch-time
+            # Substitution) so it re-expands to a fresh, unique path on
+            # every respawn -- otherwise a respawn would always try to
+            # reuse the exact same boot-session directory as the previous
+            # run and `ros2 bag record` refuses to write into one that
+            # already exists, permanently breaking respawn recovery after
+            # the very first crash. bag_dir itself IS a launch-time
+            # Substitution (a LaunchConfiguration, possibly CLI-overridden)
+            # so it's resolved once, up front, and concatenated in as a
+            # plain string alongside the still-literal $(date ...) part.
+            ExecuteProcess(
+                condition=IfCondition(record_bags),
+                cmd=['bash', '-c', [
+                    'ros2 bag record -a -o ', bag_dir,
+                    '/boot_session_$(date +%Y%m%d_%H%M%S)'
+                    ' --start-paused --storage mcap'
+                    ' --compression-mode file --compression-format zstd',
+                ]],
+                output='screen',
+                respawn=True,
+                respawn_delay=2.0,
+                name='rosbag2_recorder_process',
+            ),
+            ###############################################
+
 
     ])
-

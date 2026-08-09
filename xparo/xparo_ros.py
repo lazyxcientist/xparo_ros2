@@ -2,14 +2,16 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+from sensor_msgs.msg import Joy
 from ament_index_python.packages import get_package_share_directory
 import json
 import os
+import yaml
 from datetime import datetime
-try:
-    from .xparo import Engine
-except:
-    from xparo.xparo import Engine
+
+
+from .engine import Engine
+from .rosbag_control import RosbagControl
 
 try:
     from nav2_msgs.msg import BehaviorTreeLog
@@ -41,6 +43,13 @@ class Xparo(Node):
         self.xparo_project_id = self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value
         self.xparo_secret_key = self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value
         self.xparo_connection_type = self.declare_parameter("xparo_connection_type", xparo_config.get("xparo_connection_type", "websocket")  ).value
+        # "production" (xparo.in, https/wss) or "local" (127.0.0.1:8000,
+        # http/ws, for developing against a local Django server). Defaults
+        # to production -- a real robot that never sets this now reaches
+        # the real server instead of a dev sandbox that doesn't exist for
+        # it (see transports/django_ws.py's DEFAULT_ENVIRONMENT for the old
+        # hardcoded `local = True` this replaces).
+        self.xparo_environment = self.declare_parameter("xparo_environment", xparo_config.get("xparo_environment", "production")  ).value
         self.xparo_folder = self.declare_parameter("xparo_folder", base_path_for_package  ).value
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
         self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
@@ -52,12 +61,29 @@ class Xparo(Node):
         self.xparo_custom_evns_folder_path = self.declare_parameter("xparo_custom_evns_folder_path",os.path.join(self.xparo_folder,'custom_envs')).value
         self.record_bags = self.declare_parameter("record_bags",False).value
         self.BAG_DIR = self.declare_parameter("BAG_DIR",os.path.join(self.xparo_folder,"xparo",self.xparo_project_id,'ros_bags')).value
-        
+        # "django_ws" (networked robots, against the Django backend -- the
+        # only option before Phase 4) or "tethered_tcp" (a physically-
+        # tethered ROV with no path to Django at all). See
+        # transports/tethered_tcp.py's module docstring.
+        self.xparo_transport = self.declare_parameter("xparo_transport", xparo_config.get("xparo_transport", "django_ws")).value
+        # Only read/relevant when xparo_transport=="tethered_tcp" -- path
+        # to a copy of config/tethered_channels.yaml with this
+        # deployment's actual RS-485<->Ethernet bridge host/port pairs.
+        # Empty (default) means transports/tethered_tcp.py's own
+        # DEFAULT_CHANNELS_CONFIG (loopback test values, not a real link).
+        self.tethered_channels_config_path = self.declare_parameter(
+            "tethered_channels_config_path", xparo_config.get("tethered_channels_config_path", "")
+        ).value
+        self.tethered_channels_config = self._load_tethered_channels_config(self.tethered_channels_config_path)
+
 
         self.ask_question = self.create_subscription(String, '/xparo/ask', self.ask_question_fun, 10)
         self.task_updates = self.create_subscription(String,'/xparo/task_updates',self.task_updates,10)
         self.bt_log = self.create_subscription(String,'/bt_xparo_log',self.live_updates,10)
         self.dash_send = self.create_publisher(String,"/xparo/response",10)
+        # Phase 4 TELEOP -- remote_ops.handle_teleop publishes here via
+        # Engine's joy_publish callback, below.
+        self.joy_pub = self.create_publisher(Joy, '/joy', 10)
 
 
         if NAV2_AVAILABLE:
@@ -85,13 +111,31 @@ class Xparo(Node):
                         }
         ####################
         
+        # RosbagControl needs a live rclpy node to create clients/timers/etc
+        # on (that's `self`, here) -- it can't be built inside Engine/
+        # XP_Database/BlackboxOrchestrator, none of which are rclpy-aware
+        # (Engine is usable standalone, outside ROS2 entirely -- see its
+        # own __main__ block). Only construct it when actually recording.
+        self.rosbag_control = RosbagControl(self, self.BAG_DIR) if self.record_bags else None
+
+        # record_bags and BAG_DIR must go in through the constructor, not be
+        # set as post-construction attributes -- Engine.__init__ already
+        # builds its XP_Database (and, if record_bags is True, starts the
+        # BlackboxOrchestrator against whatever BAG_DIR it was given) before
+        # returning, so setting either attribute afterward was a no-op:
+        # bags either silently never recorded, or recorded to the wrong path.
         self.xparo_engine = Engine(self.xparo_secret_key,
                               self.xparo_project_id,
-                              connection_type = self.xparo_connection_type)
+                              connection_type = self.xparo_connection_type,
+                              record_bags = self.record_bags,
+                              BAG_DIR = self.BAG_DIR,
+                              environment = self.xparo_environment,
+                              rosbag_control = self.rosbag_control,
+                              joy_publish = self._publish_joy,
+                              xparo_transport = self.xparo_transport,
+                              tethered_channels_config = self.tethered_channels_config)
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
-        self.xparo_engine.BAG_DIR = self.BAG_DIR
-        self.xparo_engine.record_bags = self.record_bags
         self.xparo_engine.connect()
 
 
@@ -115,6 +159,34 @@ class Xparo(Node):
 
         except Exception as e:
             self.get_logger().error(f"Error processing message: {e}")
+
+    def _load_tethered_channels_config(self, path):
+        """Returns a list of {"name","host","port"} dicts (transports
+        .tethered_tcp.TetheredTcpTransport's channels_config shape), or
+        None (that class's own DEFAULT_CHANNELS_CONFIG -- loopback test
+        values, not a real link) if path is empty or unreadable. Never
+        raises -- a bad path here shouldn't take the whole node down,
+        just fall back the same as not setting it at all.
+        """
+        if not path:
+            return None
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            channels = data.get("channels", [])
+            return [{"name": c["name"], "host": c["host"], "port": int(c["port"])} for c in channels] or None
+        except Exception as e:
+            self.get_logger().error(f"Failed to load tethered_channels_config_path={path!r}: {e}")
+            return None
+
+    def _publish_joy(self, axes, buttons):
+        """Passed into Engine as joy_publish -- remote_ops.handle_teleop
+        calls this with already-padded axes/buttons (see MIN_JOY_AXES/
+        MIN_JOY_BUTTONS in remote_ops.py)."""
+        msg = Joy()
+        msg.axes = axes
+        msg.buttons = buttons
+        self.joy_pub.publish(msg)
 
     ## the data can be used a voice speak
     def call_message(self,message,**kwargs):
