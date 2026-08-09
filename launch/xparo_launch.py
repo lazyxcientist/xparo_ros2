@@ -9,7 +9,13 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
-    current_dir = get_package_share_directory("xparo_ros")
+    # "xparo_ros" is the node's executable name (see the Node(executable=...)
+    # below), not the package name -- get_package_share_directory needs the
+    # actual ROS2 package name from package.xml/CMakeLists.txt's project(),
+    # which is "xparo". Was wrong here since before this session; only
+    # surfaced now because nothing had actually run `ros2 launch` against a
+    # real colcon build before.
+    current_dir = get_package_share_directory("xparo")
 
 
     xparo_project_id =                  LaunchConfiguration('xparo_project_id',                     default="")

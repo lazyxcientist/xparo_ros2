@@ -10,8 +10,8 @@ import yaml
 from datetime import datetime
 
 
-from .engine import Engine
-from .rosbag_control import RosbagControl
+from xparo.engine import Engine
+from xparo.rosbag_control import RosbagControl
 
 try:
     from nav2_msgs.msg import BehaviorTreeLog
