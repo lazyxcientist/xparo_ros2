@@ -194,3 +194,40 @@ def test_file_transfer_upload_round_trip_through_engine(tmp_path):
     assert (tmp_path / "up.bin").read_bytes() == b"hello"
     last = json.loads(sent[-1])
     assert last["FILE_COMPLETE"]["received"] == 5
+
+
+def test_persisted_credential_is_scoped_to_project_id(tmp_path):
+    """Found via a real local-testing session: credential.json used to
+    store just {"value": ...}, with no notion of which project it was
+    issued for -- so a credential persisted while testing against project
+    A kept getting silently used (and silently overriding a freshly
+    supplied xparo_secret_key) when later pointed at unrelated project B,
+    producing a confusing 403 with no indication the new secret was never
+    actually tried. A credential must only be reused for the exact
+    project_id it was issued under.
+    """
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine.project_id = "project-a"
+
+    engine._persist_credential("secret-for-project-a")
+    assert engine._load_persisted_credential() == "secret-for-project-a"
+
+    engine.project_id = "project-b"
+    assert engine._load_persisted_credential() is None
+
+    engine.project_id = "project-a"
+    assert engine._load_persisted_credential() == "secret-for-project-a"
+
+
+def test_persist_credential_writes_the_project_id_alongside_the_value(tmp_path):
+    import json as json_module
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine.project_id = "proj-engine-test"
+
+    engine._persist_credential("some-secret")
+
+    with open(engine.xparo_credential_path) as f:
+        stored = json_module.load(f)
+    assert stored == {"value": "some-secret", "project_id": "proj-engine-test"}

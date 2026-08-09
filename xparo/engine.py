@@ -78,6 +78,7 @@ class Engine():
                     'xparo_custom_evns_folder_path'   : self.xparo_custom_evns_folder_path,
                         }
 
+        self.project_id = project_id
         effective_secret = self._load_persisted_credential() or secret_key
 
         # Everything about *how* a message actually gets to its peer lives
@@ -131,17 +132,31 @@ class Engine():
         reconnected since). Never raises -- a missing/corrupt file just
         means "fall back to the constructor's secret_key", same as before
         this existed.
+
+        Scoped to self.project_id: a credential is only meaningful for the
+        specific project it was issued under (ProjectSecretKey/
+        RobotCredential rows both belong to one project), so a stale file
+        left over from an earlier run against a *different* project_id
+        must not silently override -- and mask -- a freshly-supplied
+        secret_key for this one. Confirmed this exact failure mode for
+        real: a leftover credential.json from an earlier local test kept
+        getting used instead of a brand new xparo_secret_key launch
+        argument for an unrelated project, producing a confusing 403 with
+        no indication the supplied secret was never actually tried.
         """
         try:
             with open(self.xparo_credential_path, 'r') as file:
-                return json.load(file).get('value') or None
+                stored = json.load(file)
         except (FileNotFoundError, json.JSONDecodeError):
             return None
+        if stored.get('project_id') != self.project_id:
+            return None
+        return stored.get('value') or None
 
     def _persist_credential(self, raw_value):
         os.makedirs(os.path.dirname(self.xparo_credential_path), exist_ok=True)
         with open(self.xparo_credential_path, 'w') as file:
-            json.dump({'value': raw_value}, file)
+            json.dump({'value': raw_value, 'project_id': self.project_id}, file)
 
     def _logging_update_loop(self):
         # Heartbeat runs unconditionally, every HEARTBEAT_INTERVAL_SECONDS,
