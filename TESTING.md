@@ -21,6 +21,7 @@ below) and want to poke at what it can do.
 - [Quick start: a local robot + local Django server](#quick-start-a-local-robot--local-django-server)
 - [How messages actually travel](#how-messages-actually-travel)
 - [The dispatch-key API, capability by capability](#the-dispatch-key-api-capability-by-capability)
+- [Prompts, task history, and the other dashboard databases](#prompts-task-history-and-the-other-dashboard-databases)
 - [Three ways to test each capability](#three-ways-to-test-each-capability)
 - [Auth: project secret vs. per-robot credential](#auth-project-secret-vs-per-robot-credential)
 - [Rosbag recording](#rosbag-recording)
@@ -160,6 +161,92 @@ robots).
 
 ---
 
+## Prompts, task history, and the other dashboard databases
+
+Beyond `ADD_robots_info`'s hardware snapshot, the robot can write to six
+project-scoped tables that back the dashboard's own pages (Prompts,
+Task History, Logs, Reports, Feedback, Sensor Data). Every one of them
+follows the same `ADD_<Name>_database` / `GET_<Name>_database` /
+`DELETE_<Name>_database` shape handled in `apps/analytics/data_analyis.py`;
+`Logs_history` is the one exception with a fourth, `UPDATE_Logs_history_database`,
+because a logging *session* accumulates over time instead of being written once.
+
+| Table | Dispatch keys | Robot-side origin |
+|---|---|---|
+| **Chat prompts** (`Chat_prompts`) | `ADD_Chat_prompts_database` / `GET_...` / `DELETE_...` | Usually created automatically -- see below, `ask_bot_api` already writes one per Q&A round-trip. Send `ADD_Chat_prompts_database` directly only to log a prompt that didn't go through that pipeline. |
+| **Task history** (`Task_history`) | `ADD_Task_history_database` / `GET_...` / `DELETE_...` (no `UPDATE_...` -- each task is one immutable row, not an accumulating session) | `engine.py`'s `Engine.add_task_history({...})` -- the one convenience wrapper that exists for this table (see below). |
+| **Logs history** (`Logs_history`) | `ADD_Logs_history_database` / `UPDATE_...` (append-style) / `GET_...` / `DELETE_...` | `database.py`'s `trigger_log_update()` (one-shot) and `update_logging_session()`/`stop_logging_session()` (periodic, while a session is open -- see `engine.py`'s update loop, `local_database.session_id` gates it). |
+| **Sensor data** (`Sensor`) | `ADD_Sensor_database` / `GET_...` / `DELETE_...` | No convenience wrapper -- send the dispatch key directly (or via the durable-retry path below) from whatever robot-side code produces the reading. |
+| **Reports** (`Reports`) | `ADD_Reports_database` / `GET_...` / `DELETE_...` | Same -- no wrapper, direct dispatch key. |
+| **Feedback** (`Feedback`) | `ADD_Feedback_database` / `GET_...` / `DELETE_...` | Same -- no wrapper, direct dispatch key. |
+| **Robots** (`Robots`) | `GET_Robots_database` / `DELETE_Robots_database` (no `ADD_...` -- a robot row is created by `ADD_robots_info`, not this table) | Dashboard-side only; a robot never sends these itself. |
+
+Every `ADD_...` reply carries back either `{"task_updated": "<id>"}` or,
+for logs specifically, `{"log_updated": "<id>"}` -- the id Django assigned
+the new row (for `Chat_prompts`/`Sensor`/`Task_history`/`Reports`/`Feedback`,
+that's `vl["task_id"]` echoed back, which only round-trips correctly if
+your `ADD_...` payload included a `task_id` in the first place; see the
+durable-send pattern below for why that matters).
+
+**Sending durably (recommended for anything you don't want silently
+dropped by a bad connection):** `database.py`'s `save_failed_request(data_type,
+payload, private_send)` is the pattern all four `ADD_...`-capable local
+handlers in `dashboard_receive()` (`Chat_prompts`, `Sensor`, `Task_history`,
+`Logs_history`) use internally, and it's directly callable for any of the
+others too:
+
+1. Assigns a `task_id` (UUID) and `created_at`, writes the whole payload
+   into `config/send_later.json` *before* attempting to send (durable
+   against a crash or connection loss mid-send).
+2. Attempts `private_send(json.dumps({data_type: payload}), command_for="rest")`.
+3. If Django's `ADD_...` handler succeeds, its reply's `task_updated`
+   (or `log_updated`) lands back in `dashboard_receive()`, which calls
+   `remove_data(task_id)` to clear the local file -- so an entry only
+   stays in `send_later.json` if it was never actually acknowledged.
+4. `manage_file_size()` caps `send_later.json` at `xparo_database_size`
+   MB, evicting the oldest unacknowledged entries first if it ever fills
+   (this package does not currently retry queued entries on reconnect --
+   `save_failed_request` fires once per call; a queued-but-unsent entry
+   is retried the next time something calls `save_failed_request` for
+   that same `data_type`, not automatically).
+
+To test this path specifically: kill the Django process mid-`ADD_Sensor_database`
+call (or point the robot at an intentionally-wrong port), confirm the
+payload lands in `config/send_later.json`, then bring Django back and
+trigger another send of the same `data_type` -- confirm the entry clears
+once the ack round-trips.
+
+**Testing task history end-to-end**, from a Python shell against a real
+`Engine` (same pattern as [section B](#b-raw-websocket-no-frontend-at-all) above):
+
+```python
+import sys; sys.path.insert(0, "ros_packages/src/xparo")
+from xparo.engine import Engine
+
+e = Engine("<raw secret or persisted credential>", "<project_id>", connection_type="websocket")
+e.connect()
+e.add_task_history({
+    "input_data": {"prompt": "go to the kitchen"},
+    "output_data": {"result": "arrived"},
+    "type": "navigation",
+})
+```
+
+Then confirm the row on the dashboard's **Database -> Task History**
+page (or via `GET_Task_history_database` over the raw socket, section B),
+and via `ros2` there's nothing further to check -- this table has no
+ROS2 topic of its own, it's purely a Django-side record of what the
+robot reported doing.
+
+**Testing chat prompts end-to-end**: the simplest path is triggering an
+actual `ask_bot_api` round-trip (`Engine.send("<question>")`), since
+`Manage_Dash.py`'s `ask_bot_api` handler creates the `Chat_prompts` row
+itself once the AIML/LLM backend answers -- no separate `ADD_Chat_prompts_database`
+call is needed for that path. Confirm the row appears on **Database ->
+Prompts** with `responded_by` set to whichever backend answered it.
+
+---
+
 ## Three ways to test each capability
 
 ### A. Through the dashboard UI (the real path)
@@ -173,7 +260,7 @@ rendering) at once, not just the robot's handler logic.
    Access** buttons:
    - **Terminal** -> `RUN_COMMAND`/`COMMAND_RESULT`, one request per line, timeout-aware.
    - **Files** -> `LIST_FILES`/`DELETE_FILE`/upload (`FILE_REQ`+`FILE_CHUNK`+`FILE_COMPLETE`)/download, with a real file-tree browser.
-   - **Teleop** -> a tabbed popup: **Gamepad** (drives from a real physical controller plugged into your machine via the browser's Gamepad API), **Mapping** (a live gamepad tester -- every connected controller's axes/buttons, for identifying indices before trusting a real drive), and **Raw** (hand-typed axes/buttons lists, one-shot or repeating) -- all three publish the same `TELEOP` key, which reaches `/joy` on the robot.
+   - **Teleop** -> a tabbed popup: **Gamepad** (drives from a real physical controller plugged into your machine via the browser's Gamepad API), **Virtual Gamepad** (an on-screen fake Xbox/PlayStation/TV-remote/joystick controller, click or touch its buttons and sticks -- includes a fullscreen toggle for the panel), **Raw** (hand-typed axes/buttons lists, one-shot or repeating), and **Keyboard** (WASD/arrow keys + Q/E for axes, Space/Shift/Ctrl for buttons -- game-style quick controls, only listens while the popup is open and this tab is active) -- all four publish the same `TELEOP` key, which reaches `/joy` on the robot.
 3. Confirm on the robot side: `ros2 topic echo /joy` while driving from any Teleop tab should show live `Joy` messages.
 
 This is also the path that exercises `VIEWER_BLOCKED_KEYS` (a project
