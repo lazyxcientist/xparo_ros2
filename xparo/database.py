@@ -227,7 +227,26 @@ class XP_Database():
             "public_ip": return_dict["public_ip"] 
         }
 
-        private_send(json.dumps({"ADD_robots_info": return_dict}), command_for="rest")
+        # No command_for override, unlike ROBOT_HEARTBEAT just below this --
+        # this is deliberately sent over whichever transport is actually
+        # active (websocket, when connection_type is "websocket"/"hybrid"-
+        # connected), not forced over REST. REST's Project_dash(None, ...)
+        # has no live consumer to work with (self.socket is None there), so
+        # Django's ADD_robots_info handler can resolve/create the robot row
+        # but can never join this connection to its 'robot'+id channel
+        # group -- the exact group Manage_Dash.py's send_to_robot targets
+        # for RUN_COMMAND/TELEOP/file-transfer. Forcing REST here meant
+        # every websocket-connected robot that hadn't yet been issued (and
+        # reconnected with) a RobotCredential could look fully "connected"
+        # while every one of those silently reached nobody -- confirmed
+        # live: group_send to a group with no members is a silent no-op.
+        # Sending over the real transport lets the websocket-side handler
+        # (which does have a live consumer) join the group as soon as
+        # device_id resolves a robot row, exactly like a credentialed
+        # connection already can from connect() itself. rest/hybrid-
+        # fallback robots are unaffected -- _effective_transport() already
+        # resolves this to "rest" for them, identical to before.
+        private_send(json.dumps({"ADD_robots_info": return_dict}))
 
         # Trigger a log update immediately upon connection
         self.trigger_log_update(private_send)

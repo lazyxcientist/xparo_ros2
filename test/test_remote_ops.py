@@ -7,6 +7,7 @@ driving them; test_engine.py covers the dispatch wiring on top of this.
 import base64
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -119,7 +120,11 @@ def test_list_files_reports_tree(tmp_path):
 def test_handle_list_files_sends_file_list(tmp_path):
     responses = []
     remote_ops.handle_list_files(str(tmp_path), responses.append)
-    assert responses == [{"FILE_LIST": {"tree": []}}]
+    # base_dir lets the file browser show exactly where on the robot's
+    # filesystem these files live (e.g. to cd there over a Terminal
+    # session) -- always the resolved absolute path, regardless of
+    # whether tmp_path itself was passed in as one.
+    assert responses == [{"FILE_LIST": {"tree": [], "base_dir": str(Path(tmp_path).resolve())}}]
 
 
 def test_handle_delete_file_success(tmp_path):

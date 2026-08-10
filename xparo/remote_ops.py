@@ -144,7 +144,13 @@ def list_files(base_dir):
 
 
 def handle_list_files(base_dir, send_response):
-    send_response({"FILE_LIST": {"tree": list_files(base_dir)}})
+    # base_dir surfaced alongside the tree so the file browser can show
+    # exactly where on the robot's filesystem these files actually live
+    # (e.g. for finding them again over a Terminal/SSH session) -- without
+    # this, "transferred_files" is a name with no path, and every robot's
+    # is a different absolute location (ros_packages/.../transferred_files
+    # under wherever that particular checkout lives).
+    send_response({"FILE_LIST": {"tree": list_files(base_dir), "base_dir": str(Path(base_dir).resolve())}})
 
 
 def handle_delete_file(base_dir, rel_path, send_response):
