@@ -19,6 +19,7 @@ below) and want to poke at what it can do.
 ## Contents
 
 - [Quick start: a local robot + local Django server](#quick-start-a-local-robot--local-django-server)
+- [Copy-paste terminal recipes](#copy-paste-terminal-recipes)
 - [How messages actually travel](#how-messages-actually-travel)
 - [The dispatch-key API, capability by capability](#the-dispatch-key-api-capability-by-capability)
 - [Prompts, task history, and the other dashboard databases](#prompts-task-history-and-the-other-dashboard-databases)
@@ -83,6 +84,189 @@ either through that dashboard page or directly over the socket.
 
 ---
 
+## Copy-paste terminal recipes
+
+Everything below assumes the Quick Start's node is already running and
+connected in its own terminal -- these all run from a **second** terminal,
+from the repo root (not `ros_packages/`), with your venv active. Every
+one of these was actually run against a real local server and a real
+connected node while writing this, not written from reading the code --
+the note after each recipe says what that run actually showed.
+
+Each recipe is two parts on purpose: a command that *sends* something,
+and a command that *proves it actually landed* -- reading the response
+back off the socket only tells you Django accepted the message, not that
+a row (or a `/joy` message, or a file) actually exists on the other end.
+
+**Don't call `Manage_Dash.py`'s `Project_dash`/`send_to_robot` directly
+from a script.** It's tempting -- it's the function that actually does the
+work -- but it's an unwrapped `async def` with no `@async_to_sync`, and
+`Project_dash(None, project_id)` (matching the REST view's own
+constructor call) leaves `self.socket` `None`, which makes `send_to_robot`
+a silent no-op on top of that. Calling it via `threading.Thread(target=...)`
+the way `Manage_Dash.py` itself does only actually runs because that code
+executes *inside a live Channels consumer*; from a bare script it just
+creates a coroutine that's never awaited and quietly does nothing --
+confirmed empirically (no error, no delivery, robot's own log stayed
+silent) while writing this. **Open a real WebSocket to `ws/dash_app/...`
+instead**, exactly like the dashboard frontend does -- that's what every
+recipe below does, and it's the one way from a plain script that's
+actually been confirmed to work.
+
+**Get a session cookie** (once per terminal session -- every recipe below
+reuses `$SESSIONID`; needs `requests` and `websocket-client`, both already
+in `requirements.txt`):
+
+```bash
+export SESSIONID=$(python3 -c "
+import requests
+s = requests.Session()
+s.get('http://127.0.0.1:8000/login')
+csrf = s.cookies.get('csrftoken')
+s.post('http://127.0.0.1:8000/login',
+    data={'username': '<your-username>', 'password': '<your-password>', 'csrfmiddlewaretoken': csrf},
+    headers={'Referer': 'http://127.0.0.1:8000/login'})
+print(s.cookies.get('sessionid') or '')
+")
+[ -n "$SESSIONID" ] && echo "logged in: SESSIONID=$SESSIONID" || echo "login FAILED -- check username/password"
+```
+
+**Send a shell command to the robot and confirm the audit log (`RemoteCommandLog`) recorded it:**
+
+```bash
+python3 -c "
+import json, os, websocket
+ws = websocket.create_connection(
+    'ws://127.0.0.1:8000/ws/dash_app/<your-username>/<project_id>/',
+    cookie=f'sessionid={os.environ[\"SESSIONID\"]}',
+)
+ws.send(json.dumps({'p': {'<project_id>': {'RUN_COMMAND': {
+    'robot_id': '<robot_id>', 'command': 'echo hello-from-testing-md', 'request_id': 'manual-test-1',
+}}}}))
+print(ws.recv())  # {'message': {'COMMAND_RESULT': {..., 'output': 'hello-from-testing-md', ...}}}
+"
+
+python manage.py shell -c "
+from apps.analytics.models import RemoteCommandLog
+log = RemoteCommandLog.objects.get(request_id='manual-test-1')
+print(log.command, '->', log.output, 'exit', log.exit_code)
+"
+```
+
+> Actually ran this: got `COMMAND_RESULT` back with `output: "hello-from-testing-md"`
+> immediately, and the `RemoteCommandLog` row was there on the very next query
+> (it's written at *request* time with the command, then the same row's
+> `output`/`exit_code` fill in when `COMMAND_RESULT` arrives -- see the table
+> below -- so it exists even before the reply comes back, it just won't have
+> `output` yet).
+
+(`<robot_id>` is the UUID shown under the robot's name in the dashboard,
+or `python manage.py shell -c "from apps.analytics.models import Robots; [print(r.id, r.hostname) for r in Robots.objects.all()]"`.)
+
+**Drive `/joy` and confirm the robot side actually publishes it** (no
+Django database row for this one -- `/joy` is a live topic, not a stored
+record, so the proof is `ros2 topic echo`, run in a **third** terminal,
+started *before* the send):
+
+```bash
+# terminal 3 -- start this first and leave it running
+ros2 topic echo /joy
+
+# terminal 2
+python3 -c "
+import json, os, websocket
+ws = websocket.create_connection(
+    'ws://127.0.0.1:8000/ws/dash_app/<your-username>/<project_id>/',
+    cookie=f'sessionid={os.environ[\"SESSIONID\"]}',
+)
+ws.send(json.dumps({'p': {'<project_id>': {'TELEOP': {
+    'robot_id': '<robot_id>', 'axes': [0.5, 0, 0, 0], 'buttons': [1, 0, 0],
+}}}}))
+print(ws.recv())  # {'message': {'TELEOP_ACK': {'success': True}}}
+"
+```
+
+> Actually ran this: `TELEOP_ACK` came back, and terminal 3 printed a real
+> `Joy` message with `axes: [0.5, 0.0, 0.0, 0.0]` / `buttons: [1, 0, 0]` --
+> exactly the values sent, nothing zero-padded away.
+
+**Record a task and confirm it's queryable** (this one drives `Engine`
+directly rather than going through Django's dash-side socket, since
+`Engine.add_task_history` is the actual public API a developer would call
+from their own robot-side code -- see [Prompts, task
+history...](#prompts-task-history-and-the-other-dashboard-databases). This
+one connects a brand new `Engine`, so it's a second, independent
+connection for this run's `device_id` -- fine for a quick test, but don't
+leave it running alongside your real node long-term):
+
+```bash
+timeout 10 python3 -c "
+import sys, time
+sys.path.insert(0, 'ros_packages/src/xparo')
+from xparo.engine import Engine
+
+e = Engine('<raw_secret>', '<project_id>', connection_type='websocket', environment='local')
+e.connect()
+time.sleep(2)  # let the handshake finish
+e.add_task_history({
+    'input_data': {'prompt': 'testing.md manual check'},
+    'output_data': {'result': 'ok'},
+    'type': 'manual_test',
+})
+time.sleep(2)  # let it actually reach Django before the process exits
+"
+# (the `timeout` is load-bearing -- connect() spawns a non-daemon
+# reconnect thread, so the process never exits on its own otherwise)
+
+python manage.py shell -c "
+from apps.analytics.models import Task_history
+t = Task_history.objects.filter(type='manual_test').latest('created_at')
+print(t.id, t.type, t.input_data, t.created_at)
+"
+```
+
+> Actually ran this: the row was there on the first query afterward, with
+> `input_data` exactly as sent.
+
+**List files and confirm against the filesystem directly** (this
+capability's "database" *is* the filesystem -- but under `colcon build
+--symlink-install`, `transferred_files/` is a real copy in the *install*
+tree, not a symlink back to `src/xparo/`, the way the Python source is.
+Don't assume `ros_packages/src/xparo/transferred_files/` -- ask
+`LIST_FILES` itself, which reports the base dir it's actually reading, per
+`remote_ops.py`):
+
+```bash
+python3 -c "
+import json, os, websocket
+ws = websocket.create_connection(
+    'ws://127.0.0.1:8000/ws/dash_app/<your-username>/<project_id>/',
+    cookie=f'sessionid={os.environ[\"SESSIONID\"]}',
+)
+ws.send(json.dumps({'p': {'<project_id>': {'LIST_FILES': {'robot_id': '<robot_id>'}}}}))
+print(ws.recv())  # {'message': {'FILE_LIST': {'tree': [...], 'base_dir': '/actual/real/path'}}}
+"
+# copy the base_dir from that response, then:
+ls -la '<base_dir from above>'
+```
+
+> Actually ran this against a real `--symlink-install` build: `base_dir`
+> came back as `.../ros_packages/install/xparo/lib/python3.12/site-packages/transferred_files`
+> -- a file dropped into `ros_packages/src/xparo/transferred_files/`
+> beforehand did **not** show up in `FILE_LIST` at all, exactly because it
+> was never in the directory the running node actually reads. Confirmed
+> `ls` against the reported `base_dir` matched `FILE_LIST`'s contents
+> exactly.
+
+These all go through the real production path (a real `ws/dash_app/...`
+connection, same as the dashboard frontend), so a `VIEWER_BLOCKED_KEYS`-
+restricted role blocks `RUN_COMMAND`/`TELEOP`/`DELETE_FILE`/file-transfer
+here too (see [Auth](#auth-project-secret-vs-per-robot-credential) below)
+-- log in as a Viewer to confirm that boundary holds from the terminal,
+not just the UI.
+
+---
+
 ## How messages actually travel
 
 ```
@@ -125,7 +309,7 @@ from at all.
 |---|---|---|---|
 | `RUN_COMMAND` | `{robot_id, command, request_id, timeout?}` | Runs `command` in a shell subprocess on the robot (own thread per command; a hang or crash can't take the node down). `timeout` clamps to 1-300s (`remote_ops.MAX_COMMAND_TIMEOUT_SEC`), default 30s. Output is tail-truncated to the last 50 lines. | `COMMAND_RESULT` |
 | `TELEOP` | `{robot_id, axes: [float...], buttons: [0/1...]}` | Publishes a `sensor_msgs/Joy` to **`/joy`**. Short lists are zero-padded up to `MIN_JOY_AXES=4` / `MIN_JOY_BUTTONS=3` server-side (`remote_ops.py`) so a short payload can never crash a downstream controller indexing `axes[0..3]`/`buttons[0..2]`. | `TELEOP_ACK` |
-| `LIST_FILES` | `{robot_id}` | Recursively lists `ros_packages/src/xparo/transferred_files/` (the same directory uploads/downloads use). | `FILE_LIST` (`tree`: nested file/folder objects with `size`) |
+| `LIST_FILES` | `{robot_id}` | Recursively lists the package's `transferred_files/` directory (the same one uploads/downloads use) -- **not necessarily `ros_packages/src/xparo/transferred_files/`**: under `colcon build --symlink-install`, that directory is a real copy in the *install* tree, not a symlink, so the node actually reads/writes wherever it was installed. `FILE_LIST`'s own `base_dir` field is the ground truth -- see [Copy-paste terminal recipes](#copy-paste-terminal-recipes) for a live example of this tripping someone up. | `FILE_LIST` (`tree`: nested file/folder objects with `size`; `base_dir`: the real resolved path) |
 | `DELETE_FILE` | `{robot_id, path}` | Deletes one file under `transferred_files/`. Path-traversal-guarded (resolves + checks the result is still inside the base dir). | `DELETE_ACK` |
 | `FILE_REQ` | `{robot_id, filename, direction: "upload"\|"download", size?}` | Starts a transfer. `upload`: robot opens the destination file and acks `ready:true`. `download`: robot streams the file back as base64 `FILE_CHUNK`s. | `FILE_REQ` (echoed with `ready`/`size`), then chunks |
 | `FILE_CHUNK` | `{robot_id, data}` (base64) | One 64KiB-or-less chunk of an in-progress upload. | — |
