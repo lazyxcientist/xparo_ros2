@@ -231,3 +231,70 @@ def test_persist_credential_writes_the_project_id_alongside_the_value(tmp_path):
     with open(engine.xparo_credential_path) as f:
         stored = json_module.load(f)
     assert stored == {"value": "some-secret", "project_id": "proj-engine-test"}
+
+
+def test_persisted_credential_wires_the_fallback_callback_into_the_transport():
+    """Only a connection actually using a *persisted* credential should get
+    a way to fall back -- see _fall_back_to_raw_secret's own docstring for
+    why a raw xparo_secret_key launch argument has nothing to fall back to
+    (a genuinely wrong/revoked secret should just keep failing normally).
+    """
+    with patch('xparo.engine.Engine._load_persisted_credential', return_value='persisted-secret'):
+        engine = _make_engine()
+    assert engine.transport.on_persisted_credential_rejected == engine._fall_back_to_raw_secret
+
+
+def test_raw_secret_key_does_not_wire_the_fallback_callback():
+    with patch('xparo.engine.Engine._load_persisted_credential', return_value=None):
+        engine = _make_engine()
+    assert engine.transport.on_persisted_credential_rejected is None
+
+
+def test_fall_back_to_raw_secret_clears_the_file_and_replaces_the_transport(tmp_path):
+    """Regression test for a bug confirmed live: a persisted ROBOT_CREDENTIAL
+    left over from before its Robots/RobotCredential row was deleted (or
+    rotated) server-side gets rejected with a 403 forever -- since
+    run_forever(reconnect=N) just keeps retrying the same doomed URL, a
+    perfectly valid xparo_secret_key argument would never actually get
+    tried without this recovering on its own. Covers the actual recovery:
+    the stale file is removed, the dead transport is closed (not left
+    retrying alongside the new one), and a fresh transport is built from
+    the *original* secret_key argument and told to connect.
+    """
+    import os
+
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine._persist_credential("stale-value")
+    assert os.path.exists(engine.xparo_credential_path)
+
+    old_transport = engine.transport
+    old_transport.close = MagicMock()
+
+    with patch('xparo.engine.DjangoWsTransport') as mock_transport_cls:
+        new_transport = mock_transport_cls.return_value
+        engine._fall_back_to_raw_secret()
+
+    old_transport.close.assert_called_once()
+    assert not os.path.exists(engine.xparo_credential_path)
+    mock_transport_cls.assert_called_once()
+    # "secret" is _make_engine()'s raw secret_key -- the whole point is
+    # this must be the constructor argument, never the stale persisted one.
+    assert mock_transport_cls.call_args.args[0] == "secret"
+    assert mock_transport_cls.call_args.args[1] == engine.project_id
+    new_transport.connect.assert_called_once()
+    assert engine.transport is new_transport
+
+
+def test_fall_back_to_raw_secret_tolerates_an_already_missing_file(tmp_path):
+    """Defensive: if the file was already removed (e.g. by another process,
+    or a previous call), this must not raise -- only ever meant to run
+    once per Engine instance in practice (on_ws_error only fires the
+    callback once), but should be safe regardless.
+    """
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "does-not-exist.json")
+    engine.transport.close = MagicMock()
+
+    with patch('xparo.engine.DjangoWsTransport'):
+        engine._fall_back_to_raw_secret()  # must not raise

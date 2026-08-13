@@ -95,6 +95,86 @@ def test_on_ws_error_marks_disconnected():
     assert transport.websocket_connected is False
 
 
+def test_on_ws_error_403_fires_persisted_credential_callback_once():
+    """Regression test for a bug found via a real local-testing session
+    (Phase 8): a persisted ROBOT_CREDENTIAL that's since been invalidated
+    server-side (its Robots/RobotCredential row deleted or rotated) gets
+    rejected with a 403 on the very first handshake attempt -- and without
+    this callback, run_forever(reconnect=N) would just keep retrying that
+    exact same doomed URL forever, so a perfectly valid xparo_secret_key
+    argument would never actually get tried. on_ws_error only ever fires
+    once per real outage (see websocket_connected's own docstring), so the
+    callback must fire on that first 403 and then never again for this
+    transport instance.
+    """
+    callback = MagicMock()
+    transport = _make_transport(on_persisted_credential_rejected=callback)
+    error = MagicMock()
+    error.status_code = 403
+
+    transport.on_ws_error(None, error)
+    assert callback.call_count == 1
+    assert transport.on_persisted_credential_rejected is None
+
+    # A second error on the same (now stale) transport must not re-fire it.
+    transport.on_ws_error(None, error)
+    assert callback.call_count == 1
+
+
+def test_on_ws_error_non_403_does_not_fire_persisted_credential_callback():
+    """A genuinely wrong/revoked project secret (or any other handshake
+    failure) has nothing to fall back to -- only a 403 specifically while
+    using a persisted credential should trigger the swap.
+    """
+    callback = MagicMock()
+    transport = _make_transport(on_persisted_credential_rejected=callback)
+
+    transport.on_ws_error(None, RuntimeError("connection refused"))
+    callback.assert_not_called()
+
+    error = MagicMock()
+    error.status_code = 500
+    transport.on_ws_error(None, error)
+    callback.assert_not_called()
+
+
+def test_on_ws_error_403_without_callback_does_not_raise():
+    """A raw xparo_secret_key launch argument (not a persisted credential)
+    wires on_persisted_credential_rejected=None -- a 403 there is just a
+    genuinely bad secret and must fall through to the normal error path
+    without blowing up on a None call.
+    """
+    transport = _make_transport()  # on_persisted_credential_rejected defaults to None
+    error = MagicMock()
+    error.status_code = 403
+    transport.on_ws_error(None, error)  # must not raise
+
+
+def test_close_stops_the_websocket_and_marks_disconnected():
+    transport = _make_transport(connection_type="hybrid")
+    transport.rest_fallback_active = True
+    fake_ws = MagicMock()
+    # websocket_connected reads straight from ws.sock.connected once it
+    # exists (see test_websocket_connected_tracks_live_socket_state) --
+    # simulate the socket actually being down, same as a real close()
+    # would leave it, rather than asserting against the manually-tracked
+    # fallback value close() also sets but which this property ignores
+    # whenever a live ws.sock is present.
+    fake_ws.sock = MagicMock(connected=False)
+    transport.ws = fake_ws
+
+    transport.close()
+
+    fake_ws.close.assert_called_once()
+    assert transport.websocket_connected is False
+    assert transport.rest_fallback_active is False
+
+
+def test_close_before_connect_does_not_raise():
+    transport = _make_transport()  # never had connect() called, no self.ws yet
+    transport.close()  # must not raise
+
+
 def test_on_ws_open_marks_connected_and_clears_fallback_and_fires_callback():
     on_connected = MagicMock()
     transport = _make_transport(connection_type="hybrid", on_connected=on_connected)

@@ -55,7 +55,8 @@ class DjangoWsTransport(Transport):
     """
 
     def __init__(self, secret_key, project_id, on_message, on_connected=None,
-                 connection_type="websocket", environment=None):
+                 connection_type="websocket", environment=None,
+                 on_persisted_credential_rejected=None):
         super().__init__(on_message, on_connected)
         self.connection_type = connection_type
         # Backing store for the websocket_connected property below -- used
@@ -67,6 +68,12 @@ class DjangoWsTransport(Transport):
         # _hybrid_watchdog_loop/_hybrid_rest_fallback_loop below. Unused
         # (and harmless) for the other connection_type values.
         self.rest_fallback_active = False
+        # Set by engine.py only when secret_key here came from a persisted
+        # ROBOT_CREDENTIAL (config/credential.json), never for a raw
+        # xparo_secret_key launch argument -- see on_ws_error below for why
+        # that distinction matters. None means "nothing to fall back to,
+        # a 403 here is just a genuinely wrong/revoked secret."
+        self.on_persisted_credential_rejected = on_persisted_credential_rejected
 
         environment = environment or DEFAULT_ENVIRONMENT
         is_local = environment == "local"
@@ -159,6 +166,18 @@ class DjangoWsTransport(Transport):
         ###################################################
         #### getting initial data..
 
+    def close(self):
+        # Stops run_forever's own retry loop (sets its keep_running flag
+        # and closes the underlying socket) -- websocket-client has no
+        # separate "stop reconnecting" call, closing is the one mechanism.
+        # Safe to call whether or not connect() ever actually got as far as
+        # creating self.ws (e.g. "rest"/"offline" modes, or a transport
+        # that's being retired before its first connect() attempt).
+        self.rest_fallback_active = False
+        if getattr(self, "ws", None) is not None:
+            self.ws.close()
+        self.websocket_connected = False
+
     def _effective_transport(self):
         """connection_type=="hybrid" isn't itself a valid transport -- it's
         websocket when connected, REST while _hybrid_rest_fallback_loop is
@@ -204,6 +223,27 @@ class DjangoWsTransport(Transport):
         # relied on for websocket/hybrid liveness once self.ws.sock exists.
         self.websocket_connected = False
         print(error)
+
+        # A 403 on the very first attempt, specifically while using a
+        # persisted ROBOT_CREDENTIAL, means that credential is no longer
+        # valid server-side (its robot/credential row was deleted or
+        # rotated) but the stale config/credential.json is still on disk,
+        # silently overriding whatever xparo_secret_key was actually passed
+        # to this launch. Without this, run_forever(reconnect=N) just keeps
+        # retrying the same doomed URL forever -- confirmed happening for
+        # real: a perfectly valid secret_key argument produced a permanent
+        # 403 loop with no indication it was never actually tried. Only
+        # fire once (on_ws_error's own "first attempt only" behavior
+        # already gives us that), and only when engine.py told us this
+        # secret came from the persisted file in the first place -- a
+        # genuinely wrong/revoked project secret typed by a user should
+        # still just fail normally, nothing to fall back to there.
+        if self.on_persisted_credential_rejected is not None and getattr(error, 'status_code', None) == 403:
+            callback = self.on_persisted_credential_rejected
+            self.on_persisted_credential_rejected = None
+            callback()
+            return
+
         print(f'''
         Truble shooting:
             1. check your internet connection

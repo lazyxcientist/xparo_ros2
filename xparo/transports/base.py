@@ -40,3 +40,14 @@ class Transport(ABC):
         websocket vs. REST vs. offline; transports that only have one way
         to send can ignore it)."""
         raise NotImplementedError
+
+    @abstractmethod
+    def close(self):
+        """Stop connecting/reconnecting and release any background threads
+        or sockets this transport owns. Must be safe to call even if
+        connect() was never called or the transport was never actually up.
+        Engine uses this to retire a transport it's about to replace (see
+        engine.py's _fall_back_to_raw_secret) -- without it, the old
+        transport's reconnect loop would keep retrying a doomed connection
+        forever alongside the new one."""
+        raise NotImplementedError

@@ -79,7 +79,13 @@ class Engine():
                         }
 
         self.project_id = project_id
-        effective_secret = self._load_persisted_credential() or secret_key
+        # Kept for _fall_back_to_raw_secret below -- the one value that
+        # must never get silently lost if a persisted credential turns out
+        # to be stale.
+        self._raw_secret_key = secret_key
+        self._environment = environment
+        persisted_credential = self._load_persisted_credential()
+        effective_secret = persisted_credential or secret_key
 
         # Everything about *how* a message actually gets to its peer lives
         # in the transport (see transports/base.py's Transport ABC
@@ -105,6 +111,13 @@ class Engine():
                 on_connected=self.send_initial_data,
                 connection_type=connection_type,
                 environment=environment,
+                # Only give the transport a way to fall back if this
+                # attempt is actually using a *persisted* credential, not
+                # a raw xparo_secret_key -- see _fall_back_to_raw_secret's
+                # own docstring for why the distinction matters.
+                on_persisted_credential_rejected=(
+                    self._fall_back_to_raw_secret if persisted_credential else None
+                ),
             )
 
         # tethered_tcp has no Django to talk to at all (that's the whole
@@ -157,6 +170,39 @@ class Engine():
         os.makedirs(os.path.dirname(self.xparo_credential_path), exist_ok=True)
         with open(self.xparo_credential_path, 'w') as file:
             json.dump({'value': raw_value, 'project_id': self.project_id}, file)
+
+    def _fall_back_to_raw_secret(self):
+        """Called at most once, from the transport's on_ws_error, the
+        moment a persisted ROBOT_CREDENTIAL gets rejected with a 403 on its
+        very first handshake attempt -- meaning the credential is no
+        longer valid server-side (its Robots/RobotCredential row was
+        deleted or rotated) even though this project_id still matches.
+        _load_persisted_credential's own project-scoping check (see its
+        docstring) only catches a stale file left over from a *different*
+        project; it has no way to know a same-project credential has since
+        been invalidated, and without this, run_forever(reconnect=N) would
+        keep retrying that exact same doomed URL forever -- a perfectly
+        valid xparo_secret_key argument would never actually get tried.
+
+        Only wired up when this connection actually started from a
+        persisted credential (see __init__) -- a real bad/revoked project
+        secret typed by an operator has nothing to fall back to and should
+        keep failing normally.
+        """
+        print("persisted ROBOT_CREDENTIAL was rejected (403) -- clearing it and retrying with the original secret_key")
+        try:
+            os.remove(self.xparo_credential_path)
+        except FileNotFoundError:
+            pass
+        self.transport.close()
+        self.transport = DjangoWsTransport(
+            self._raw_secret_key, self.project_id,
+            on_message=self.on_ws_message,
+            on_connected=self.send_initial_data,
+            connection_type=self.connection_type,
+            environment=self._environment,
+        )
+        self.transport.connect()
 
     def _logging_update_loop(self):
         # Heartbeat runs unconditionally, every HEARTBEAT_INTERVAL_SECONDS,
