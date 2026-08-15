@@ -165,6 +165,10 @@ class Xparo(Node):
         # (Phase 12) -- before connect(), so a RUN_TASK referencing a
         # plugin tag can never race a fresh boot that hasn't loaded it yet.
         self.xparo_engine.sync_bt_plugins()
+        # Same reasoning as sync_bt_plugins just above, for Phase 13's
+        # inline-authored nodes -- persisted per-node .py files under
+        # custom_behaviors/inline_nodes/ from a previous sync.
+        self.xparo_engine.sync_bt_inline_nodes()
         self.xparo_engine.connect()
 
 

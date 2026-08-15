@@ -7,7 +7,7 @@ from py_trees import common
 
 from xparo.bt_engine import tree_builder
 from xparo.bt_engine.node_registry import NODE_REGISTRY
-from xparo.bt_engine.plugin_loader import CustomBTNode, load_plugins, register_plugins
+from xparo.bt_engine.plugin_loader import CustomBTNode, load_plugins, register_plugins, unregister_tags
 
 CUSTOM_NODE_SOURCE = '''
 from xparo.bt_engine.plugin_loader import CustomBTNode
@@ -133,6 +133,21 @@ def _make_engine(tmp_path, **kwargs):
     # really write plugin_paths.json into.
     engine.files["xparo_custom_behaviors_folder_path"] = str(tmp_path)
     return engine
+
+
+class TestUnregisterTags:
+    def test_a_registered_tag_is_removed(self, tmp_path):
+        plugin_file = tmp_path / "my_plugin.py"
+        plugin_file.write_text(CUSTOM_NODE_SOURCE)
+        register_plugins([str(plugin_file)])
+        assert "MyCustomAction" in NODE_REGISTRY
+
+        unregister_tags(["MyCustomAction"])
+
+        assert "MyCustomAction" not in NODE_REGISTRY
+
+    def test_a_tag_that_was_never_registered_is_a_safe_noop(self):
+        unregister_tags(["NoSuchTag"])  # must not raise
 
 
 class TestEngineSyncBtPlugins:

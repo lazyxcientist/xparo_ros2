@@ -56,6 +56,12 @@ class Engine():
         # than an AttributeError, for Engine's standalone-outside-ROS2 use
         # (see this file's own __main__ block) and every test in this repo.
         self.bt_executor = None
+        # Phase 13 -- XML tags sync_bt_inline_nodes most recently
+        # registered, so a resync can unregister exactly those before
+        # re-registering the current file set (load_plugins/register_plugins
+        # only ever add/overwrite entries, never remove ones for a file
+        # that's disappeared -- see sync_bt_inline_nodes' own docstring).
+        self._inline_node_tags = set()
         # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
         # separate from BAG_DIR (rosbag sessions) and the xparo_* config
         # paths below (behavior trees/env/properties, a different concept).
@@ -311,6 +317,70 @@ class Engine():
         loaded = plugin_loader.register_plugins(enabled_paths)
         print(f"[bt_engine] loaded plugin tags: {list(loaded.keys())}")
 
+    def sync_bt_inline_nodes(self, inline_code=None):
+        """Phase 13. inline_code is Project_Dashboard.custom_bt_node_inline_code's
+        shape ({node_name: python_source}) fresh from Django when
+        resyncing -- persisted here as one file per node under
+        custom_behaviors/inline_nodes/, then loaded through the exact same
+        plugin_loader.register_plugins() Phase 12 built (inline code is
+        just another set of .py paths on disk by the time it reaches the
+        loader). None means "load whatever was persisted from a previous
+        sync" (the startup case, called once from xparo_ros.py's
+        __init__, mirroring sync_bt_plugins).
+
+        Unlike custom_aiml/custom_maps/custom_bt_node_plugins above, a
+        node removed from Django's dict has its on-disk file deleted here
+        too rather than left in place -- CustomNodeCodeLog logs a
+        "deleted" action for exactly this case on the Django side, and
+        leaving the file behind would mean a project owner "deleting" a
+        node has no actual effect on what can still run on the robot.
+
+        Which node names currently exist is tracked via an explicit
+        manifest file (same idea as plugin_paths.json above), not by
+        os.listdir()-ing the folder -- an import can leave a __pycache__/
+        entry behind next to the .py files, which a raw directory listing
+        would otherwise hand to the loader as if it were a plugin path.
+        """
+        folder = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'inline_nodes')
+        manifest_path = os.path.join(folder, 'manifest.json')
+        if inline_code is not None:
+            os.makedirs(folder, exist_ok=True)
+            previous_names = set()
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r') as file:
+                    try:
+                        previous_names = set(json.load(file))
+                    except json.JSONDecodeError:
+                        previous_names = set()
+            for stale_name in previous_names - set(inline_code):
+                try:
+                    os.remove(os.path.join(folder, stale_name + '.py'))
+                except OSError:
+                    pass
+            for name, source in inline_code.items():
+                with open(os.path.join(folder, name + '.py'), 'w') as file:
+                    file.write(source)
+            with open(manifest_path, 'w') as file:
+                json.dump(list(inline_code.keys()), file)
+
+        names = []
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r') as file:
+                try:
+                    names = json.load(file)
+                except json.JSONDecodeError:
+                    names = []
+        paths = [os.path.join(folder, name + '.py') for name in names]
+        # Unregister whatever this method itself most recently loaded
+        # before reloading -- a file renamed or deleted between two syncs
+        # must not leave its old tag runnable in NODE_REGISTRY (see
+        # plugin_loader.unregister_tags' own docstring for why
+        # register_plugins alone can't do this).
+        plugin_loader.unregister_tags(self._inline_node_tags)
+        loaded = plugin_loader.register_plugins(paths)
+        self._inline_node_tags = set(loaded.keys())
+        print(f"[bt_engine] loaded inline node tags: {list(loaded.keys())}")
+
     def live_updates(self, msg):
         try:
             data = json.loads(msg.data)
@@ -428,6 +498,15 @@ class Engine():
                 # in this block, then actually (re)load whichever paths are
                 # enabled into NODE_REGISTRY.
                 self.sync_bt_plugins(val)
+            elif k=="custom_bt_node_inline_code":
+                # Phase 13 -- val is Project_Dashboard.custom_bt_node_inline_code's
+                # shape ({node_name: python_source}). Django only ever
+                # sends this once role-gating + the allow_inline_bt_code
+                # opt-in have both already passed (Manage_Dash.py's
+                # save_aiml), so no trust decision is made here -- this
+                # robot trusts whatever its own project's Django instance
+                # relays, same as every other sync branch in this method.
+                self.sync_bt_inline_nodes(val)
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":

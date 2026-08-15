@@ -84,6 +84,20 @@ def load_plugins(paths):
     return registry
 
 
+def unregister_tags(tags):
+    """Removes exactly these tags from NODE_REGISTRY, if present. Needed
+    by callers (sync_bt_inline_nodes) that must fully clear a previous
+    sync's registrations before re-registering the current file set --
+    load_plugins/register_plugins only ever add or overwrite entries by
+    tag, they never remove one whose backing file has since disappeared
+    or been renamed.
+    """
+    from .node_registry import NODE_REGISTRY
+
+    for tag in tags:
+        NODE_REGISTRY.pop(tag, None)
+
+
 def register_plugins(paths):
     """load_plugins() + wires each result into node_registry.NODE_REGISTRY
     using the same calling convention every other builder there already
