@@ -81,17 +81,25 @@ def _paused_response(paused):
     return FakeFuture(result=MagicMock(paused=paused))
 
 
-def _make_control(bag_dir='/tmp/bags'):
+def _make_control(bag_dir='/tmp/bags', start_mode='task', start_delay_seconds=0):
     """Constructs against a discovery-not-running response so __init__'s
-    resync()->handle_stop() boot sequence resolves to a clean CLOSED
-    baseline with no further calls (the common, simplest case) -- tests
-    that care about a different starting state reconfigure fake clients
-    and call resync()/handle_start()/handle_stop() again explicitly.
+    resync()->_boot_sequence()->handle_stop() boot sequence resolves to a
+    clean CLOSED baseline with no further calls (the common, simplest
+    case) -- tests that care about a different starting state reconfigure
+    fake clients and call resync()/handle_start()/handle_stop() again
+    explicitly. Defaults start_mode to 'task' (not RosbagControl's own
+    'auto' default) specifically so this shared baseline never itself
+    triggers an auto-start -- most existing tests assume a clean CLOSED
+    baseline with zero record/resume calls made yet; see
+    TestBootSequenceAutoStart below for the 'auto' behavior itself.
     """
     node = FakeNode()
     control = RosbagControl.__new__(RosbagControl)
     control.node = node
     control.bag_dir = bag_dir
+    control.start_mode = start_mode
+    control.start_delay_seconds = max(0, start_delay_seconds or 0)
+    control._start_delay_timer = None
     control.state = UNKNOWN
     control.recorder_alive = False
     from rosbag2_interfaces.srv import Record, Stop, Resume, SplitBagfile, IsPaused, IsDiscoveryRunning
@@ -104,7 +112,7 @@ def _make_control(bag_dir='/tmp/bags'):
     control.status_pub = MagicMock()
     control.alive_pub = MagicMock()
     control.is_discovery_client.queue_response(_discovery_response(False))
-    control.resync(on_done=control.handle_stop)
+    control.resync(on_done=control._boot_sequence)
     return control
 
 
@@ -266,3 +274,103 @@ def test_split_disabled_via_control_cb_never_reaches_split_client():
     msg = MagicMock(data='split')
     control.control_cb(msg)
     assert control.split_client.calls == []
+
+
+class TestBootSequenceAutoStart:
+    """Regression coverage for a real bug found live: record_bags:=true
+    used to have TWO independent, uncoordinated actors both acting around
+    boot -- RosbagControl.__init__'s own "close the launch-time throwaway
+    session" cleanup, and XP_Database.__init__ separately calling
+    start_recording() the moment Engine was constructed. Both chains are
+    async with nothing serializing them, so whichever service call landed
+    on the recorder last silently won -- confirmed live as a session
+    opening, being told to resume, and then immediately being closed and
+    compressed again by the constructor's own cleanup landing right after.
+    _boot_sequence is the fix: auto-starting is now entirely
+    RosbagControl's own decision, chained strictly *after* the cleanup is
+    verified CLOSED, never racing a second, external start call (which no
+    longer exists at all -- see database.py).
+    """
+
+    def _fire_pending_timer(self, node):
+        """Simulate whichever _verify_after timer is currently pending
+        firing -- FakeNode.create_timer only records (period, callback,
+        timer), it never fires on its own."""
+        period, callback, timer = node.timers[-1]
+        callback()
+
+    def _boot(self, control, start_mode, start_delay_seconds, discovery_running, paused=None):
+        """_make_control() itself already ran (and fully resolved) one
+        boot sequence during construction -- always with start_mode
+        'task', so it never has side effects beyond leaving a clean
+        baseline (see _make_control's own docstring). This simulates a
+        *second*, independent boot scenario against that already-built
+        object, with whatever start_mode/discovery state this test
+        actually wants to exercise -- deliberately never passed into
+        _make_control itself, since doing so once caused a confusing
+        cascade of default-MagicMock-driven state transitions when the
+        object's own internal boot happened to hit a rejected Record call.
+        """
+        control.start_mode = start_mode
+        control.start_delay_seconds = start_delay_seconds
+        control.is_discovery_client.queue_response(_discovery_response(discovery_running))
+        if discovery_running:
+            control.is_paused_client.queue_response(_paused_response(paused))
+        control.resync(on_done=control._boot_sequence)
+
+    def test_auto_start_with_no_delay_opens_a_fresh_session_only_after_the_boot_close_is_verified(self):
+        control = _make_control()
+        # Real recorder boot state: a session already open, paused (see
+        # rosbag_control.py's own __init__ docstring on why).
+        self._boot(control, start_mode='auto', start_delay_seconds=0, discovery_running=True, paused=True)
+
+        # The boot-session close fires immediately -- exactly one Stop,
+        # and critically NOT a Resume of the old session (that was the
+        # bug: a concurrent handle_start() would have resumed it here).
+        assert len(control.stop_client.calls) == 1
+        assert control.resume_client.calls == []
+        assert control.record_client.calls == []
+
+        # Nothing opens a new session until the Stop is actually verified
+        # CLOSED -- queue that verification's resync response, then fire
+        # the pending timer to run it.
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.record_client.queue_response(FakeFuture(result=MagicMock(return_code=0, error_string='')))
+        self._fire_pending_timer(control.node)
+
+        assert control.state == CLOSED
+        # _maybe_auto_start ran as the verify's on_done -- a fresh,
+        # correctly-timestamped session is now open (Record, then Resume
+        # to start writing), not a resume of the boot-time one.
+        assert len(control.record_client.calls) == 1
+        assert control.record_client.calls[0].uri.startswith('/tmp/bags/bag_')
+        assert len(control.resume_client.calls) == 1
+
+    def test_wait_for_task_mode_never_auto_starts(self):
+        control = _make_control()
+        self._boot(control, start_mode='task', start_delay_seconds=0, discovery_running=True, paused=True)
+
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        self._fire_pending_timer(control.node)
+
+        assert control.state == CLOSED
+        assert control.record_client.calls == []
+        assert control.resume_client.calls == []
+
+    def test_auto_start_with_a_delay_waits_for_the_delay_timer_before_starting(self):
+        control = _make_control()
+        self._boot(control, start_mode='auto', start_delay_seconds=30, discovery_running=False)  # boot: already closed
+
+        # Boot-session was already closed (handle_stop no-ops), so
+        # _maybe_auto_start runs synchronously as resync's own on_done --
+        # no stop call needed, but the start must still wait for the
+        # configured delay, not fire immediately.
+        assert control.record_client.calls == []
+        delay_timers = [t for t in control.node.timers if t[0] == 30]
+        assert len(delay_timers) == 1
+
+        control.record_client.queue_response(FakeFuture(result=MagicMock(return_code=0, error_string='')))
+        _, delayed_start_cb, _ = delay_timers[0]
+        delayed_start_cb()
+
+        assert len(control.record_client.calls) == 1

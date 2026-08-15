@@ -54,9 +54,23 @@ class XP_Database():
             manager_thread = Thread(target=self.orchestrator.manage_disk_and_upload, daemon=True)
             manager_thread.start()
 
-            # Start recorder in main thread
-            self.orchestrator.start_recording()
-            
+            # Deliberately NOT calling self.orchestrator.start_recording()
+            # here anymore -- RosbagControl's own __init__ already runs a
+            # boot sequence (close whatever throwaway session the recorder
+            # auto-opened at its own process launch, then decide for
+            # itself whether/when to auto-start, per rosbag_start_mode/
+            # rosbag_start_delay_seconds) the moment it's constructed,
+            # which happens moments before this. Calling start_recording()
+            # unconditionally here too raced that sequence -- both are
+            # async (nothing blocks for rclpy to start spinning yet), so
+            # whichever one's Resume/Stop service call happened to land
+            # last on the recorder silently won, with no error anywhere.
+            # Confirmed live: a real boot with record_bags:=true opened a
+            # session, resumed it, and then had it immediately closed and
+            # compressed again by the constructor's own always-run
+            # cleanup -- the exact symptom of this race. See
+            # rosbag_control.py's __init__/_boot_sequence.
+
             # while orchestrator.running:
             #     time.sleep(1)
         ###################################################

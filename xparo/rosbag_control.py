@@ -58,6 +58,7 @@ and needs a different signal.
 """
 
 import datetime
+import json
 import os
 
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -65,6 +66,41 @@ from std_msgs.msg import String, Bool
 from rosbag2_interfaces.srv import (
     Record, Stop, SplitBagfile, IsPaused, Resume, IsDiscoveryRunning,
 )
+
+# Recording config synced from Project_Dashboard (apps/analytics/
+# data_analyis.py's GET_rosbag_config/EDIT_rosbag_config), persisted here
+# under the same custom_behaviors/ folder every other synced config
+# (plugin_paths.json, inline_nodes/) already lives in. Two independent
+# readers: xparo_ros.py reads start_mode/start_delay_seconds *before*
+# constructing RosbagControl (its __init__ kicks off the boot sequence
+# immediately, so this can't wait for Engine's own post-construction sync
+# the way BT plugin config does); xparo_launch.py reads record_all/
+# ignore_topics/include_topics to build `ros2 bag record`'s command line
+# for the *next* launch -- topic selection is a subprocess launch
+# argument, not something re-appliable to an already-running recorder.
+ROSBAG_CONFIG_FILENAME = 'rosbag_config.json'
+DEFAULT_ROSBAG_CONFIG = {
+    'record_all': True,
+    'ignore_topics': [],
+    'include_topics': [],
+    'start_mode': 'auto',
+    'start_delay_seconds': 0,
+}
+
+
+def load_rosbag_config(custom_behaviors_folder_path):
+    """Never raises -- a missing/corrupt config file falls back to
+    DEFAULT_ROSBAG_CONFIG (record everything, auto-start immediately),
+    same posture as every other synced-config loader in this package."""
+    path = os.path.join(custom_behaviors_folder_path, ROSBAG_CONFIG_FILENAME)
+    if not os.path.exists(path):
+        return dict(DEFAULT_ROSBAG_CONFIG)
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return {**DEFAULT_ROSBAG_CONFIG, **data}
+    except Exception:
+        return dict(DEFAULT_ROSBAG_CONFIG)
 
 
 RELIABLE_QOS = QoSProfile(
@@ -95,9 +131,16 @@ class RosbagControl:
     next to everything else this robot writes.
     """
 
-    def __init__(self, node, bag_dir):
+    def __init__(self, node, bag_dir, start_mode='auto', start_delay_seconds=0):
         self.node = node
         self.bag_dir = bag_dir
+        # 'auto' -- auto-start recording at boot (after the delay below,
+        # 0 meaning immediately). 'task' -- stay closed at boot and wait
+        # for something external (the /ros2_bag_control topic today; a
+        # future BT node later) to call handle_start() explicitly.
+        self.start_mode = start_mode
+        self.start_delay_seconds = max(0, start_delay_seconds or 0)
+        self._start_delay_timer = None
 
         self.state = UNKNOWN
         self.recorder_alive = False
@@ -130,7 +173,47 @@ class RosbagControl:
         # would silently just resume writing into that throwaway launch-
         # time path. handle_stop() is idempotent (no-ops if already
         # CLOSED), so this is safe to always run.
-        self.resync(on_done=self.handle_stop)
+        #
+        # _boot_sequence (not a bare self.handle_stop) is the fix for a
+        # real race: this used to hand handle_stop straight to resync's
+        # on_done, while a completely separate, uncoordinated caller
+        # (BlackboxOrchestrator.start_recording(), from XP_Database
+        # .__init__, whenever record_bags=True) called handle_start() of
+        # its own accord moments later. Both chains are async -- nothing
+        # blocks waiting for rclpy to start spinning yet at this point in
+        # boot -- so whichever service call happened to land last on the
+        # recorder silently won, with no error anywhere. Confirmed live:
+        # a real boot opened a session, resumed it, then had it
+        # immediately closed and compressed again by this constructor's
+        # own cleanup landing after the resume. Auto-starting is now
+        # entirely this class's own decision (see _boot_sequence/
+        # _maybe_auto_start below), chained strictly *after* the cleanup
+        # confirms CLOSED, never racing it -- XP_Database no longer calls
+        # start_recording() from its own __init__ at all.
+        self.resync(on_done=self._boot_sequence)
+
+    def _boot_sequence(self):
+        self.handle_stop(on_done=self._maybe_auto_start)
+
+    def _maybe_auto_start(self):
+        if self.start_mode != 'auto':
+            self.node.get_logger().info(
+                'Recording set to "wait for task" -- staying closed until explicitly started.')
+            return
+        if self.start_delay_seconds > 0:
+            self.node.get_logger().info(f'Auto-starting recording in {self.start_delay_seconds}s...')
+            self._start_delay_timer = self.node.create_timer(self.start_delay_seconds, self._fire_delayed_start)
+            return
+        self.handle_start()
+
+    def _fire_delayed_start(self):
+        # One-shot: cancel first, same pattern _verify_after already uses
+        # for its own delayed re-check, since create_timer is periodic by
+        # default and there's no separate one-shot primitive here.
+        if self._start_delay_timer is not None:
+            self._start_delay_timer.cancel()
+            self._start_delay_timer = None
+        self.handle_start()
 
     # ---------- the single source of truth (two-signal check) ----------
 
@@ -191,14 +274,19 @@ class RosbagControl:
         if on_done:
             on_done()
 
-    def _verify_after(self, expected_state, ok_msg):
-        """One-shot delayed re-check, so we confirm reality instead of trusting a response."""
+    def _verify_after(self, expected_state, ok_msg, on_done=None):
+        """One-shot delayed re-check, so we confirm reality instead of trusting a response.
+        on_done (optional) fires after the check, regardless of whether it
+        matched -- used to chain a further action (e.g. _boot_sequence
+        starting recording only once the boot-session close is verified
+        CLOSED, not merely requested).
+        """
         def _check():
             timer.cancel()
-            self.resync(on_done=lambda: self._log_verify_result(expected_state, ok_msg))
+            self.resync(on_done=lambda: self._log_verify_result(expected_state, ok_msg, on_done))
         timer = self.node.create_timer(POST_ACTION_VERIFY_DELAY_SEC, _check)
 
-    def _log_verify_result(self, expected_state, ok_msg):
+    def _log_verify_result(self, expected_state, ok_msg, on_done=None):
         if self.state == expected_state:
             self.node.get_logger().info(ok_msg)
         else:
@@ -206,6 +294,8 @@ class RosbagControl:
                 f'VERIFICATION MISMATCH: expected {expected_state} after action, '
                 f'recorder actually reports {self.state}. Investigate immediately.'
             )
+        if on_done:
+            on_done()
 
     # ---------- watchdog / status ----------
 
@@ -288,14 +378,16 @@ class RosbagControl:
 
         self._call_checked(self.record_client, req, 'record', on_response=on_record_response)
 
-    def handle_stop(self):
+    def handle_stop(self, on_done=None):
         if self.state == CLOSED:
             self.node.get_logger().info('Not recording -- skipping stop.')
+            if on_done:
+                on_done()
             return
         if self.state == UNKNOWN:
             self.node.get_logger().warn('State unknown -- attempting stop anyway to avoid a dangling session.')
         self._call(self.stop_client, Stop.Request(), 'stop',
-                   on_ok=lambda: self._verify_after(CLOSED, 'Stop issued, bag should be finalized.'))
+                   on_ok=lambda: self._verify_after(CLOSED, 'Stop issued, bag should be finalized.', on_done=on_done))
 
     def handle_split(self):
         """DISABLED -- unreachable from control_cb. Kept in case single-file

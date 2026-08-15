@@ -28,7 +28,7 @@ from datetime import datetime
 
 
 from xparo.engine import Engine
-from xparo.rosbag_control import RosbagControl
+from xparo.rosbag_control import RosbagControl, load_rosbag_config
 from xparo.bt_engine.executor import BehaviorTreeExecutor
 
 try:
@@ -134,7 +134,18 @@ class Xparo(Node):
         # XP_Database/BlackboxOrchestrator, none of which are rclpy-aware
         # (Engine is usable standalone, outside ROS2 entirely -- see its
         # own __main__ block). Only construct it when actually recording.
-        self.rosbag_control = RosbagControl(self, self.BAG_DIR) if self.record_bags else None
+        # start_mode/start_delay_seconds come from whatever was persisted
+        # by a previous sync (Manage_Dash.py's rosbag_config, relayed via
+        # engine.py's sync_rosbag_config) -- read here, before
+        # RosbagControl exists, since its __init__ kicks off the boot
+        # sequence immediately and can't wait for Engine's own
+        # post-construction sync the way BT plugin config does.
+        rosbag_config = load_rosbag_config(self.xparo_custom_behaviors_folder_path)
+        self.rosbag_control = RosbagControl(
+            self, self.BAG_DIR,
+            start_mode=rosbag_config['start_mode'],
+            start_delay_seconds=rosbag_config['start_delay_seconds'],
+        ) if self.record_bags else None
 
         # record_bags and BAG_DIR must go in through the constructor, not be
         # set as post-construction attributes -- Engine.__init__ already

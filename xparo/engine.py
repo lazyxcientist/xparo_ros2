@@ -381,6 +381,51 @@ class Engine():
         self._inline_node_tags = set(loaded.keys())
         print(f"[bt_engine] loaded inline node tags: {list(loaded.keys())}")
 
+    def sync_rosbag_config(self, config):
+        """`config` is apps/analytics/data_analyis.py's
+        GET_rosbag_config/EDIT_rosbag_config shape ({record_all,
+        ignore_topics, include_topics, start_mode, start_delay_seconds}),
+        always real data -- unlike sync_bt_plugins/sync_bt_inline_nodes,
+        this has no "load whatever was persisted, on startup" mode of its
+        own, since xparo_ros.py already reads the persisted file directly
+        (rosbag_control.load_rosbag_config) *before* RosbagControl is
+        constructed -- its __init__ kicks off the boot sequence
+        immediately, so it can't wait for Engine to exist and sync
+        afterward the way BT plugin config does.
+
+        Persists to custom_behaviors/rosbag_config.json (the same file
+        load_rosbag_config reads) and, if this robot is actually
+        recording, applies start_mode/start_delay_seconds to the live
+        RosbagControl immediately. record_all/ignore_topics/
+        include_topics only take effect on this robot's *next* launch --
+        see rosbag_control.py's own module comment on why topic selection
+        can't be re-applied to an already-running recorder process.
+        """
+        # Local import (not at module top like bt_engine's plugin_loader/
+        # run_task) -- rosbag_control.py has a real rclpy/rosbag2_interfaces
+        # dependency, and engine.py is deliberately usable standalone
+        # outside a ROS2 context (see its own __main__ block and the test
+        # suite's connection_type="offline" construction); only pay that
+        # import cost when this method is actually called.
+        from .rosbag_control import ROSBAG_CONFIG_FILENAME
+        pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"], ROSBAG_CONFIG_FILENAME)
+        os.makedirs(os.path.dirname(pth), exist_ok=True)
+        with open(pth, 'w') as file:
+            json.dump(config, file)
+
+        # bt_executor.node is the live Xparo node -- its own
+        # rosbag_control (if this robot was launched with
+        # record_bags:=true) is the thing start_mode/start_delay_seconds
+        # actually apply to. None if this robot isn't recording bags at
+        # all, same "safe no-op" posture RUN_TASK's own
+        # bt_executor-is-None check has.
+        if self.bt_executor is not None and getattr(self.bt_executor, 'node', None) is not None:
+            live_control = getattr(self.bt_executor.node, 'rosbag_control', None)
+            if live_control is not None:
+                live_control.start_mode = config.get('start_mode', live_control.start_mode)
+                live_control.start_delay_seconds = max(0, config.get('start_delay_seconds', live_control.start_delay_seconds) or 0)
+        print(f"[rosbag_control] synced config: {config}")
+
     def live_updates(self, msg):
         try:
             data = json.loads(msg.data)
@@ -507,6 +552,13 @@ class Engine():
                 # robot trusts whatever its own project's Django instance
                 # relays, same as every other sync branch in this method.
                 self.sync_bt_inline_nodes(val)
+            elif k=="rosbag_config":
+                # val is DataAnalysis._get_rosbag_config()'s shape
+                # ({record_all, ignore_topics, include_topics, start_mode,
+                # start_delay_seconds}) -- see sync_rosbag_config's own
+                # docstring for what does/doesn't apply live vs. on next
+                # launch.
+                self.sync_rosbag_config(val)
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":

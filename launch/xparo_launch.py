@@ -1,4 +1,5 @@
 import os
+import re
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
@@ -6,6 +7,41 @@ from launch.conditions import IfCondition
 from launch_ros.actions import Node
 from launch.substitutions import LaunchConfiguration
 
+from xparo.rosbag_control import load_rosbag_config
+
+
+def _rosbag_record_topic_args(custom_behaviors_folder_path):
+    """Builds the topic-selection portion of `ros2 bag record`'s command
+    line from whatever config was last synced from the dashboard (Sensors
+    Database page -> apps/analytics/data_analyis.py's EDIT_rosbag_config
+    -> engine.py's sync_rosbag_config -> persisted here). This can only
+    ever reflect this robot's *next* launch, never an already-running
+    recorder -- `ros2 bag record`'s topic list is a process launch
+    argument, not something re-appliable at runtime the way
+    RosbagControl's own Record/Stop/Resume service calls are.
+
+    Returns a single string to splice into the same bash -c command this
+    file already builds (matching --start-paused/--storage/etc.'s own
+    plain-string-concatenation style just below).
+    """
+    config = load_rosbag_config(custom_behaviors_folder_path)
+    if config['record_all']:
+        ignore = [t for t in (config['ignore_topics'] or []) if t]
+        if not ignore:
+            return '-a'
+        # `ros2 bag record -a --exclude '<regex>'` -- exact-topic-name
+        # alternation, anchored so e.g. "/tf" doesn't also swallow
+        # "/tf_static".
+        pattern = '|'.join(f'^{re.escape(t)}$' for t in ignore)
+        return f"-a --exclude '{pattern}'"
+    include = [t for t in (config['include_topics'] or []) if t]
+    if not include:
+        # Nothing explicitly selected -- fall back to recording
+        # everything rather than silently writing an empty bag forever,
+        # which would look identical to "recording is broken" from the
+        # Sensors Database page.
+        return '-a'
+    return ' '.join(include)
 
 
 def generate_launch_description():
@@ -141,7 +177,17 @@ def generate_launch_description():
             ExecuteProcess(
                 condition=IfCondition(record_bags),
                 cmd=['bash', '-c', [
-                    'ros2 bag record -a -o ', bag_dir,
+                    # Reads whatever topic-selection config was last
+                    # synced from the dashboard, from the *default*
+                    # custom_behaviors_folder_path -- like current_dir
+                    # above, this doesn't account for a CLI override of
+                    # xparo_custom_behaviors_folder_path itself (a
+                    # LaunchConfiguration substitution, not a concrete
+                    # value yet at this point in generate_launch_description,
+                    # and not worth the extra complexity to resolve early
+                    # for what would be a rare override of an already-rare
+                    # override).
+                    f'ros2 bag record {_rosbag_record_topic_args(os.path.join(current_dir, "custom_behaviors"))} -o ', bag_dir,
                     '/boot_session_$(date +%Y%m%d_%H%M%S)'
                     ' --start-paused --storage mcap'
                     ' --compression-mode file --compression-format zstd',
