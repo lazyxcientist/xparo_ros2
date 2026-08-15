@@ -7,6 +7,7 @@ from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
 from .bt_engine import run_task
+from .bt_engine import plugin_loader
 
 record_bags = False
 xparo_database_size =  80
@@ -280,7 +281,35 @@ class Engine():
                         #   command_for="rest"
                           )
 
+    def sync_bt_plugins(self, plugins=None):
+        """Phase 12. `plugins` is Project_Dashboard.custom_bt_node_plugins's
+        shape ([{"path":..., "enabled":...}]) fresh from Django when
+        resyncing (persisted to disk here, same as custom_aiml/custom_maps
+        above) -- None means "load whatever was persisted from a previous
+        sync" (the startup case, called once from xparo_ros.py's
+        __init__, before any RUN_TASK could possibly reference a plugin
+        tag). Either way, ends by (re)registering every enabled path's
+        tags into NODE_REGISTRY -- calling this twice with the same paths
+        simply overwrites the same registry entries, not a problem.
+        """
+        pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'plugin_paths.json')
+        if plugins is not None:
+            content = json.dumps(plugins)
+            self.local_database.load_or_create_file(pth, content)
+            with open(pth, 'w') as file:
+                file.write(content)
+        else:
+            if not os.path.exists(pth):
+                return
+            with open(pth, 'r') as file:
+                try:
+                    plugins = json.load(file)
+                except json.JSONDecodeError:
+                    plugins = []
 
+        enabled_paths = [p.get('path') for p in plugins if isinstance(p, dict) and p.get('enabled') and p.get('path')]
+        loaded = plugin_loader.register_plugins(enabled_paths)
+        print(f"[bt_engine] loaded plugin tags: {list(loaded.keys())}")
 
     def live_updates(self, msg):
         try:
@@ -392,6 +421,13 @@ class Engine():
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
                         file.write(content)
+            elif k=="custom_bt_node_plugins":
+                # Phase 12 -- val is Project_Dashboard.custom_bt_node_plugins's
+                # shape ([{"path":..., "enabled":...}]), same "persist to
+                # disk, mirroring custom_aiml's pattern" as everything else
+                # in this block, then actually (re)load whichever paths are
+                # enabled into NODE_REGISTRY.
+                self.sync_bt_plugins(val)
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":

@@ -161,6 +161,10 @@ class Xparo(Node):
         # own constructor the way rosbag_control is.
         self.bt_executor = BehaviorTreeExecutor(self, self.xparo_engine)
         self.xparo_engine.bt_executor = self.bt_executor
+        # Load whatever plugin paths were persisted from a previous sync
+        # (Phase 12) -- before connect(), so a RUN_TASK referencing a
+        # plugin tag can never race a fresh boot that hasn't loaded it yet.
+        self.xparo_engine.sync_bt_plugins()
         self.xparo_engine.connect()
 
 
