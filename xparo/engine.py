@@ -6,6 +6,7 @@ from datetime import datetime
 from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
+from .bt_engine import run_task
 
 record_bags = False
 xparo_database_size =  80
@@ -45,6 +46,15 @@ class Engine():
         # supplies the real one; defaults to a no-op so TELEOP is a safe
         # no-op (still acks) rather than a crash outside a live node.
         self.joy_publish = joy_publish or (lambda axes, buttons: None)
+        # bt_engine.executor.BehaviorTreeExecutor -- set post-construction
+        # by xparo_ros.py, same reasoning as call_message/files just below
+        # in Xparo.__init__: it needs this already-built Engine instance to
+        # call add_live_update/add_task_history on, so it can't be built
+        # (or passed in) before Engine exists. None here means RUN_TASK is
+        # a safe no-op (matches TELEOP's own "no live node" default) rather
+        # than an AttributeError, for Engine's standalone-outside-ROS2 use
+        # (see this file's own __main__ block) and every test in this repo.
+        self.bt_executor = None
         # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
         # separate from BAG_DIR (rosbag sessions) and the xparo_* config
         # paths below (behavior trees/env/properties, a different concept).
@@ -428,6 +438,18 @@ class Engine():
                 self.file_transfer.handle_file_chunk(val)
             elif k=="FILE_COMPLETE":
                 self.file_transfer.handle_file_complete(self._send_dict)
+            elif k=="RUN_TASK":
+                # bt_executor is None when this Engine isn't owned by a
+                # live Xparo node (standalone use, or every test in this
+                # repo) -- same "safe no-op, no crash" posture TELEOP's
+                # default joy_publish already has for the same reason.
+                if self.bt_executor is not None:
+                    threading.Thread(
+                        target=run_task.handle_run_task,
+                        args=(self.bt_executor, val, self._send_dict),
+                        kwargs={"add_task_history": self.add_task_history},
+                        daemon=True,
+                    ).start()
             else:
                 self.call_message(message)
 

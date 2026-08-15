@@ -29,6 +29,7 @@ from datetime import datetime
 
 from xparo.engine import Engine
 from xparo.rosbag_control import RosbagControl
+from xparo.bt_engine.executor import BehaviorTreeExecutor
 
 try:
     from nav2_msgs.msg import BehaviorTreeLog
@@ -153,6 +154,13 @@ class Xparo(Node):
                               tethered_channels_config = self.tethered_channels_config)
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
+        # Composable, owned by this node like self.rosbag_control above --
+        # unlike that one, it needs the already-built xparo_engine (to call
+        # add_live_update/add_task_history on), so it can only be
+        # constructed here, after Engine exists, not passed into Engine's
+        # own constructor the way rosbag_control is.
+        self.bt_executor = BehaviorTreeExecutor(self, self.xparo_engine)
+        self.xparo_engine.bt_executor = self.bt_executor
         self.xparo_engine.connect()
 
 
