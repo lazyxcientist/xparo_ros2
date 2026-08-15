@@ -86,20 +86,27 @@ def _wrap_conditional(node, attrs, blackboard):
     )
 
 
-def build_node(element, blackboard):
+def build_node(element, blackboard, ros_node=None):
     """Recursively builds one ET.Element (and its children) into a
-    py_trees.behaviour.Behaviour tree."""
+    py_trees.behaviour.Behaviour tree. `ros_node` is the live rclpy Node
+    hosting this tree (None when ticking offline, as every test in this
+    repo does) -- threaded through to every builder call so leaf nodes
+    with real ROS interfaces to call (Phase 10's ParamSet is the first)
+    can create clients/publishers on it. Composite/control-flow builders
+    ignore it; Phase 9 didn't need this parameter at all until Phase 10
+    introduced the first leaf that does.
+    """
     tag = element.tag
     builder = NODE_REGISTRY.get(tag)
     if builder is None:
         raise UnknownNodeError(f"no registered node for tag <{tag}>")
 
-    children = [build_node(child_el, blackboard) for child_el in element]
-    node = builder(tag, element.attrib, blackboard, children)
+    children = [build_node(child_el, blackboard, ros_node) for child_el in element]
+    node = builder(tag, element.attrib, blackboard, children, ros_node)
     return _wrap_conditional(node, element.attrib, blackboard)
 
 
-def build_tree(xml_fragment, blackboard):
+def build_tree(xml_fragment, blackboard, ros_node=None):
     """Parses a BT XML fragment and builds a py_trees tree from it.
     `blackboard` is a plain dict, shared by reference with every node in
     the tree (see executor.py's module docstring for why this engine uses
@@ -107,4 +114,4 @@ def build_tree(xml_fragment, blackboard):
     Returns the root py_trees.behaviour.Behaviour.
     """
     root_element = single_root_child(parse_fragment(xml_fragment))
-    return build_node(root_element, blackboard)
+    return build_node(root_element, blackboard, ros_node)

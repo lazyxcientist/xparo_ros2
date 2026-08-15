@@ -8,6 +8,10 @@ blackboard values can change between ticks, e.g. a Script node earlier in
 the same Sequence assigning a value a later sibling reads.
 """
 import re
+import time
+
+import py_trees
+from py_trees import common
 
 _PLACEHOLDER_RE = re.compile(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
@@ -36,3 +40,46 @@ def resolve_attrs(raw_attrs, blackboard, required=()):
         if resolved.get(key) is None:
             raise BlackboardKeyError(f"{key!r} is required but resolved to None (raw: {raw_attrs.get(key)!r})")
     return resolved
+
+
+class StubActionNode(py_trees.behaviour.Behaviour):
+    """Honest-scoping base for every leaf tag this repo has zero real
+    subsystem to hook into yet (confirmed by grep at planning time: no
+    audio/TTS/docking/battery-telemetry/Nav2-action-client infrastructure
+    anywhere in this repo, only a passive BehaviorTreeLog *subscription*).
+    Resolves its attributes, logs them, holds RUNNING for
+    SIMULATED_DELAY_S, then returns SUCCESS -- so the full parse->build->
+    resolve->tick->relay pipeline is genuinely exercisable end-to-end
+    today, while real hardware wiring is called out explicitly as
+    follow-up work rather than silently faked as "done". Subclasses set
+    TAG (for logging) and REQUIRED_ATTRS (passed to resolve_attrs).
+    """
+
+    TAG = "StubAction"
+    REQUIRED_ATTRS = ()
+    SIMULATED_DELAY_S = 0.3
+
+    def __init__(self, name, attrs, blackboard):
+        super().__init__(name=name)
+        self.attrs = attrs
+        self.blackboard = blackboard
+        self._started_at = None
+
+    def initialise(self):
+        self._started_at = None
+
+    def update(self):
+        try:
+            resolved = resolve_attrs(self.attrs, self.blackboard, required=self.REQUIRED_ATTRS)
+        except BlackboardKeyError as e:
+            self.feedback_message = str(e)
+            return common.Status.FAILURE
+
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+            self.feedback_message = f"[STUB] {self.TAG}: {resolved}"
+            print(f"[bt_engine STUB] {self.TAG} ({self.name}): {resolved}")
+
+        if time.monotonic() - self._started_at < self.SIMULATED_DELAY_S:
+            return common.Status.RUNNING
+        return common.Status.SUCCESS

@@ -46,8 +46,11 @@ QUICK_DELIVERY_TREE_FRAGMENT = """
 
 # --- ad-hoc dummy leaves, registered only for this test module, matching
 # the plan's own testing spec ("tree_builder builds the real example tree
-# with ad-hoc dummy leaves") -- Phase 10 replaces these with real ones.
-def _dummy_leaf_builder(name, attrs, blackboard, children):
+# with ad-hoc dummy leaves") -- Phase 10 has real ones for these tags now,
+# but these dummies keep this test module's original intent (proving the
+# build/tick/skip pipeline works generically) independent of any one leaf
+# implementation's own behaviour, which get their own tests instead.
+def _dummy_leaf_builder(name, attrs, blackboard, children, ros_node):
     import py_trees as pt
 
     class _Dummy(pt.behaviour.Behaviour):
@@ -180,6 +183,54 @@ class TestTreeBuilder:
         root = tree_builder.build_tree('<Sequence><LoadNextDelivery /></Sequence>', {})
         assert all("(conditional)" not in n.name for n in root.iterate())
 
+    def test_sequence_has_memory_and_does_not_restart_already_succeeded_siblings(self):
+        """Real bug caught live, not in a test first: mapping <Sequence> to
+        py_trees' memory=False (BT.CPP v3's meaning) made a real multi-step
+        tree (quick_delivery_tree.xml) loop forever -- every tick where a
+        later child was still RUNNING reset current_child back to index 0,
+        so an already-SUCCEEDED earlier sibling with internal state (like
+        every stub action node's simulated-delay timer) got re-initialised
+        and restarted from scratch, forever, never reaching the child after
+        the RUNNING one. BTCPP_format="4" (every tree in this repo) means
+        plain <Sequence> has memory (skip already-succeeded children,
+        resume from whichever is RUNNING) -- confirmed by fixing this
+        exact symptom, not just by reading BT.CPP's changelog.
+        """
+        import py_trees as pt
+
+        class _RunsTwiceThenSucceeds(pt.behaviour.Behaviour):
+            def __init__(self, name):
+                super().__init__(name=name)
+                self.ticks = 0
+
+            def initialise(self):
+                self.ticks = 0
+
+            def update(self):
+                self.ticks += 1
+                return common.Status.SUCCESS if self.ticks >= 2 else common.Status.RUNNING
+
+        first_leaf = _RunsTwiceThenSucceeds(name="first")
+        second_leaf = _RunsTwiceThenSucceeds(name="second")
+
+        NODE_REGISTRY["_FirstLeaf"] = lambda name, attrs, blackboard, children, ros_node: first_leaf
+        NODE_REGISTRY["_SecondLeaf"] = lambda name, attrs, blackboard, children, ros_node: second_leaf
+        try:
+            root = tree_builder.build_tree("<Sequence><_FirstLeaf /><_SecondLeaf /></Sequence>", {})
+            tree = __import__("py_trees").trees.BehaviourTree(root)
+            for _ in range(6):
+                tree.tick()
+                if root.status in (common.Status.SUCCESS, common.Status.FAILURE):
+                    break
+        finally:
+            del NODE_REGISTRY["_FirstLeaf"]
+            del NODE_REGISTRY["_SecondLeaf"]
+
+        assert root.status == common.Status.SUCCESS, "the sequence never converged -- looks like the memory=False bug is back"
+        # If the first leaf had been wrongly restarted after the second
+        # went RUNNING, it would have ticked far more than twice.
+        assert first_leaf.ticks == 2
+
 
 class TestExecutor:
     def test_ticks_a_synthetic_tree_and_emits_ordered_live_updates(self):
@@ -205,6 +256,38 @@ class TestExecutor:
         executor.run('<LoadNextDelivery />', tick_rate_hz=0)
         first_event = mock_engine.add_live_update.call_args_list[0].args[0]
         assert first_event["prev"] == "INVALID"
+
+    def test_a_sibling_never_reached_emits_no_spurious_event(self):
+        """Real bug caught live: root.iterate() walks the *whole* tree,
+        including a second Sequence child that a first-child FAILURE means
+        never actually gets ticked. That sibling still sits at py_trees'
+        own default Status.INVALID, indistinguishable by value from "never
+        seen before" -- comparing against a bare dict.get() (defaulting to
+        None) treated that as a real "None -> INVALID" transition and
+        emitted a phantom event for a node that was never entered at all.
+        """
+        mock_engine = MagicMock()
+
+        import py_trees as pt
+
+        class _Fail(pt.behaviour.Behaviour):
+            def update(self):
+                return common.Status.FAILURE
+
+        NODE_REGISTRY["AlwaysFails"] = lambda name, attrs, blackboard, children, ros_node: _Fail(name=name)
+        try:
+            executor = BehaviorTreeExecutor(node=MagicMock(), engine=mock_engine)
+            executor.run(
+                '<Sequence><AlwaysFails /><LoadNextDelivery /></Sequence>', tick_rate_hz=0,
+            )
+        finally:
+            del NODE_REGISTRY["AlwaysFails"]
+
+        events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
+        assert not any(e["node_name"] == "LoadNextDelivery" for e in events), (
+            "LoadNextDelivery was never reached (the Sequence failed on its first "
+            "child) but still generated a live-update event"
+        )
 
     def test_returns_the_blackboard_after_running(self):
         mock_engine = MagicMock()

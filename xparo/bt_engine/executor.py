@@ -49,14 +49,22 @@ class BehaviorTreeExecutor:
         TASK_RESULT), not just the status.
         """
         blackboard = {} if blackboard is None else blackboard
-        root = tree_builder.build_tree(xml_fragment, blackboard)
+        root = tree_builder.build_tree(xml_fragment, blackboard, ros_node=self.node)
         tree = py_trees.trees.BehaviourTree(root)
 
         previous_status = {}
 
         def _on_post_tick(ticked_tree):
+            # root.iterate() walks the *whole* tree structure, including
+            # siblings never actually reached this tick (e.g. later steps
+            # in a Sequence that never got past an earlier RUNNING one) --
+            # those sit at py_trees' own default Status.INVALID, same as
+            # "never seen before". Defaulting the lookup to INVALID (not
+            # None) makes that comparison correctly a no-op instead of a
+            # spurious "None -> INVALID" event on every node that merely
+            # exists in the tree, not just the ones actually ticked.
             for behaviour in ticked_tree.root.iterate():
-                prev = previous_status.get(behaviour.id)
+                prev = previous_status.get(behaviour.id, common.Status.INVALID)
                 curr = behaviour.status
                 if prev != curr:
                     self._emit_live_update(behaviour, prev, curr)
@@ -87,7 +95,7 @@ class BehaviorTreeExecutor:
             # source produced an event.
             "node_type": behaviour.name,
             "uid": str(behaviour.id),
-            "prev": prev_status.name if prev_status is not None else common.Status.INVALID.name,
+            "prev": prev_status.name,
             "curr": curr_status.name,
             "timestamp": now,
             "datetime": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
