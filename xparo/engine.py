@@ -426,6 +426,56 @@ class Engine():
                 live_control.start_delay_seconds = max(0, config.get('start_delay_seconds', live_control.start_delay_seconds) or 0)
         print(f"[rosbag_control] synced config: {config}")
 
+    def sync_custom_tasks(self, tasks):
+        """`tasks` is apps/analytics/data_analyis.py's
+        DataAnalysis._get_custom_tasks shape ({task_id: {behaviour_tree_name,
+        blackboard_mapping, params, save_task_history}}) -- persisted to
+        custom_behaviors/tasks.json (same folder/pattern rosbag_config.json
+        already uses) so a task can be triggered locally, without a Django
+        round trip, by publishing its task_id on /xparo/run_task (see
+        run_task_from_topic below and xparo_ros.py's subscription to that
+        topic). Sent on every connect (get_init_api_client_data) and
+        pushed live on every task add/edit/delete/copy (Manage_Dash.py),
+        matching rosbag_config's own sync cadence.
+        """
+        from .bt_engine.task_sync import TASKS_FILENAME
+        pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"], TASKS_FILENAME)
+        os.makedirs(os.path.dirname(pth), exist_ok=True)
+        with open(pth, 'w') as file:
+            json.dump(tasks, file)
+        print(f"[task_sync] synced {len(tasks)} task(s)")
+
+    def run_task_from_topic(self, task_id, override_params=None):
+        """/xparo/run_task's handler (xparo_ros.py) -- the locally-
+        triggered counterpart to on_ws_message's own "RUN_TASK" branch
+        just below, sharing the exact same dispatch (run_task.
+        handle_run_task, one thread per task, matching RUN_COMMAND's
+        established pattern) but resolving tree_xml/blackboard from this
+        robot's own already-synced local files (bt_engine.task_sync)
+        instead of receiving them pre-resolved from Django. TASK_RESULT
+        and (if the task has save_task_history on) its history row still
+        get reported back over whatever transport is configured --
+        handle_run_task doesn't know or care which path triggered it, so
+        RUN_TASK's own single-run-deletion/restart-on-failure logic
+        (Django's TASK_RESULT handler) keeps working unchanged too.
+        """
+        from .bt_engine import task_sync
+        if self.bt_executor is None:
+            print("[run_task_from_topic] no live bt_executor -- ignoring")
+            return
+        custom_tasks = task_sync.load_custom_tasks(self.files["xparo_custom_behaviors_folder_path"])
+        val = task_sync.build_run_task_val(task_id, override_params, custom_tasks, self.files)
+        if val is None:
+            print(f"[run_task_from_topic] task_id {task_id!r} not in the local sync cache -- "
+                  f"either it doesn't exist, or this robot hasn't synced since it was created")
+            return
+        threading.Thread(
+            target=run_task.handle_run_task,
+            args=(self.bt_executor, val, self._send_dict),
+            kwargs={"add_task_history": self.add_task_history},
+            daemon=True,
+        ).start()
+
     def live_updates(self, msg):
         try:
             data = json.loads(msg.data)
@@ -559,6 +609,12 @@ class Engine():
                 # docstring for what does/doesn't apply live vs. on next
                 # launch.
                 self.sync_rosbag_config(val)
+            elif k=="custom_tasks":
+                # val is DataAnalysis._get_custom_tasks()'s shape
+                # ({task_id: {behaviour_tree_name, blackboard_mapping,
+                # params, save_task_history}}) -- see sync_custom_tasks'
+                # own docstring.
+                self.sync_custom_tasks(val)
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":

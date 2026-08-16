@@ -98,6 +98,12 @@ class Xparo(Node):
         self.ask_question = self.create_subscription(String, '/xparo/ask', self.ask_question_fun, 10)
         self.task_updates = self.create_subscription(String,'/xparo/task_updates',self.task_updates,10)
         self.bt_log = self.create_subscription(String,'/bt_xparo_log',self.live_updates,10)
+        # Behaviour Tree redesign: local task execution -- publish
+        # {"task_id": "...", "override_params": {...}} here (override_params
+        # optional) to run an already-synced task (Engine.sync_custom_tasks)
+        # directly on this robot, no Django round trip needed at trigger
+        # time. Same naming convention as /xparo/ask, /xparo/task_updates.
+        self.run_task_sub = self.create_subscription(String, '/xparo/run_task', self.run_task_topic_cb, 10)
         self.dash_send = self.create_publisher(String,"/xparo/response",10)
         # Phase 4 TELEOP -- remote_ops.handle_teleop publishes here via
         # Engine's joy_publish callback, below.
@@ -256,6 +262,18 @@ class Xparo(Node):
     def ask_question_fun(self, msg):
         user_input = str(msg.data)
         self.xparo_engine.send(user_input.upper())
+
+    def run_task_topic_cb(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().error(f'Failed to parse /xparo/run_task message: {str(e)}')
+            return
+        task_id = payload.get("task_id")
+        if not task_id:
+            self.get_logger().error('/xparo/run_task message missing "task_id"')
+            return
+        self.xparo_engine.run_task_from_topic(task_id, payload.get("override_params"))
     ####################################################
     ####################################################
 
@@ -272,6 +290,16 @@ def main(args=None):
         rclpy.spin(xparo)
     except KeyboardInterrupt:
         pass
+    # Sends this session's final Logs_history update (total runtime,
+    # average CPU/RAM/disk/GPU consumption across the whole session) while
+    # the transport can still actually send it -- only reachable from a
+    # graceful stop (Ctrl+C / `ros2 launch` shutting the process down),
+    # never a genuine force-kill/crash, the same honest limitation
+    # blackbox_manager.py's own rosbag force-exit handling already has.
+    try:
+        xparo.xparo_engine.local_database.stop_logging_session(xparo.xparo_engine.private_send)
+    except Exception as e:
+        xparo.get_logger().error(f"Failed to send final logging session update: {e}")
     xparo.destroy_node()
     rclpy.try_shutdown()
 

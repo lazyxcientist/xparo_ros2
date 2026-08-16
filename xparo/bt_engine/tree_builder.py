@@ -75,7 +75,7 @@ class ConditionalDecorator(py_trees.decorators.Decorator):
 def _wrap_conditional(node, attrs, blackboard):
     if not any(attrs.get(a) for a in _CONDITIONAL_ATTRS):
         return node
-    return ConditionalDecorator(
+    wrapper = ConditionalDecorator(
         name=f"{node.name} (conditional)",
         child=node,
         blackboard=blackboard,
@@ -84,6 +84,12 @@ def _wrap_conditional(node, attrs, blackboard):
         failure_if=attrs.get("_failureIf"),
         while_cond=attrs.get("_while"),
     )
+    # The wrapper is a synthetic node this engine invents (not a real
+    # BT.CPP decorator tag) -- reports the same registration tag as the
+    # node it wraps, matching how its .name already reads as "that node,
+    # conditionally gated" rather than a distinct type of its own.
+    wrapper.xparo_tag = getattr(node, "xparo_tag", node.name)
+    return wrapper
 
 
 def build_node(element, blackboard, ros_node=None):
@@ -101,8 +107,30 @@ def build_node(element, blackboard, ros_node=None):
     if builder is None:
         raise UnknownNodeError(f"no registered node for tag <{tag}>")
 
+    # Matches the BT editor canvas's own node-identity convention exactly
+    # (frontend/.../DownloadButton.js's buildNodesFromXml: the XML `name`
+    # attribute becomes the React Flow node's id, falling back to a
+    # random id only when `name` is absent). executor.py's live updates
+    # put this same value in node_name, and moveRobotToNode matches it
+    # directly against a canvas node's id -- built from the bare tag
+    # instead, every node sharing a tag (three <ParamSet> nodes in the
+    # real quick_delivery_tree.xml alone) would report the identical
+    # node_name, making live highlighting ambiguous or simply wrong
+    # whenever a tree has more than one node of the same type. Falling
+    # back to the tag when `name` is absent matches the canvas's own
+    # degraded behavior for the same case.
+    node_name = element.attrib.get("name") or tag
     children = [build_node(child_el, blackboard, ros_node) for child_el in element]
-    node = builder(tag, element.attrib, blackboard, children, ros_node)
+    node = builder(node_name, element.attrib, blackboard, children, ros_node)
+    # The registration/type name (the tag itself, e.g. "PlayAudio"),
+    # kept distinct from node.name (the instance name above, which may be
+    # a custom name="..." attribute) -- mirrors BT.CPP's own
+    # node.name() vs node.registrationName() split exactly (confirmed
+    # against this project's own prior C++ RosTopicLogger, which reports
+    # both separately: {"node_name": node.name(), "node_type":
+    # node.registrationName(), ...}). executor.py's live updates read
+    # this back for the node_type field.
+    node.xparo_tag = tag
     return _wrap_conditional(node, element.attrib, blackboard)
 
 

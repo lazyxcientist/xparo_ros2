@@ -9,6 +9,8 @@ from launch.substitutions import LaunchConfiguration
 
 from xparo.rosbag_control import load_rosbag_config
 
+ROS_DISTRO = os.environ.get("ROS_DISTRO", "").lower()
+
 
 def _rosbag_record_topic_args(custom_behaviors_folder_path):
     """Builds the topic-selection portion of `ros2 bag record`'s command
@@ -88,6 +90,7 @@ def generate_launch_description():
 
 
     ####################################
+
 
 
 

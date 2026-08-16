@@ -179,6 +179,51 @@ class TestTreeBuilder:
         with pytest.raises(tree_builder.UnknownNodeError):
             tree_builder.build_tree('<TotallyMadeUpTag foo="bar" />', {})
 
+    def test_an_explicit_name_attribute_becomes_the_node_name(self):
+        """The BT editor canvas (DownloadButton.js's buildNodesFromXml)
+        uses the XML `name` attribute as the React Flow node's id, and
+        live updates' node_name is matched against that id directly
+        (moveRobotToNode) -- a node built without reading this attribute
+        would never be highlightable on the canvas by name.
+        """
+        root = tree_builder.build_tree('<PlayAudio name="intro_audio" file_path="/x.mp3" />', {})
+        assert root.name == "intro_audio"
+
+    def test_no_name_attribute_falls_back_to_the_bare_tag(self):
+        root = tree_builder.build_tree('<PlayAudio file_path="/x.mp3" />', {})
+        assert root.name == "PlayAudio"
+
+    def test_same_tag_used_twice_without_names_collide_matching_the_canvas_own_degraded_case(self):
+        """Documents the honest limitation, not a bug: quick_delivery_tree.xml
+        itself has two <DockRobot> and two <Sequence> nodes with no name=
+        attribute -- both engines (this one and the canvas) fall back to
+        the bare tag in that case, so live updates for either DockRobot
+        are genuinely ambiguous until the tree's author gives each one a
+        unique name= (which resolves it on both sides identically)."""
+        root = tree_builder.build_tree(QUICK_DELIVERY_TREE_FRAGMENT, {
+            "robot_task_backend_path": "/opt/xparo",
+            "dock_name": "dock-1", "dock_type": "auto", "dock_max_staging_time": "30",
+            "max_speed_array": "[1,1,1]", "message_to_play": "hello", "current_tray": "A",
+            "docking_feature_enabled": False,
+        })
+        dock_robot_names = {n.name for n in root.iterate() if n.name == "DockRobot"}
+        assert dock_robot_names == {"DockRobot"}  # both share this name -- indistinguishable
+
+    def test_giving_each_dock_robot_a_unique_name_disambiguates_them(self):
+        fragment = QUICK_DELIVERY_TREE_FRAGMENT.replace(
+            'dock_method="undocking"', 'name="dock_out" dock_method="undocking"'
+        ).replace(
+            'dock_method="docking"', 'name="dock_in" dock_method="docking"'
+        )
+        root = tree_builder.build_tree(fragment, {
+            "robot_task_backend_path": "/opt/xparo",
+            "dock_name": "dock-1", "dock_type": "auto", "dock_max_staging_time": "30",
+            "max_speed_array": "[1,1,1]", "message_to_play": "hello", "current_tray": "A",
+            "docking_feature_enabled": False,
+        })
+        names = {n.name for n in root.iterate() if n.name in ("dock_out", "dock_in")}
+        assert names == {"dock_out", "dock_in"}
+
     def test_conditional_wrapper_does_not_leak_into_node_names_of_unconditional_nodes(self):
         root = tree_builder.build_tree('<Sequence><LoadNextDelivery /></Sequence>', {})
         assert all("(conditional)" not in n.name for n in root.iterate())
@@ -249,6 +294,34 @@ class TestExecutor:
         # point of the live-update feed is that curr reflects reality.
         root_events = [e for e in events if e["node_name"] == "Sequence"]
         assert root_events[-1]["curr"] == "SUCCESS"
+
+    def test_node_type_reports_the_registration_tag_distinct_from_an_explicit_name(self):
+        """Mirrors this project's own prior C++ RosTopicLogger exactly
+        (node.name() vs node.registrationName()) -- node_type must stay
+        the tag ("LoadNextDelivery") even when node_name is a custom
+        name= attribute, not silently collapse to the same value."""
+        mock_engine = MagicMock()
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=mock_engine)
+
+        executor.run('<LoadNextDelivery name="grab_the_next_order" />', tick_rate_hz=0)
+
+        events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
+        assert events
+        for event in events:
+            assert event["node_name"] == "grab_the_next_order"
+            assert event["node_type"] == "LoadNextDelivery"
+
+    def test_node_type_without_an_explicit_name_falls_back_to_the_tag_for_both_fields(self):
+        mock_engine = MagicMock()
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=mock_engine)
+
+        executor.run('<LoadNextDelivery />', tick_rate_hz=0)
+
+        events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
+        assert events
+        for event in events:
+            assert event["node_name"] == "LoadNextDelivery"
+            assert event["node_type"] == "LoadNextDelivery"
 
     def test_prev_status_is_invalid_on_first_transition(self):
         mock_engine = MagicMock()

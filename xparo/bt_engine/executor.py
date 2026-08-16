@@ -86,14 +86,15 @@ class BehaviorTreeExecutor:
         now = time.time()
         data = {
             "node_name": behaviour.name,
-            # Matches Xparo.navigation_callback's own shape exactly --
-            # that's a real quirk in the Nav2 integration this mirrors
-            # (BT.CPP's BehaviorTreeLog event has no separate node-type
-            # field either, it's the same value duplicated into both
-            # keys), preserved on purpose so the dashboard's existing
-            # live-tree consumer doesn't need to special-case which
-            # source produced an event.
-            "node_type": behaviour.name,
+            # The registration/type name (tree_builder.py sets
+            # node.xparo_tag to the XML tag at build time), distinct from
+            # node_name -- mirrors this project's own prior C++
+            # RosTopicLogger exactly (node.name() vs
+            # node.registrationName()). xparo_ros.py's navigation_callback
+            # (Nav2's forwarded BehaviorTreeLog) still duplicates node_name
+            # into this field -- that's Nav2's own message schema
+            # genuinely having no separate field, not a choice made here.
+            "node_type": getattr(behaviour, "xparo_tag", behaviour.name),
             "uid": str(behaviour.id),
             "prev": prev_status.name,
             "curr": curr_status.name,

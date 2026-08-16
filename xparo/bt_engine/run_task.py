@@ -7,11 +7,18 @@ RUN_COMMAND) even though it lives in bt_engine/ rather than remote_ops.py
 -- this is BT-execution-specific, not a general exec/file-transfer/teleop
 primitive those handlers share.
 
-Django resolves blackboard_mapping into a concrete {name: value} dict
-server-side before this ever runs (apps/analytics/data_analyis.py's
-resolve_blackboard_mapping) -- this handler never needs to know about
-mapping *types*, just "here's your resolved blackboard", matching the
-plan's explicit architecture.
+blackboard_mapping is always resolved into a concrete {name: value} dict
+*before* this ever runs -- this handler never needs to know about mapping
+*types*, just "here's your resolved blackboard". Two callers resolve it
+two different ways, both producing the identical `val` shape this
+function reads: engine.py's own "RUN_TASK" on_ws_message branch, where
+Django resolved it server-side (apps/analytics/data_analyis.py's
+resolve_blackboard_mapping) before ever sending it over the websocket;
+and engine.py's run_task_from_topic (triggered by /xparo/run_task,
+xparo_ros.py), where this robot resolves it itself from its own already-
+synced local files (bt_engine.task_sync.resolve_blackboard) with zero
+Django contact at trigger time. handle_run_task itself doesn't know or
+care which path produced its `val`.
 """
 import time
 from datetime import datetime

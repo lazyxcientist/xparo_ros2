@@ -1,4 +1,5 @@
 websocket-client
 psutil
 py_trees
+PyYAML
 

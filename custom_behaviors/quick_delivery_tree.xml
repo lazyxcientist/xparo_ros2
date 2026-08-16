@@ -1,6 +1,6 @@
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
-  <BehaviorTree ID="MainTree">
-    <Sequence>
+<BehaviorTree ID="MainTree">
+<Sequence>
       <Script
         code="audio_short_punchy_path := robot_task_backend_path + '/sound/short-punchy-sine-wave.mp3'" />
 
@@ -74,27 +74,5 @@
 
 
     </Sequence>
-  </BehaviorTree>
-
-
-  <TreeNodesModel>
-    <Action ID="LoadNextDelivery" />
-    <Action ID="NavigateTo">
-      <input_port name="location" />
-    </Action>
-    <Action ID="LoadItems" />
-    <Action ID="NotifyPatient">
-      <input_port name="tray" />
-    </Action>
-    <Action ID="JSONPublisher">
-      <input_port name="type" />
-      <input_port name="task" />
-      <input_port name="param1" />
-      <input_port name="param2" />
-    </Action>
-    <Action ID="CheckBatteryLevel">
-      <input_port name="min_level" />
-    </Action>
-  </TreeNodesModel>
-
+</BehaviorTree>
 </root>

@@ -3,11 +3,13 @@ import time
 import shutil
 import signal
 import glob
+import json
 import requests
 from threading import Thread
 from datetime import datetime
 
 from .rosbag_control import PAUSED, WRITING
+from .rosbag_metadata import build_sensor_data
 
 # --- CONFIGURATION ---
 
@@ -74,36 +76,124 @@ class BlackboxOrchestrator:
             usage = self.get_disk_usage()
             if usage > self.DISK_MAX_PCT:
                 self._force_cleanup()
+            # Pure local disk hygiene, no server contact -- runs every
+            # cycle regardless of API_TOKEN, so the boot-cleanup
+            # throwaway (see _is_boot_session_bag) gets discarded even
+            # before this robot has fully connected, not stuck waiting
+            # alongside real uploads.
+            self._discard_boot_session_bags()
             # self._process_uploads()
             # 2. CHECK TOKEN BEFORE UPLOADING
             if not self.API_TOKEN or self.API_TOKEN == "":
                 print("[MANAGER THREAD] Idle: Waiting for API_TOKEN from server...")
             else:
                 self._process_uploads()
-                
+
             time.sleep(self.CHECK_INTERVAL)
 
+    def _find_bag_files(self):
+        """xparo_launch.py's ExecuteProcess always passes --compression-mode
+        file --compression-format zstd, so every real session's output is
+        actually named *.mcap.zstd, not *.mcap -- a glob for only "*.mcap"
+        (this method's own previous shape) matches zero real files here,
+        ever, completely silently (glob.glob just returns [], no error).
+        Confirmed live: 7 fully-compressed, fully-closed bag sessions sat
+        on disk, unclaimed, across hours of testing, because
+        _process_uploads never found anything to upload and never printed
+        so much as a warning about it. Matching both patterns (not just
+        .mcap.zstd) so this keeps working if compression is ever made
+        optional later.
+        """
+        bags = glob.glob(os.path.join(self.BAG_DIR, "**/*.mcap"), recursive=True)
+        bags += glob.glob(os.path.join(self.BAG_DIR, "**/*.mcap.zstd"), recursive=True)
+        return bags
+
+    @staticmethod
+    def _is_boot_session_bag(bag_path):
+        """xparo_launch.py's ExecuteProcess can't start the recorder fully
+        idle (confirmed empirically -- see rosbag_control.py's __init__
+        docstring), so every single `ros2 launch` produces a second,
+        throwaway session at boot: --start-paused into a
+        'boot_session_<timestamp>' directory, immediately closed again by
+        RosbagControl's own boot cleanup (_boot_sequence) before it ever
+        opens the real, correctly-named session a user actually wants.
+        That close finalizes a genuine, valid .mcap(.zstd) + metadata.yaml
+        on disk -- confirmed live: every single boot produced exactly one
+        of these alongside the real recording, so every session was
+        uploaded as *two* separate rosbag rows instead of one. Real
+        sessions are always named 'bag_<timestamp>' (handle_start's own
+        naming) -- never this prefix -- so matching on the immediate
+        parent directory's name is exact, with zero ambiguity and no
+        dependency on timing between this class and RosbagControl's own
+        state machine.
+        """
+        return os.path.basename(os.path.dirname(bag_path)).startswith('boot_session_')
+
+    def _remove_bag_and_metadata(self, bag_path):
+        """Deletes the bag data file and its sibling metadata.yaml (if
+        any), then removes the now-empty session directory. Both callers
+        below used to delete only the data file, leaving metadata.yaml
+        behind forever -- os.listdir(parent) was never empty, so the
+        directory (and the orphaned YAML) never got cleaned up either."""
+        os.remove(bag_path)
+        parent = os.path.dirname(bag_path)
+        metadata_path = os.path.join(parent, 'metadata.yaml')
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+        if os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+
     def _force_cleanup(self):
-        # Finds all mcap files recursively
-        files = glob.glob(os.path.join(self.BAG_DIR, "**/*.mcap"), recursive=True)
+        files = self._find_bag_files()
         files.sort(key=os.path.getctime)
         for f in files:
             if self.get_disk_usage() < self.DISK_TARGET_PCT: break
-            os.remove(f)
-            # Remove empty parent directory if it was a rosbag folder
-            parent = os.path.dirname(f)
-            if not os.listdir(parent):
-                os.rmdir(parent)
+            self._remove_bag_and_metadata(f)
             print(f"[CLEANUP] Disk threshold met. Deleted: {f}")
+
+    def _discard_boot_session_bags(self):
+        """Deletes (never uploads) the throwaway boot-cleanup session --
+        see _is_boot_session_bag's own docstring for why one of these
+        exists on disk after *every* launch. Deleted outright rather than
+        merely skipped: it has zero value, and leaving it in place would
+        just mean it keeps getting re-discovered (and re-skipped) by
+        every future cycle, accumulating on disk forever.
+
+        This runs unconditionally, every cycle, including the very first
+        one right after this process starts -- which can land before
+        RosbagControl's own async boot sequence (a chain of ROS service
+        calls) has actually finished closing that session. metadata.yaml
+        is only ever written once a session is genuinely, fully closed
+        (same signal _process_uploads' own session-open check relies on
+        elsewhere), so requiring it here before touching anything avoids
+        deleting -- or racing rosbag2's own compression step against --
+        a file the recorder might still have open. A boot-session bag
+        that isn't closed yet is simply left for a later cycle, once it
+        is.
+        """
+        for bag_path in self._find_bag_files():
+            if not self._is_boot_session_bag(bag_path):
+                continue
+            metadata_path = os.path.join(os.path.dirname(bag_path), 'metadata.yaml')
+            if not os.path.exists(metadata_path):
+                continue
+            self._remove_bag_and_metadata(bag_path)
+            print(f"[CLEANUP] Discarded boot-cleanup session (never real data): {os.path.basename(bag_path)}")
 
     def _process_uploads(self):
         """Finds completed bags and uploads to Django API."""
-        # Find all MCAP files in subfolders
-        all_bags = glob.glob(os.path.join(self.BAG_DIR, "**/*.mcap"), recursive=True)
-        
+        # Never a "completed bag" in any meaningful sense -- see
+        # _is_boot_session_bag's docstring. manage_disk_and_upload's real
+        # production loop always runs _discard_boot_session_bags first
+        # each cycle, but this filter doesn't rely on that ordering: any
+        # boot-session bag _discard_boot_session_bags hasn't gotten to yet
+        # (e.g. still open -- see its own docstring) must not be uploaded
+        # either, and this method should be correct entirely on its own.
+        all_bags = [b for b in self._find_bag_files() if not self._is_boot_session_bag(b)]
+
         # Sort by modification time (oldest first)
         all_bags.sort(key=os.path.getmtime)
-        
+
         # If a session is currently open (writing or merely paused -- either
         # way its .mcap is still being appended to), ignore the absolute
         # newest file. If it's the initial sync and nothing is recording
@@ -112,6 +202,16 @@ class BlackboxOrchestrator:
         target_bags = all_bags[:-1] if session_open else all_bags
 
         if not target_bags:
+            # Deliberately quiet when there's genuinely nothing recorded
+            # yet (all_bags empty too) -- this print is scoped to the one
+            # case worth a breadcrumb: real completed bag(s) exist on
+            # disk but every one of them is being held back because a
+            # session is still open. Silence here (with no distinction
+            # from "nothing to do at all") is exactly what let the real
+            # *.mcap vs *.mcap.zstd glob bug above go unnoticed for so
+            # long -- there was no signal either way.
+            if all_bags:
+                print(f"[UPLOAD] {len(all_bags)} bag file(s) on disk, all excluded (current session still open).")
             return
 
         for bag_path in target_bags:
@@ -119,31 +219,35 @@ class BlackboxOrchestrator:
                 # Use os.path.basename for cleaner log output
                 filename = os.path.basename(bag_path)
                 print(f"[UPLOAD] Attempting: {filename}")
-                
+
+                # Reads this session's metadata.yaml (attempting a
+                # `ros2 bag reindex` recovery first if it's missing) and
+                # sends the resulting summary + raw YAML text -- this used
+                # to be hardcoded to '{}' regardless of what was actually
+                # on disk, which is why the dashboard's rosbag rows always
+                # showed an empty "Data (preview)".
+                sensor_data = build_sensor_data(bag_path)
+                print(f"[UPLOAD] Metadata status for {filename}: {sensor_data.get('metadata_status')}")
+
                 with open(bag_path, 'rb') as f:
                     payload = {
                         'robot_id': self.ROBOT_ID,
-                        'data': '{}', 
+                        'data': json.dumps(sensor_data),
                         'sensor_type': 'rosbag'
                     }
                     headers = {'Authorization': f'Token {self.API_TOKEN}'}
-                    
+
                     response = requests.post(
-                        self.xparo_website_url+"/api/upload_rosbag/", 
-                        files={'bag_file': f}, 
-                        data=payload, 
-                        headers=headers, 
+                        self.xparo_website_url+"/api/upload_rosbag/",
+                        files={'bag_file': f},
+                        data=payload,
+                        headers=headers,
                         timeout=300
                     )
-                    
+
                     # 201 is DRF's default for 'Created'
                     if response.status_code in [200, 201]:
-                        os.remove(bag_path)
-                        # Clean up empty folder left behind by rosbag
-                        parent_dir = os.path.dirname(bag_path)
-                        if not os.listdir(parent_dir):
-                            os.rmdir(parent_dir)
-                            
+                        self._remove_bag_and_metadata(bag_path)
                         print(f"[SUCCESS] Server confirmed receipt. Deleted: {filename}")
                     else:
                         print(f"[FAILED] Server status {response.status_code}: {response.text}")

@@ -78,46 +78,67 @@ class XP_Database():
 
 
     def update_logging_session(self, private_send):
-        """Send incremental updates for the current session."""
+        """Send incremental updates for the current session -- merged into
+        the SAME Logs_history row session_id already points at
+        (Django's UPDATE_Logs_history_database, not another ADD), so a
+        long-running session accumulates one row's worth of history, not
+        one row per check-in."""
         if not self.session_id:
             print("No active logging session to update.")
             return
 
-        # Get new logs
         new_logs = self.get_ros2_jazzy_logs()
-        
-        # Take a resource snapshot
+
+        # Take a resource snapshot -- appended to resource_samples so
+        # _average_resource_samples can fold it into a whole-session
+        # average, both here (a running total-so-far) and again, finally,
+        # in stop_logging_session's own session-end update.
         current_resources = self.get_smart_resource_consumption()
         self.resource_samples.append((datetime.utcnow(), current_resources))
-        
-        # Compute average resource usage since last update (or since session start)
-        # For simplicity, we'll send the latest snapshot; you can aggregate as needed.
-        # To compute average, you could store cumulative values in a separate attribute.
-        # Here we'll just send the current snapshot.
-        
+
         payload = {
             "id": self.session_id,
             "log_files": new_logs,
-            "resources_consuption": current_resources,   # or computed average
-            "extra_info": {"last_update": datetime.utcnow().isoformat()}
+            "resources_consuption": current_resources,
+            "extra_info": {
+                "last_update": datetime.utcnow().isoformat(),
+                "running_average": self._average_resource_samples(),
+            }
         }
-        
-        # Send update command (needs server-side handler)
+
         private_send(json.dumps({"UPDATE_Logs_history_database": payload}), command_for="rest")
-        
+
         self.last_update_time = datetime.utcnow()
 
     def stop_logging_session(self, private_send):
-        """Send a final update and clear session ID."""
-        if self.session_id:
-            # Optionally add a flag in extra_info to mark session end
-            final_payload = {
-                "id": self.session_id,
-                "extra_info": {"event": "session_end", "uptime": str(datetime.utcnow() - self.session_start_time)}
+        """Send a final update -- total runtime and the average resource
+        consumption across every sample taken this session -- then clear
+        session_id so the *next* real connection (a genuinely new process
+        life) starts a fresh session rather than silently reusing this
+        one's id.
+
+        Best-effort only: this is reachable from xparo_ros.py's
+        KeyboardInterrupt handler (a graceful Ctrl+C/`ros2 launch` stop),
+        not from a genuine force-kill or crash -- there's no signal to
+        catch in that case, the exact same honest limitation
+        blackbox_manager.py's own force-exit handling already documents
+        for rosbag sessions that never got a clean Stop() either.
+        """
+        if not self.session_id:
+            return
+        uptime_seconds = (datetime.utcnow() - self.session_start_time).total_seconds()
+        final_payload = {
+            "id": self.session_id,
+            "extra_info": {
+                "event": "session_end",
+                "session_end_time": datetime.utcnow().isoformat(),
+                "total_runtime_seconds": uptime_seconds,
+                **self._average_resource_samples(),
             }
-            private_send(json.dumps({"UPDATE_Logs_history_database": final_payload}), command_for="rest")
-            self.session_id = None
-            self.resource_samples = []
+        }
+        private_send(json.dumps({"UPDATE_Logs_history_database": final_payload}), command_for="rest")
+        self.session_id = None
+        self.resource_samples = []
 
     ####################################################
     # Ensure the directory exists, create if not
@@ -262,8 +283,23 @@ class XP_Database():
         # resolves this to "rest" for them, identical to before.
         private_send(json.dumps({"ADD_robots_info": return_dict}))
 
-        # Trigger a log update immediately upon connection
-        self.trigger_log_update(private_send)
+        # Starts a new logging session -- but only the first time in this
+        # process's life, not on every call. send_initial_data (this
+        # method's only caller, via dashboard_receive) is registered as
+        # the transport's on_connected callback, which fires on every
+        # reconnect (a WiFi hiccup, a Django/Daphne restart, a hybrid-mode
+        # REST-fallback recovery -- none of them a new session by any
+        # reasonable definition), not just true process startup.
+        # Confirmed live: a robot that reconnected several times over one
+        # otherwise-continuous run got a brand new Logs_history row every
+        # single time -- "many logs" for what was really one session.
+        # self.session_id is only ever set once Django actually confirms
+        # the first ADD_Logs_history_database landed (see
+        # dashboard_receive's "log_updated" handler), so a session that
+        # never confirmed correctly still retries on the very next
+        # reconnect rather than being silently lost.
+        if self.session_id is None:
+            self.trigger_log_update(private_send)
 
     def get_device_uuid(self):
         # Get MAC address (which is usually stable unless hardware changes)
@@ -367,19 +403,74 @@ class XP_Database():
         return peripherals
     
     def get_smart_resource_consumption(self):
-        """Calculates an intelligent average of resource consumption."""
+        """Calculates an intelligent average of resource consumption. Every
+        call here is also what update_logging_session appends to
+        resource_samples -- see _average_resource_samples for how those
+        turn into a whole-session average."""
         cpu_percentages = psutil.cpu_percent(interval=1, percpu=True)
         ram = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
-        
+
         return {
             "cpu_avg_percent": sum(cpu_percentages) / len(cpu_percentages) if cpu_percentages else 0,
             "cpu_cores_percent": cpu_percentages,
             "ram_used_percent": ram.percent,
             "ram_available_mb": ram.available / (1024 * 1024),
+            "disk_used_percent": disk.percent,
+            "gpu_percent": self.get_gpu_percent(),
             "disk_io": psutil.disk_io_counters()._asdict() if psutil.disk_io_counters() else {},
             "net_io": psutil.net_io_counters()._asdict() if psutil.net_io_counters() else {}
         }
+
+    def get_gpu_percent(self):
+        """Best-effort NVIDIA GPU utilization via nvidia-smi -- covers
+        desktop/server NVIDIA GPUs. Returns None (never a faked 0) when
+        nvidia-smi isn't installed or there's no GPU, which is the honest,
+        common case on this project's actual target hardware -- Jetson
+        boards use tegrastats instead, a genuinely different tool this
+        doesn't attempt to support yet. Matches this codebase's own
+        precedent for hardware it can't really see into rather than
+        faking a number (Phase 10's stub BT leaf nodes, xparo's bt_engine).
+        """
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode != 0:
+                return None
+            first_line = result.stdout.strip().splitlines()[0]
+            return float(first_line)
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+            return None
+
+    def _average_resource_samples(self):
+        """Averages every resource_samples snapshot collected since
+        session start (get_smart_resource_consumption(), appended by
+        update_logging_session every update_interval seconds). cpu/ram/
+        disk are always present in a real snapshot; gpu_percent is
+        averaged only over the samples where a GPU was actually detected,
+        and left out entirely (never defaulted to 0) if none ever was --
+        "no GPU seen" and "GPU idle at 0%" are different facts."""
+        if not self.resource_samples:
+            return {}
+        cpu_values = [snapshot.get('cpu_avg_percent', 0) for _, snapshot in self.resource_samples]
+        ram_values = [snapshot.get('ram_used_percent', 0) for _, snapshot in self.resource_samples]
+        disk_values = [snapshot.get('disk_used_percent', 0) for _, snapshot in self.resource_samples]
+        gpu_values = [
+            snapshot['gpu_percent'] for _, snapshot in self.resource_samples
+            if snapshot.get('gpu_percent') is not None
+        ]
+
+        averages = {
+            "avg_cpu_percent": sum(cpu_values) / len(cpu_values),
+            "avg_ram_percent": sum(ram_values) / len(ram_values),
+            "avg_disk_percent": sum(disk_values) / len(disk_values),
+            "sample_count": len(self.resource_samples),
+        }
+        if gpu_values:
+            averages["avg_gpu_percent"] = sum(gpu_values) / len(gpu_values)
+        return averages
 
     def get_ros2_jazzy_logs(self):
         """Fetches new lines from the latest ROS2 log directory."""
@@ -417,12 +508,18 @@ class XP_Database():
         return {"log_directory": latest_dir, "new_entries": new_logs}
 
     def trigger_log_update(self, private_send):
-        """Gathers ROS2 logs and resource metrics, then packages them for Django."""
+        """Gathers ROS2 logs and resource metrics, then packages them for
+        Django. The ONE call, per process life, that creates a new
+        Logs_history row (send_robot_info's session_id guard ensures
+        that) -- every later update within the same session goes through
+        update_logging_session/stop_logging_session instead, which update
+        this same row rather than creating new ones."""
+        now = datetime.utcnow()
         payload = {
             "log_files": self.get_ros2_jazzy_logs(),
             "resources_consuption": self.get_smart_resource_consumption(),
-            "extra_info": {"event": "api_connect_or_update"},
-            "created_at": datetime.utcnow().isoformat(),
+            "extra_info": {"event": "session_start", "session_start_time": now.isoformat()},
+            "created_at": now.isoformat(),
             "unique_id":self.unique_id,
         }
         # Send data to the server
