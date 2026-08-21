@@ -151,6 +151,10 @@ class TestBuildRunTaskVal:
             "tree_xml": "<LoadNextDelivery />",
             "blackboard": {"dock_name": "dock-1"},
             "save_task_history": True,
+            # No "stage" key on the cached task -- defaults to
+            # "development", the least-trusted reading (see
+            # build_run_task_val's own comment).
+            "stage": "development",
         }
 
 
@@ -193,7 +197,10 @@ class TestRunTaskFromTopic:
         engine.run_task_from_topic("does-not-exist", {})  # must not raise
 
     def test_a_known_task_id_actually_runs_and_reports_task_result(self, tmp_path):
-        engine = _make_engine(tmp_path)
+        # development runs any task stage -- this test is about the
+        # dispatch plumbing, not stage gating (run_task.py has its own
+        # dedicated tests for that).
+        engine = _make_engine(tmp_path, xparo_stage="development")
         sent = []
         engine.transport.send = lambda message, command_for=None: sent.append(message)
         engine.bt_executor = BehaviorTreeExecutor(node=MagicMock(), engine=engine)
@@ -222,7 +229,7 @@ class TestRunTaskFromTopic:
         assert task_result["success"] is True
 
     def test_override_params_reach_the_resolved_blackboard(self, tmp_path):
-        engine = _make_engine(tmp_path)
+        engine = _make_engine(tmp_path, xparo_stage="development")
         sent = []
         engine.transport.send = lambda message, command_for=None: sent.append(message)
         engine.bt_executor = BehaviorTreeExecutor(node=MagicMock(), engine=engine)

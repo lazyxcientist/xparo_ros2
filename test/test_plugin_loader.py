@@ -49,6 +49,18 @@ class SecondCondition(CustomBTNode):
         return common.Status.FAILURE
 '''
 
+CRASHING_NODE_SOURCE = '''
+from xparo.bt_engine.plugin_loader import CustomBTNode
+from py_trees import common
+
+
+class CrashesOnTick(CustomBTNode):
+    XML_TAG = "CrashesOnTick"
+
+    def update(self):
+        raise RuntimeError("boom")
+'''
+
 
 class TestLoadPlugins:
     def test_a_custom_bt_node_subclass_is_found_and_registered_by_tag(self, tmp_path):
@@ -121,6 +133,71 @@ class TestRegisterPlugins:
             assert NODE_REGISTRY["MyCustomAction"] is second_builder
         finally:
             NODE_REGISTRY.pop("MyCustomAction", None)
+
+
+class TestCrashIsolation:
+    """A node's update() raising must become a controlled FAILURE, not an
+    exception that unwinds the whole tree tick -- confirmed by reading
+    py_trees' own Sequence/BehaviourTree.tick source that nothing upstream
+    catches this otherwise, so a bad plugin/inline/custom-file node used to
+    abort every other branch in the same tree run, not just itself."""
+
+    def test_a_node_that_raises_reports_failure_instead_of_propagating(self, tmp_path):
+        plugin_file = tmp_path / "crashes.py"
+        plugin_file.write_text(CRASHING_NODE_SOURCE)
+        try:
+            register_plugins([str(plugin_file)])
+            root = tree_builder.build_tree("<Sequence><CrashesOnTick /></Sequence>", {})
+            tree_pkg = __import__("py_trees").trees.BehaviourTree(root)
+            tree_pkg.tick()  # must not raise
+            assert root.status == common.Status.FAILURE
+        finally:
+            NODE_REGISTRY.pop("CrashesOnTick", None)
+
+    def test_a_sibling_after_the_crashing_node_still_gets_a_chance_to_run(self, tmp_path):
+        """The whole point of isolating it at the node level rather than
+        only at run_task.py's whole-task try/except -- other branches in
+        the SAME tree run must survive one bad node, not just other
+        concurrently-running tasks in other threads."""
+        crash_file = tmp_path / "crashes.py"
+        crash_file.write_text(CRASHING_NODE_SOURCE)
+        good_file = tmp_path / "good.py"
+        good_file.write_text(CUSTOM_NODE_SOURCE)
+        try:
+            register_plugins([str(crash_file), str(good_file)])
+            # A crashing first child must not stop the Sequence from
+            # continuing to tick its next child on a LATER tree tick --
+            # Sequence semantics: since the first child now reports
+            # FAILURE (not RUNNING), the Sequence itself is FAILURE this
+            # tick and never reaches the second child, so exercise this
+            # via a Fallback instead: Fallback tries the next child
+            # exactly when an earlier one fails.
+            root = tree_builder.build_tree(
+                "<Fallback><CrashesOnTick /><MyCustomAction /></Fallback>", {},
+            )
+            tree_pkg = __import__("py_trees").trees.BehaviourTree(root)
+            tree_pkg.tick()
+            assert root.status == common.Status.SUCCESS
+        finally:
+            NODE_REGISTRY.pop("CrashesOnTick", None)
+            NODE_REGISTRY.pop("MyCustomAction", None)
+
+    def test_crash_isolation_also_applies_to_nodes_loaded_via_the_older_inline_mechanism(self, tmp_path):
+        """sync_bt_inline_nodes (Phase 13) and sync_custom_node_files
+        (Phase 5) both route through this exact same register_plugins --
+        the safety net isn't specific to one caller."""
+        from xparo.engine import Engine
+
+        engine = Engine("secret", "proj-crash-isolation-test", connection_type="offline")
+        engine.files["xparo_custom_behaviors_folder_path"] = str(tmp_path)
+        try:
+            engine.sync_bt_inline_nodes({"CrashesOnTick": CRASHING_NODE_SOURCE})
+            root = tree_builder.build_tree("<Sequence><CrashesOnTick /></Sequence>", {})
+            tree_pkg = __import__("py_trees").trees.BehaviourTree(root)
+            tree_pkg.tick()
+            assert root.status == common.Status.FAILURE
+        finally:
+            NODE_REGISTRY.pop("CrashesOnTick", None)
 
 
 def _make_engine(tmp_path, **kwargs):

@@ -76,3 +76,9 @@ class TestRosbagRecordTopicArgs:
         }))
 
         assert xparo_launch._rosbag_record_topic_args(str(tmp_path)) == '-a'
+
+    def test_rosbag_storage_options_are_distro_aware(self, xparo_launch):
+        assert xparo_launch.get_rosbag_storage_args('jazzy') == [
+            '--storage', 'mcap', '--compression-mode', 'file', '--compression-format', 'zstd'
+        ]
+        assert xparo_launch.get_rosbag_storage_args('humble') == ['--storage', 'sqlite3']

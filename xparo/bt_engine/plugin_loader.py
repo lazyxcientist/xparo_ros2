@@ -12,10 +12,14 @@ to a robot-local file by a *separate* sync step before this ever runs).
 import importlib
 import importlib.util
 import inspect
+import logging
 import os
 import sys
 
 import py_trees
+from py_trees import common
+
+_logger = logging.getLogger("xparo.bt_engine.plugin_loader")
 
 
 class CustomBTNode(py_trees.behaviour.Behaviour):
@@ -98,6 +102,36 @@ def unregister_tags(tags):
         NODE_REGISTRY.pop(tag, None)
 
 
+def _crash_isolated_update(instance, tag):
+    """A crash inside a user-authored node's update() must become a
+    controlled FAILURE, not an exception that unwinds the whole tick --
+    confirmed by reading py_trees' own Sequence/BehaviourTree.tick source
+    directly: neither catches an exception from a child's update(), so
+    today one bad plugin/inline/custom-file node aborts every other
+    branch in the same tree run, not just itself (the spec's own "a node
+    crashing must not crash the whole engine" requirement doesn't hold at
+    the tree level, only at run_task.py's whole-task try/except). Wrapping
+    whatever the INSTANCE's own `update` resolves to -- not requiring a
+    differently-named override -- applies uniformly to every node loaded
+    through this module (Phase 12 external plugins, Phase 13 inline code,
+    and the newer multi-language CustomFile nodes alike) without changing
+    CustomBTNode's existing update()-override contract, which
+    custom_nodes_panel.js's already-shipped generated template depends on.
+    """
+    original_update = instance.update
+
+    def safe_update():
+        try:
+            return original_update()
+        except Exception as exc:
+            _logger.error("%s (%s) raised during update(): %s", instance.name, tag, exc)
+            instance.feedback_message = f"crashed: {exc}"
+            return common.Status.FAILURE
+
+    instance.update = safe_update
+    return instance
+
+
 def register_plugins(paths):
     """load_plugins() + wires each result into node_registry.NODE_REGISTRY
     using the same calling convention every other builder there already
@@ -109,7 +143,9 @@ def register_plugins(paths):
 
     loaded = load_plugins(paths)
     for tag, cls in loaded.items():
-        NODE_REGISTRY[tag] = lambda name, attrs, blackboard, children, ros_node, cls=cls: cls(
-            name=name, attrs=attrs, blackboard=blackboard, ros_node=ros_node,
-        )
+        def builder(name, attrs, blackboard, children, ros_node, cls=cls, tag=tag):
+            instance = cls(name=name, attrs=attrs, blackboard=blackboard, ros_node=ros_node)
+            return _crash_isolated_update(instance, tag)
+
+        NODE_REGISTRY[tag] = builder
     return loaded

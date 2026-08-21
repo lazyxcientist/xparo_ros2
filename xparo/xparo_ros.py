@@ -68,6 +68,12 @@ class Xparo(Node):
         # it (see transports/django_ws.py's DEFAULT_ENVIRONMENT for the old
         # hardcoded `local = True` this replaces).
         self.xparo_environment = self.declare_parameter("xparo_environment", xparo_config.get("xparo_environment", "production")  ).value
+        # Which Task stages (apps/analytics/models.py's TaskStageChoices,
+        # outer repo) this robot may run a RUN_TASK dispatch for -- see
+        # bt_engine/run_task.py's ALLOWED_TASK_STAGES for the actual
+        # cascade. Defaults to "production", matching xparo_environment's
+        # own safety-first default just above.
+        self.xparo_stage = self.declare_parameter("xparo_stage", xparo_config.get("xparo_stage", "production")  ).value
         self.xparo_folder = self.declare_parameter("xparo_folder", base_path_for_package  ).value
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
         self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
@@ -165,6 +171,7 @@ class Xparo(Node):
                               record_bags = self.record_bags,
                               BAG_DIR = self.BAG_DIR,
                               environment = self.xparo_environment,
+                              xparo_stage = self.xparo_stage,
                               rosbag_control = self.rosbag_control,
                               joy_publish = self._publish_joy,
                               xparo_transport = self.xparo_transport,
@@ -186,6 +193,10 @@ class Xparo(Node):
         # inline-authored nodes -- persisted per-node .py files under
         # custom_behaviors/inline_nodes/ from a previous sync.
         self.xparo_engine.sync_bt_inline_nodes()
+        # Same reasoning again, for the multi-language custom BT node
+        # system's own Python nodes -- persisted per-file .py files under
+        # custom_behaviors/custom_node_files/ from a previous sync.
+        self.xparo_engine.sync_custom_node_files()
         self.xparo_engine.connect()
 
 

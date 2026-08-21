@@ -63,6 +63,16 @@ def generate_launch_description():
     # against a local Django server) -- see transports/django_ws.py's
     # DEFAULT_ENVIRONMENT.
     xparo_environment =                 LaunchConfiguration('xparo_environment',                    default="production")
+    # Which Task stages (apps/analytics/models.py's TaskStageChoices) this
+    # robot is allowed to run: "development" (any stage), "testing"
+    # (testing/review/production), "review" (review/production), or
+    # "production" (production only) -- see run_task.py's
+    # ALLOWED_TASK_STAGES for the actual cascade table this feeds. Defaults
+    # to "production", the most restrictive, matching xparo_environment's
+    # own safety-first default just above -- an unconfigured robot should
+    # refuse to run anything but production-ready tasks, not silently run
+    # whatever's still being iterated on in development.
+    xparo_stage =                       LaunchConfiguration('xparo_stage',                          default="production")
     xparo_behavior_path =               LaunchConfiguration('xparo_behavior_path',                  default=os.path.join(current_dir,'config','default.xml'))
     xparo_file_path =                   LaunchConfiguration('xparo_file_path',                      default=os.path.join(current_dir,'config','default.yaml'))
     xparo_env_path =                    LaunchConfiguration('xparo_env_path',                       default=os.path.join(current_dir,'config','default.env'))
@@ -101,6 +111,7 @@ def generate_launch_description():
             DeclareLaunchArgument('xparo_secret_key',                   default_value=xparo_secret_key,                 description='your genrated secret key'),
             DeclareLaunchArgument('xparo_connection_type',              default_value=xparo_connection_type,            description='websocket or restframework connection'),
             DeclareLaunchArgument('xparo_environment',                  default_value=xparo_environment,                description='"production" (xparo.in) or "local" (127.0.0.1:8000)'),
+            DeclareLaunchArgument('xparo_stage',                        default_value=xparo_stage,                      description='"development", "testing", "review", or "production" -- which Task stages this robot may run'),
             DeclareLaunchArgument('xparo_behavior_path',                default_value=xparo_behavior_path,              description='path for AUTO-genrated behaviour tree.'),
             DeclareLaunchArgument('xparo_file_path',                    default_value=xparo_file_path,                  description='path for AUTO-genrated file'),
             DeclareLaunchArgument('xparo_env_path',                     default_value=xparo_env_path,                   description='path for AUTO-genrated env/blackbord'),
@@ -126,6 +137,7 @@ def generate_launch_description():
                             'xparo_secret_key':                     xparo_secret_key,
                             'xparo_connection_type':                xparo_connection_type,
                             'xparo_environment':                    xparo_environment,
+                            'xparo_stage':                           xparo_stage,
                             'xparo_behavior_path':                  xparo_behavior_path,
                             'xparo_file_path':                      xparo_file_path,
                             'xparo_env_path':                       xparo_env_path,

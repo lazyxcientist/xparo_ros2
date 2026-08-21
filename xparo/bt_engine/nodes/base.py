@@ -42,6 +42,22 @@ def resolve_attrs(raw_attrs, blackboard, required=()):
     return resolved
 
 
+def write_output(raw_attrs, blackboard, key, value):
+    """The direct mirror of resolve_attrs' own input-side "{blackboard_key}"
+    convention, but for outputs: an output port's raw XML attribute value
+    IS the target blackboard key itself (a literal name, no braces) --
+    <Navigate distance_remaining="nav.distance" /> writes
+    blackboard["nav.distance"], not blackboard["distance_remaining"]. A
+    port with no attribute at all (this output was never wired to
+    anything by whoever placed the node) is a silent no-op, not an error
+    -- an unmapped output is a normal, valid choice, not a mistake to
+    raise BlackboardKeyError over the way a missing *required input* is.
+    """
+    target = raw_attrs.get(key)
+    if target:
+        blackboard[target] = value
+
+
 class StubActionNode(py_trees.behaviour.Behaviour):
     """Honest-scoping base for every leaf tag this repo has zero real
     subsystem to hook into yet (confirmed by grep at planning time: no

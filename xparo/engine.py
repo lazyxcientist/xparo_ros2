@@ -8,6 +8,7 @@ from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
 from .bt_engine import run_task
 from .bt_engine import plugin_loader
+from .bt_engine import runners
 
 record_bags = False
 xparo_database_size =  80
@@ -28,7 +29,7 @@ STATUS_MAP = {
 
 
 class Engine():
-    def __init__(self,secret_key,project_id,connection_type = "websocket",record_bags=record_bags,BAG_DIR=None,environment=None,rosbag_control=None,joy_publish=None,xparo_transport="django_ws",tethered_channels_config=None):
+    def __init__(self,secret_key,project_id,connection_type = "websocket",record_bags=record_bags,BAG_DIR=None,environment=None,rosbag_control=None,joy_publish=None,xparo_transport="django_ws",tethered_channels_config=None,xparo_stage="production"):
         global xparo_database_size
         self.tmp_folder = "."
         xparo_database_path = os.path.join(self.tmp_folder,"xparo",project_id,'database')
@@ -62,6 +63,11 @@ class Engine():
         # only ever add/overwrite entries, never remove ones for a file
         # that's disappeared -- see sync_bt_inline_nodes' own docstring).
         self._inline_node_tags = set()
+        # Same idea, for sync_custom_node_files' own registrations --
+        # tracked separately from _inline_node_tags so the two sync
+        # mechanisms never unregister tags the OTHER one most recently
+        # loaded.
+        self._custom_node_file_tags = set()
         # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
         # separate from BAG_DIR (rosbag sessions) and the xparo_* config
         # paths below (behavior trees/env/properties, a different concept).
@@ -101,6 +107,10 @@ class Engine():
         # to be stale.
         self._raw_secret_key = secret_key
         self._environment = environment
+        # Read by run_task.py's ALLOWED_TASK_STAGES check before ticking
+        # any RUN_TASK dispatch -- see xparo_ros.py's own declare_parameter
+        # for the "production" default rationale.
+        self.xparo_stage = xparo_stage
         persisted_credential = self._load_persisted_credential()
         effective_secret = persisted_credential or secret_key
 
@@ -381,6 +391,166 @@ class Engine():
         self._inline_node_tags = set(loaded.keys())
         print(f"[bt_engine] loaded inline node tags: {list(loaded.keys())}")
 
+    _CUSTOM_NODE_FILE_EXTENSIONS = {'python': '.py', 'cpp': '.cpp', 'javascript': '.js', 'bash': '.sh'}
+
+    def sync_custom_node_files(self, custom_node_files=None):
+        """Multi-language custom BT node system, Phase 5/6/7 -- the robot-
+        side half of apps/analytics/models.py's CustomFile/
+        CustomNodeDefinition, now covering all four languages. `custom_node_files`
+        is {file_name: {"language", "source", "xml_tag", "node_type",
+        "header_source", "dependencies", "ports"}} for every project
+        CustomFile that's currently exposed as a node (DataAnalysis's own
+        sync helper only ever sends that subset -- a plain source file
+        with no CustomNodeDefinition never reaches the robot at all, it
+        has nothing to register), fresh from Django when resyncing.
+
+        Deliberately its own folder/manifest (custom_behaviors/
+        custom_node_files/, own _custom_node_file_tags tracking set) --
+        NOT the same as sync_bt_inline_nodes' inline_nodes/ folder (a
+        different Django model/dispatch key/trust model: CustomFile is
+        real per-project source-controlled code with its own file-name
+        identity, not admin-authored inline nodes keyed by node name) and
+        NOT xparo_custom_files_folder_path (confirmed by inspection to be
+        an unrelated, pre-existing "Sets"/data-file sync with nothing to
+        do with code -- reusing it would silently collide two unrelated
+        features).
+
+        Registration differs by language (see runners.py's own module
+        docstring for why): Python self-describes its own tag via
+        `XML_TAG = "..."`, scanned by plugin_loader's existing class
+        introspection -- exactly like sync_bt_inline_nodes/sync_bt_plugins
+        already do. JavaScript/Bash/C++ have no importable-and-scannable
+        source the same way, so their xml_tag/ports/node_type ride along
+        in the manifest itself (persisted here, not re-derived) and get
+        registered directly into NODE_REGISTRY. A C++ entry that fails to
+        compile is skipped (logged, not raised) -- the rest of the sync,
+        every other language and every other file, still proceeds; this
+        mirrors plugin_loader.load_plugins' own "one bad file contributes
+        nothing, never blocks the rest" posture. An unrecognized language
+        is skipped just as quietly.
+
+        None means "load whatever was persisted from a previous sync"
+        (the startup case, called once from xparo_ros.py's __init__,
+        mirroring sync_bt_plugins/sync_bt_inline_nodes) -- the manifest
+        carries everything needed to re-register without Django resending
+        anything, since the actual source files are already on disk.
+        """
+        from .bt_engine.node_registry import NODE_REGISTRY
+
+        folder = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files')
+        manifest_path = os.path.join(folder, 'manifest.json')
+
+        if custom_node_files is not None:
+            os.makedirs(folder, exist_ok=True)
+            previous_manifest = {}
+            if os.path.exists(manifest_path):
+                with open(manifest_path, 'r') as file:
+                    try:
+                        previous_manifest = json.load(file)
+                    except json.JSONDecodeError:
+                        previous_manifest = {}
+
+            manifest = {}
+            for name, entry in custom_node_files.items():
+                if not isinstance(entry, dict):
+                    continue
+                language = entry.get('language')
+                extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(language)
+                if extension is None:
+                    continue  # unrecognized language -- not written, not registered
+                source_path = os.path.join(folder, name + extension)
+                with open(source_path, 'w') as file:
+                    file.write(entry.get('source', ''))
+                if language == 'bash':
+                    os.chmod(source_path, 0o755)
+                manifest[name] = {
+                    'language': language,
+                    'xml_tag': entry.get('xml_tag', ''),
+                    'node_type': entry.get('node_type', 'action'),
+                    'ports': entry.get('ports', []),
+                    'header_source': entry.get('header_source', ''),
+                }
+
+            for stale_name, stale_entry in previous_manifest.items():
+                if stale_name in manifest:
+                    continue
+                stale_extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(stale_entry.get('language'), '')
+                for suffix in (stale_extension, '.hpp'):
+                    if not suffix:
+                        continue
+                    try:
+                        os.remove(os.path.join(folder, stale_name + suffix))
+                    except OSError:
+                        pass
+
+            with open(manifest_path, 'w') as file:
+                json.dump(manifest, file)
+
+        manifest = {}
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r') as file:
+                try:
+                    manifest = json.load(file)
+                except json.JSONDecodeError:
+                    manifest = {}
+
+        plugin_loader.unregister_tags(self._custom_node_file_tags)
+        registered_tags = set()
+
+        python_paths = [
+            os.path.join(folder, name + '.py')
+            for name, entry in manifest.items() if entry.get('language') == 'python'
+        ]
+        registered_tags |= set(plugin_loader.register_plugins(python_paths).keys())
+
+        js_entries = [(name, entry) for name, entry in manifest.items() if entry.get('language') == 'javascript']
+        if js_entries:
+            js_runtime_dir = os.path.join(folder, 'js_runtime')
+            runners.ensure_js_runtime(js_runtime_dir)
+            for name, entry in js_entries:
+                xml_tag = entry.get('xml_tag')
+                if not xml_tag:
+                    continue
+                output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
+                NODE_REGISTRY[xml_tag] = runners.make_javascript_node_factory(
+                    os.path.join(folder, name + '.js'), js_runtime_dir, output_keys,
+                )
+                registered_tags.add(xml_tag)
+
+        for name, entry in manifest.items():
+            if entry.get('language') != 'bash':
+                continue
+            xml_tag = entry.get('xml_tag')
+            if not xml_tag:
+                continue
+            script_path = os.path.join(folder, name + '.sh')
+
+            def _bash_builder(nm, attrs, blackboard, children, ros_node, script_path=script_path):
+                return runners.BashProcessNode(nm, attrs, blackboard, script_path=script_path, ros_node=ros_node)
+
+            NODE_REGISTRY[xml_tag] = _bash_builder
+            registered_tags.add(xml_tag)
+
+        cpp_entries = [(name, entry) for name, entry in manifest.items() if entry.get('language') == 'cpp']
+        if cpp_entries:
+            cpp_build_dir = os.path.join(folder, 'cpp_build')
+            for name, entry in cpp_entries:
+                xml_tag = entry.get('xml_tag')
+                cpp_path = os.path.join(folder, name + '.cpp')
+                if not xml_tag or not os.path.exists(cpp_path):
+                    continue
+                with open(cpp_path, 'r') as file:
+                    source = file.read()
+                output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
+                executable_path = runners.compile_cpp_node(source, entry.get('header_source', ''), cpp_build_dir, name)
+                if executable_path is None:
+                    continue
+                NODE_REGISTRY[xml_tag] = runners.make_cpp_node_factory(executable_path, output_keys)
+                registered_tags.add(xml_tag)
+
+        self._custom_node_file_tags = registered_tags
+        print(f"[bt_engine] loaded custom node file tags: {sorted(registered_tags)}")
+
     def sync_rosbag_config(self, config):
         """`config` is apps/analytics/data_analyis.py's
         GET_rosbag_config/EDIT_rosbag_config shape ({record_all,
@@ -472,7 +642,7 @@ class Engine():
         threading.Thread(
             target=run_task.handle_run_task,
             args=(self.bt_executor, val, self._send_dict),
-            kwargs={"add_task_history": self.add_task_history},
+            kwargs={"add_task_history": self.add_task_history, "xparo_stage": self.xparo_stage},
             daemon=True,
         ).start()
 
@@ -615,6 +785,13 @@ class Engine():
                 # params, save_task_history}}) -- see sync_custom_tasks'
                 # own docstring.
                 self.sync_custom_tasks(val)
+            elif k=="custom_node_files":
+                # Multi-language custom BT node system, Phase 5 -- val is
+                # DataAnalysis._get_custom_node_files_for_sync()'s shape
+                # ({file_name: {"language":..., "source":...}}). See
+                # sync_custom_node_files' own docstring for what happens
+                # to non-Python entries today.
+                self.sync_custom_node_files(val)
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":
@@ -670,7 +847,7 @@ class Engine():
                     threading.Thread(
                         target=run_task.handle_run_task,
                         args=(self.bt_executor, val, self._send_dict),
-                        kwargs={"add_task_history": self.add_task_history},
+                        kwargs={"add_task_history": self.add_task_history, "xparo_stage": self.xparo_stage},
                         daemon=True,
                     ).start()
             else:

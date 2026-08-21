@@ -145,4 +145,13 @@ def build_run_task_val(task_id, override_params, custom_tasks, files):
         "tree_xml": tree_xml,
         "blackboard": blackboard,
         "save_task_history": task.get("save_task_history", True),
+        # TaskStageChoices value synced down with everything else above --
+        # see run_task.py's ALLOWED_TASK_STAGES check, which applies here
+        # exactly like it does to a Django-dispatched RUN_TASK. Defaults
+        # to "development" (a stale locally-cached task from before this
+        # feature has no "stage" key at all) -- the task's own stage, not
+        # a robot's, so an unlabeled task should only be trusted by the
+        # most permissive robots, not treated as production-ready. See
+        # run_task.py's handle_run_task for the same reasoning in detail.
+        "stage": task.get("stage") or "development",
     }
