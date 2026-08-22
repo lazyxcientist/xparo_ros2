@@ -5,11 +5,39 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 from xparo.rosbag_control import load_rosbag_config
 
 ROS_DISTRO = os.environ.get("ROS_DISTRO", "").lower()
+
+
+def _derive_source_folder(install_share_dir, subfolder):
+    """Bidirectional file sync (see /home/scientist/.claude/plans/breezy-
+    splashing-koala.md): a "local" launch (this exact machine, developing
+    against a local Django server -- xparo_environment's own existing
+    meaning) means custom_behaviors/custom_envs content should land in the
+    real, git-tracked SOURCE tree the owner actually hand-edits, not only
+    ever in the colcon-generated install tree nobody is meant to touch by
+    hand -- that's the whole point of this feature; syncing changes into a
+    location the user never edits or commits doesn't help them at all.
+
+    install_share_dir is get_package_share_directory('xparo')'s own
+    result (.../<ws>/install/xparo/share/xparo); this repo's own actual,
+    observed colcon workspace layout (ros_packages/{src,build,install,log}/)
+    means the equivalent source path is 4 directories up, then down into
+    src/xparo. Falls back to the install-tree path itself, never raises,
+    if that doesn't hold (e.g. a real separate-machine production
+    deployment with no source checkout present at all) -- this is a
+    best-effort local-dev convenience, not something a real robot's boot
+    should ever fail over.
+    """
+    install_root = os.path.dirname(os.path.dirname(os.path.dirname(install_share_dir)))
+    workspace_root = os.path.dirname(install_root)
+    source_package_dir = os.path.join(workspace_root, 'src', 'xparo')
+    if os.path.isdir(source_package_dir):
+        return os.path.join(source_package_dir, subfolder)
+    return os.path.join(install_share_dir, subfolder)
 
 
 def _rosbag_record_topic_args(custom_behaviors_folder_path):
@@ -78,9 +106,26 @@ def generate_launch_description():
     xparo_env_path =                    LaunchConfiguration('xparo_env_path',                       default=os.path.join(current_dir,'config','default.env'))
     xparo_local_env_path =              LaunchConfiguration('xparo_local_env_path',                 default=os.path.join(current_dir, 'config', 'default.env'))
     xparo_properties_path =             LaunchConfiguration('xparo_properties_path',                default=os.path.join(current_dir,'properties','properties.txt'))
-    xparo_custom_behaviors_folder_path= LaunchConfiguration('xparo_custom_behaviors_folder_path',   default=os.path.join(current_dir,'custom_behaviors'))
+    # Bidirectional file sync -- xparo_environment=="local" (developing
+    # against a local Django server, this exact machine/checkout) means
+    # synced custom_behaviors/custom_envs content should land in the real
+    # source tree the owner actually hand-edits and git-commits, not only
+    # ever the colcon install tree; "production" (a real, possibly
+    # separate-machine deployment) keeps the existing install-tree
+    # default unchanged. See _derive_source_folder's own docstring for
+    # the path derivation and its safe fallback.
+    _install_custom_behaviors_dir = os.path.join(current_dir, 'custom_behaviors')
+    _source_custom_behaviors_dir = _derive_source_folder(current_dir, 'custom_behaviors')
+    _install_custom_evns_dir = os.path.join(current_dir, 'custom_envs')
+    _source_custom_evns_dir = _derive_source_folder(current_dir, 'custom_envs')
+
+    xparo_custom_behaviors_folder_path= LaunchConfiguration('xparo_custom_behaviors_folder_path',   default=PythonExpression([
+        '"', _source_custom_behaviors_dir, '" if "', xparo_environment, '" == "local" else "', _install_custom_behaviors_dir, '"',
+    ]))
     xparo_custom_files_folder_path =    LaunchConfiguration('xparo_custom_files_folder_path',       default=os.path.join(current_dir,'custom_files'))
-    xparo_custom_evns_folder_path =     LaunchConfiguration('xparo_custom_evns_folder_path',        default=os.path.join(current_dir,'custom_envs'))
+    xparo_custom_evns_folder_path =     LaunchConfiguration('xparo_custom_evns_folder_path',        default=PythonExpression([
+        '"', _source_custom_evns_dir, '" if "', xparo_environment, '" == "local" else "', _install_custom_evns_dir, '"',
+    ]))
     record_bags =                       LaunchConfiguration('record_bags',                          default=False)
     # Must be shared between the xparo_ros node and the rosbag2 recorder
     # process below -- RosbagControl (rosbag_control.py) opens sessions

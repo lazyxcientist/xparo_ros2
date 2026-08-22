@@ -1,4 +1,5 @@
 import json
+import re
 import threading
 import time
 import os
@@ -1147,6 +1148,151 @@ class Engine():
 
         return result
 
+    # Bidirectional file sync, "adopt a disk-added file" (see /home/
+    # scientist/.claude/plans/breezy-splashing-koala.md): a file the owner
+    # drops directly into a language folder -- not via the dashboard, not
+    # in manifest.json/examples_manifest.json at all -- needs to be
+    # DISCOVERED before it can even be reported to Django. Only files that
+    # actually look like a real node's entry point count; a shared helper/
+    # include file (a plain utility module with no node class, a .hpp
+    # header already handled separately as header_source) is deliberately
+    # never surfaced here, matching the owner's own explicit "no need to
+    # sync its importable/include files, just the main file" instruction.
+    # C++'s check mirrors runners.py's own _CPP_CLASS_RE exactly (cheap
+    # structural match -- the real compile attempt only happens later,
+    # once Django has actually ingested this as a CustomFile).
+    _JS_NODE_CLASS_RE = re.compile(r"class\s+\w+\s+extends\s+XparoNode")
+
+    def _looks_like_a_node_file(self, language, source):
+        if language == 'python':
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+                tmp.write(source)
+                tmp_path = tmp.name
+            try:
+                return bool(plugin_loader.load_plugins([tmp_path]))
+            except Exception:
+                return False
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        if language == 'cpp':
+            return bool(runners._CPP_CLASS_RE.search(source))
+        if language == 'javascript':
+            return bool(self._JS_NODE_CLASS_RE.search(source))
+        if language == 'bash':
+            # No import/include convention exists for Bash at all -- every
+            # .sh file in this folder is inherently "a main file".
+            return True
+        return False
+
+    def _discover_new_node_files(self, known_names):
+        """Scans every language subfolder for files not already tracked
+        (in manifest.json or examples_manifest.json) that look like a
+        real node's entry point. Returns {name: {language, source,
+        header_source}} -- header_source stays '' here (a bare .hpp with
+        no matching .cpp of the same name is exactly the "include file"
+        case this deliberately skips)."""
+        base = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files')
+        discovered = {}
+        for language, extension in self._CUSTOM_NODE_FILE_EXTENSIONS.items():
+            language_dir = os.path.join(base, language)
+            if not os.path.isdir(language_dir):
+                continue
+            for filename in os.listdir(language_dir):
+                if not filename.endswith(extension):
+                    continue
+                name = filename[:-len(extension)]
+                if name in known_names:
+                    continue
+                source_path = os.path.join(language_dir, filename)
+                try:
+                    with open(source_path, 'r') as file:
+                        source = file.read()
+                except OSError:
+                    continue
+                if not self._looks_like_a_node_file(language, source):
+                    continue
+                header_source = ''
+                if language == 'cpp':
+                    header_path = os.path.join(language_dir, name + '.hpp')
+                    if os.path.exists(header_path):
+                        with open(header_path, 'r') as file:
+                            header_source = file.read()
+                discovered[name] = {"language": language, "source": source, "header_source": header_source}
+        return discovered
+
+    _CPP_CLASS_AND_BASE_RE = re.compile(r"class\s+(\w+)\s*:\s*public\s+BT::(SyncActionNode|ConditionNode)")
+    _CPP_PORT_RE = re.compile(r'BT::(InputPort|OutputPort)\s*<[^>]*>\s*\(\s*"([^"]+)"')
+    _JS_PORT_RE = re.compile(r'this\.(input|output)\s*\(\s*"([^"]+)"')
+    _BASH_INPUT_RE = re.compile(r'\$\{(\w+):-')
+    _BASH_OUTPUT_RE = re.compile(r'echo\s+"(\w+)=')
+
+    @staticmethod
+    def _pascal_case(name):
+        """Duplicated (not imported -- separate git repo, no shared
+        import path) from apps/analytics/custom_node_files.py's own
+        _pascal_case, kept in lockstep by convention the same way
+        sync_hash.py's two copies are."""
+        parts = [p for p in name.replace('-', '_').split('_') if p]
+        return ''.join(p[0].upper() + p[1:] for p in parts) or 'CustomNode'
+
+    def _detect_node_metadata(self, name, language, source):
+        """Best-effort {xml_tag, node_type, ports} for a file Django has
+        never seen before -- used only to bootstrap a brand-new
+        CustomNodeDefinition on first ingest (see
+        DataAnalysis._ingest_disk_content on the Django side); once one
+        exists, this is never consulted again -- Django's own value is
+        always authoritative from then on, same as every other synced
+        entry's metadata.
+        """
+        if language == 'python':
+            import tempfile
+            xml_tag = self._pascal_case(name)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+                tmp.write(source)
+                tmp_path = tmp.name
+            try:
+                found = plugin_loader.load_plugins([tmp_path])
+                if found:
+                    xml_tag = next(iter(found.keys()))
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return {"xml_tag": xml_tag, "node_type": "action", "ports": []}
+
+        if language == 'cpp':
+            match = self._CPP_CLASS_AND_BASE_RE.search(source)
+            xml_tag = match.group(1) if match else self._pascal_case(name)
+            node_type = "condition" if match and match.group(2) == "ConditionNode" else "action"
+            ports = [
+                {"direction": "input" if kind == "InputPort" else "output", "key": key}
+                for kind, key in self._CPP_PORT_RE.findall(source)
+            ]
+            return {"xml_tag": xml_tag, "node_type": node_type, "ports": ports}
+
+        if language == 'javascript':
+            class_match = re.search(r"class\s+(\w+)\s+extends\s+XparoNode", source)
+            xml_tag = class_match.group(1) if class_match else self._pascal_case(name)
+            ports = [
+                {"direction": kind, "key": key}
+                for kind, key in self._JS_PORT_RE.findall(source)
+            ]
+            return {"xml_tag": xml_tag, "node_type": "action", "ports": ports}
+
+        if language == 'bash':
+            ports = [{"direction": "input", "key": key.lower()} for key in self._BASH_INPUT_RE.findall(source)]
+            ports += [{"direction": "output", "key": key.lower()} for key in self._BASH_OUTPUT_RE.findall(source)]
+            return {"xml_tag": self._pascal_case(name), "node_type": "action", "ports": ports}
+
+        return {"xml_tag": self._pascal_case(name), "node_type": "action", "ports": []}
+
     def get_local_file_state(self):
         """Bidirectional file sync (see /home/scientist/.claude/plans/
         breezy-splashing-koala.md, Part 3): the robot's half of
@@ -1179,19 +1325,47 @@ class Engine():
         # no payload -- the same safe "reload whatever's already synced"
         # startup case, harmless to re-run).
         self.sync_custom_node_files()
-        node_files_manifest_path = os.path.join(
-            self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files', 'manifest.json',
-        )
-        node_files_state = {}
+        node_files_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files')
+        node_files_manifest_path = os.path.join(node_files_dir, 'manifest.json')
+        manifest = {}
         if os.path.exists(node_files_manifest_path):
             with open(node_files_manifest_path, 'r') as file:
                 try:
                     manifest = json.load(file)
                 except json.JSONDecodeError:
                     manifest = {}
-            for name, entry in manifest.items():
-                if entry.get('content_hash'):
-                    node_files_state[name] = {"content_hash": entry['content_hash'], "language": entry.get('language', '')}
+        node_files_state = {}
+        for name, entry in manifest.items():
+            if entry.get('content_hash'):
+                node_files_state[name] = {"content_hash": entry['content_hash'], "language": entry.get('language', '')}
+
+        examples_manifest_path = os.path.join(node_files_dir, 'examples_manifest.json')
+        examples_manifest = {}
+        if os.path.exists(examples_manifest_path):
+            with open(examples_manifest_path, 'r') as file:
+                try:
+                    examples_manifest = json.load(file)
+                except json.JSONDecodeError:
+                    examples_manifest = {}
+        known_names = set(manifest.keys()) | {
+            name for language_examples in examples_manifest.values()
+            if isinstance(language_examples, dict) for name in language_examples
+        }
+        # A file dropped directly into a language folder -- never synced
+        # from Django, not one of the shipped examples either -- is
+        # exactly the "user is not going to edit the build packages, he
+        # will edit or add files in the main package" case. Discovered
+        # here so LOCAL_FILE_STATE reports its hash the same as any other
+        # tracked file, and Django's own reconciliation (baseline=""
+        # since it's never seen this name) naturally treats it as
+        # disk-changed-only -- see resolve_local_file_content's ingest
+        # path, which now creates a new CustomFile (+ a best-effort
+        # CustomNodeDefinition) instead of silently dropping it.
+        for name, entry in self._discover_new_node_files(known_names).items():
+            node_files_state[name] = {
+                "content_hash": sync_hash.content_hash(entry["source"], entry["header_source"]),
+                "language": entry["language"],
+            }
 
         return {
             "device_id": self.local_database.unique_id,
@@ -1241,18 +1415,36 @@ class Engine():
                     manifest = {}
         for name in requested.get("custom_node_files", []):
             entry = manifest.get(name)
-            if entry is None:
+            if entry is not None:
+                extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(entry.get('language'))
+                if extension is None:
+                    continue
+                source_path = os.path.join(node_files_folder, entry['language'], name + extension)
+                try:
+                    with open(source_path, 'r') as file:
+                        source = file.read()
+                except OSError:
+                    continue
+                response["custom_node_files"][name] = {"source": source, "header_source": entry.get('header_source', '')}
                 continue
-            extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(entry.get('language'))
-            if extension is None:
+
+            # Not in manifest.json at all -- a file dropped directly into
+            # a language folder (see _discover_new_node_files). Django has
+            # never heard of this name, so it needs enough to bootstrap a
+            # brand-new CustomFile (+ a best-effort CustomNodeDefinition)
+            # from scratch, not just source/header_source.
+            discovered = self._discover_new_node_files(set()).get(name)
+            if discovered is None:
                 continue
-            source_path = os.path.join(node_files_folder, entry['language'], name + extension)
-            try:
-                with open(source_path, 'r') as file:
-                    source = file.read()
-            except OSError:
-                continue
-            response["custom_node_files"][name] = {"source": source, "header_source": entry.get('header_source', '')}
+            metadata = self._detect_node_metadata(name, discovered["language"], discovered["source"])
+            response["custom_node_files"][name] = {
+                "source": discovered["source"],
+                "header_source": discovered["header_source"],
+                "language": discovered["language"],
+                "detected_xml_tag": metadata["xml_tag"],
+                "detected_node_type": metadata["node_type"],
+                "detected_ports": metadata["ports"],
+            }
 
         custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
         for name in requested.get("custom_aiml", []):
