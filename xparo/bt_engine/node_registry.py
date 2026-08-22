@@ -89,6 +89,12 @@ def _build_param_set(name, attrs, blackboard, children, ros_node):
     return ParamSetNode(name=name, attrs=attrs, blackboard=blackboard, ros_node=ros_node)
 
 
+@register("Wait")
+def _build_wait(name, attrs, blackboard, children, ros_node):
+    from .nodes.wait import WaitNode
+    return WaitNode(name=name, attrs=attrs, blackboard=blackboard)
+
+
 def _register_stub(tag, module_name, class_name):
     @register(tag)
     def _builder(name, attrs, blackboard, children, ros_node, module_name=module_name, class_name=class_name):

@@ -68,6 +68,11 @@ class TestHandleRunTaskDirect:
         # reason -- see TestHandleRunTaskStageGating for that case).
         assert "stage_mismatch" not in responses[0]["TASK_RESULT"]
         assert responses[0]["TASK_RESULT"]["success"] is False
+        # A clean FAILURE status is not an exception -- final_blackboard
+        # never gets an "_error" key for this case, so TASK_RESULT's error
+        # must be an empty string, not missing (the frontend consumer
+        # distinguishes "no error message" from "no error key at all").
+        assert responses[0]["TASK_RESULT"]["error"] == ""
 
     def test_a_malformed_tree_reports_success_false_instead_of_raising(self):
         mock_engine = MagicMock()
@@ -81,6 +86,10 @@ class TestHandleRunTaskDirect:
 
         assert "stage_mismatch" not in responses[0]["TASK_RESULT"]
         assert responses[0]["TASK_RESULT"]["success"] is False
+        # Unlike a clean FAILURE, this genuinely raised (UnknownNodeError) --
+        # the real exception text must reach TASK_RESULT, not just
+        # success=False with no explanation.
+        assert "NotARealTag" in responses[0]["TASK_RESULT"]["error"]
 
     def test_save_task_history_true_calls_add_task_history_with_the_resolved_blackboard(self):
         mock_engine = MagicMock()

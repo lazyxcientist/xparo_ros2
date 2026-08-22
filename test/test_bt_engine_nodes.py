@@ -18,6 +18,7 @@ from xparo.bt_engine.nodes.param_set import ParamSetNode, build_parameter_value
 from xparo.bt_engine.nodes.play_audio import PlayAudioNode
 from xparo.bt_engine.nodes.speak_text import SpeakTextNode
 from xparo.bt_engine.nodes.navigate_to import NavigateToNode
+from xparo.bt_engine.nodes.wait import WaitNode
 
 
 def _tick_to_completion(node, max_ticks=20):
@@ -64,6 +65,35 @@ class TestStubNodes:
     def test_stub_holds_running_for_the_simulated_delay(self):
         node = PlayAudioNode(name="p", attrs={"file_path": "/x.mp3"}, blackboard={})
         node.SIMULATED_DELAY_S = 10  # long enough that the first tick can't have finished
+        assert node.update() == common.Status.RUNNING
+
+
+class TestWaitNode:
+    def test_holds_running_until_the_configured_duration_elapses(self):
+        node = WaitNode(name="w", attrs={"seconds": "0.05"}, blackboard={})
+        assert node.update() == common.Status.RUNNING
+        status = _tick_to_completion(node)
+        assert status == common.Status.SUCCESS
+
+    def test_defaults_to_one_second_when_no_seconds_attr_given(self):
+        node = WaitNode(name="w", attrs={}, blackboard={})
+        assert node.update() == common.Status.RUNNING
+
+    def test_resolves_a_blackboard_placeholder_for_seconds(self):
+        node = WaitNode(name="w", attrs={"seconds": "{pause_s}"}, blackboard={"pause_s": "0.05"})
+        status = _tick_to_completion(node)
+        assert status == common.Status.SUCCESS
+
+    def test_a_non_numeric_seconds_value_fails_cleanly(self):
+        node = WaitNode(name="w", attrs={"seconds": "not-a-number"}, blackboard={})
+        assert node.update() == common.Status.FAILURE
+
+    def test_restarts_its_timer_on_reinitialise(self):
+        node = WaitNode(name="w", attrs={"seconds": "0.05"}, blackboard={})
+        _tick_to_completion(node)
+        node.initialise()
+        # A fresh initialise() (tree re-entering this node) must not
+        # instantly report SUCCESS from the previous run's elapsed clock.
         assert node.update() == common.Status.RUNNING
 
 

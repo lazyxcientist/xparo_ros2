@@ -1,0 +1,78 @@
+{
+  "python": {
+    "greet_example": {
+      "xml_tag": "GreetExample",
+      "node_type": "action",
+      "ports": [
+        {"direction": "input", "key": "name"},
+        {"direction": "output", "key": "greeting"}
+      ],
+      "header_source": ""
+    },
+    "battery_ok_example": {
+      "xml_tag": "BatteryOkExample",
+      "node_type": "condition",
+      "ports": [
+        {"direction": "input", "key": "min_level"}
+      ],
+      "header_source": ""
+    }
+  },
+  "cpp": {
+    "greet_example_cpp": {
+      "xml_tag": "GreetExampleCpp",
+      "node_type": "action",
+      "ports": [
+        {"direction": "input", "key": "name"},
+        {"direction": "output", "key": "greeting"}
+      ],
+      "header_source": ""
+    },
+    "battery_ok_example_cpp": {
+      "xml_tag": "BatteryOkExampleCpp",
+      "node_type": "condition",
+      "ports": [
+        {"direction": "input", "key": "min_level"}
+      ],
+      "header_source": ""
+    }
+  },
+  "javascript": {
+    "greet_example_js": {
+      "xml_tag": "GreetExampleJs",
+      "node_type": "action",
+      "ports": [
+        {"direction": "input", "key": "name"},
+        {"direction": "output", "key": "greeting"}
+      ],
+      "header_source": ""
+    },
+    "battery_ok_example_js": {
+      "xml_tag": "BatteryOkExampleJs",
+      "node_type": "condition",
+      "ports": [
+        {"direction": "input", "key": "min_level"}
+      ],
+      "header_source": ""
+    }
+  },
+  "bash": {
+    "greet_example_bash": {
+      "xml_tag": "GreetExampleBash",
+      "node_type": "action",
+      "ports": [
+        {"direction": "input", "key": "name"},
+        {"direction": "output", "key": "greeting"}
+      ],
+      "header_source": ""
+    },
+    "battery_ok_example_bash": {
+      "xml_tag": "BatteryOkExampleBash",
+      "node_type": "condition",
+      "ports": [
+        {"direction": "input", "key": "min_level"}
+      ],
+      "header_source": ""
+    }
+  }
+}

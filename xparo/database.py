@@ -46,7 +46,19 @@ class XP_Database():
             def handle_exit(signum, frame):
                 self.orchestrator.running = False
                 self.orchestrator.stop_recording()
-                exit(0)
+                # Deliberately NOT exit(0): that raises SystemExit, a sibling
+                # of KeyboardInterrupt rather than the same exception, so
+                # xparo_ros.py's `except KeyboardInterrupt: pass` around
+                # rclpy.spin() never caught it -- the process exited straight
+                # from here, before main() ever reached
+                # stop_logging_session(), which is the only thing that sends
+                # this session's "session_end"/session_end_time update to
+                # Django. Raising KeyboardInterrupt instead (the same
+                # exception Python's own default SIGINT handler raises) lets
+                # rclpy.spin() unwind normally into that existing shutdown
+                # path for both SIGINT and SIGTERM (e.g. a `docker stop`/
+                # systemd stop), so the final update actually gets sent.
+                raise KeyboardInterrupt()
             signal.signal(signal.SIGINT, handle_exit)
             signal.signal(signal.SIGTERM, handle_exit)
 

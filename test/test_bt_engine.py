@@ -179,6 +179,17 @@ class TestTreeBuilder:
         with pytest.raises(tree_builder.UnknownNodeError):
             tree_builder.build_tree('<TotallyMadeUpTag foo="bar" />', {})
 
+    def test_wait_is_registered_and_ticks_to_success_after_its_duration(self):
+        import time
+        root = tree_builder.build_tree('<Wait seconds="0.01" />', {})
+        tree = __import__("py_trees").trees.BehaviourTree(root)
+        for _ in range(20):
+            tree.tick()
+            if root.status != common.Status.RUNNING:
+                break
+            time.sleep(0.01)
+        assert root.status == common.Status.SUCCESS
+
     def test_an_explicit_name_attribute_becomes_the_node_name(self):
         """The BT editor canvas (DownloadButton.js's buildNodesFromXml)
         uses the XML `name` attribute as the React Flow node's id, and

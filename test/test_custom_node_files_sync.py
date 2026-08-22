@@ -10,6 +10,8 @@ thing, don't mock" convention (test_remote_ops.py) -- loader correctness
 itself is covered by test_plugin_loader.py, runner correctness by
 test_runners.py.
 """
+import json
+
 from xparo.bt_engine.node_registry import NODE_REGISTRY
 
 NAVIGATE_SOURCE = '''
@@ -86,9 +88,17 @@ class TestEngineSyncCustomNodeFilesPython:
         try:
             engine.sync_custom_node_files({"navigate": {"language": "python", "source": NAVIGATE_SOURCE}})
 
-            written = (tmp_path / "custom_node_files" / "navigate.py").read_text()
+            written = (tmp_path / "custom_node_files" / "python" / "navigate.py").read_text()
             assert written == NAVIGATE_SOURCE
             assert "Navigate" in NODE_REGISTRY
+
+            # Bidirectional file sync: a fresh Django sync is the new
+            # authoritative baseline -- content_hash/synced_at land in the
+            # manifest immediately, not just on some later reconciliation.
+            from xparo.sync_hash import content_hash
+            manifest = json.loads((tmp_path / "custom_node_files" / "manifest.json").read_text())
+            assert manifest["navigate"]["content_hash"] == content_hash(NAVIGATE_SOURCE, "")
+            assert manifest["navigate"]["synced_at"]
         finally:
             NODE_REGISTRY.pop("Navigate", None)
 
@@ -99,8 +109,8 @@ class TestEngineSyncCustomNodeFilesPython:
             "navigate": {"language": "rust", "source": "fn main() {}", "xml_tag": "Navigate"},
         })
 
-        assert not (tmp_path / "custom_node_files" / "navigate.py").exists()
-        assert not (tmp_path / "custom_node_files" / "navigate.rs").exists()
+        assert not (tmp_path / "custom_node_files" / "python" / "navigate.py").exists()
+        assert not (tmp_path / "custom_node_files" / "rust" / "navigate.rs").exists()
         assert "Navigate" not in NODE_REGISTRY
 
     def test_a_cpp_file_that_fails_to_compile_is_skipped_not_registered_rest_of_sync_still_proceeds(self, tmp_path):
@@ -113,13 +123,20 @@ class TestEngineSyncCustomNodeFilesPython:
         NODE_REGISTRY.pop("Dock", None)
 
         try:
-            engine.sync_custom_node_files({
+            failures = engine.sync_custom_node_files({
                 "navigate": {"language": "cpp", "source": "not even valid c++", "xml_tag": "Navigate"},
                 "dock": {"language": "python", "source": DOCK_SOURCE},
             })
 
             assert "Navigate" not in NODE_REGISTRY
             assert "Dock" in NODE_REGISTRY
+            # Real fix: this used to only ever be printed to the robot's
+            # own stdout, invisible to whoever edited the file from the
+            # dashboard -- now it's returned so on_ws_message can relay it.
+            assert len(failures) == 1
+            assert failures[0]["name"] == "navigate"
+            assert failures[0]["language"] == "cpp"
+            assert failures[0]["reason"]
         finally:
             NODE_REGISTRY.pop("Navigate", None)
             NODE_REGISTRY.pop("Dock", None)
@@ -134,11 +151,11 @@ class TestEngineSyncCustomNodeFilesPython:
                 "navigate": {"language": "python", "source": NAVIGATE_SOURCE},
                 "dock": {"language": "python", "source": DOCK_SOURCE},
             })
-            assert (tmp_path / "custom_node_files" / "navigate.py").exists()
+            assert (tmp_path / "custom_node_files" / "python" / "navigate.py").exists()
 
             engine.sync_custom_node_files({"dock": {"language": "python", "source": DOCK_SOURCE}})
 
-            assert not (tmp_path / "custom_node_files" / "navigate.py").exists()
+            assert not (tmp_path / "custom_node_files" / "python" / "navigate.py").exists()
             assert "Navigate" not in NODE_REGISTRY
             assert "Dock" in NODE_REGISTRY
         finally:
@@ -173,8 +190,34 @@ class TestEngineSyncCustomNodeFilesPython:
             updated_source = NAVIGATE_SOURCE.replace("SUCCESS", "FAILURE")
             engine.sync_custom_node_files({"navigate": {"language": "python", "source": updated_source}})
 
-            assert (tmp_path / "custom_node_files" / "navigate.py").read_text() == updated_source
+            assert (tmp_path / "custom_node_files" / "python" / "navigate.py").read_text() == updated_source
             assert NODE_REGISTRY["Navigate"] is not first_builder
+        finally:
+            NODE_REGISTRY.pop("Navigate", None)
+
+    def test_a_pre_existing_manifest_entry_with_no_hash_is_bootstrapped_not_flagged(self, tmp_path):
+        """Bidirectional file sync, Part 5: a manifest.json written before
+        hash-tracking existed has no content_hash key at all -- reading it
+        must compute one from whatever's on disk right now and treat that
+        as the new baseline, not raise or silently leave it un-hashed
+        forever."""
+        from xparo.sync_hash import content_hash
+
+        engine = _make_engine(tmp_path)
+        node_files_dir = tmp_path / "custom_node_files"
+        (node_files_dir / "python").mkdir(parents=True)
+        (node_files_dir / "python" / "navigate.py").write_text(NAVIGATE_SOURCE)
+        (node_files_dir / "manifest.json").write_text(json.dumps({
+            "navigate": {"language": "python", "xml_tag": "", "node_type": "action", "ports": [], "header_source": ""},
+        }))
+
+        try:
+            engine.sync_custom_node_files()  # startup case, no Django payload
+
+            assert "Navigate" in NODE_REGISTRY
+            manifest = json.loads((node_files_dir / "manifest.json").read_text())
+            assert manifest["navigate"]["content_hash"] == content_hash(NAVIGATE_SOURCE, "")
+            assert manifest["navigate"]["synced_at"]
         finally:
             NODE_REGISTRY.pop("Navigate", None)
 
@@ -225,9 +268,9 @@ class TestEngineSyncCustomNodeFilesJavaScript:
                 "navigate": {"language": "javascript", "source": JS_NAVIGATE_SOURCE, "xml_tag": "Navigate", "node_type": "action", "ports": []},
             })
 
-            assert (tmp_path / "custom_node_files" / "navigate.js").read_text() == JS_NAVIGATE_SOURCE
-            assert (tmp_path / "custom_node_files" / "js_runtime" / "js_host.js").exists()
-            assert (tmp_path / "custom_node_files" / "js_runtime" / "xparo_node.js").exists()
+            assert (tmp_path / "custom_node_files" / "javascript" / "navigate.js").read_text() == JS_NAVIGATE_SOURCE
+            assert (tmp_path / "custom_node_files" / "javascript" / "js_runtime" / "js_host.js").exists()
+            assert (tmp_path / "custom_node_files" / "javascript" / "js_runtime" / "xparo_node.js").exists()
             assert "Navigate" in NODE_REGISTRY
 
             from xparo.bt_engine import tree_builder
@@ -265,7 +308,7 @@ class TestEngineSyncCustomNodeFilesBash:
                 "navigate": {"language": "bash", "source": BASH_NAVIGATE_SOURCE, "xml_tag": "Navigate", "node_type": "action", "ports": []},
             })
 
-            script_path = tmp_path / "custom_node_files" / "navigate.sh"
+            script_path = tmp_path / "custom_node_files" / "bash" / "navigate.sh"
             assert script_path.read_text() == BASH_NAVIGATE_SOURCE
             assert os.access(script_path, os.X_OK)
             assert "Navigate" in NODE_REGISTRY
@@ -285,13 +328,14 @@ class TestEngineSyncCustomNodeFilesCpp:
         engine = _make_engine(tmp_path)
 
         try:
-            engine.sync_custom_node_files({
+            failures = engine.sync_custom_node_files({
                 "navigate": {"language": "cpp", "source": CPP_NAVIGATE_SOURCE, "xml_tag": "Navigate", "node_type": "action", "ports": []},
             })
 
-            assert (tmp_path / "custom_node_files" / "navigate.cpp").exists()
-            assert (tmp_path / "custom_node_files" / "cpp_build" / "navigate").exists()
+            assert (tmp_path / "custom_node_files" / "cpp" / "navigate.cpp").exists()
+            assert (tmp_path / "custom_node_files" / "cpp" / "cpp_build" / "navigate").exists()
             assert "Navigate" in NODE_REGISTRY
+            assert failures == []
 
             from xparo.bt_engine import tree_builder
             import py_trees
@@ -311,6 +355,34 @@ class TestOnWsMessageCustomNodeFileSync:
         try:
             engine.on_ws_message('ws', {"custom_node_files": {"navigate": {"language": "python", "source": NAVIGATE_SOURCE}}})
             assert "Navigate" in NODE_REGISTRY
-            assert (tmp_path / "custom_node_files" / "navigate.py").exists()
+            assert (tmp_path / "custom_node_files" / "python" / "navigate.py").exists()
         finally:
             NODE_REGISTRY.pop("Navigate", None)
+
+    def test_custom_node_files_key_always_acks_with_registered_tags_and_no_failures(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        sent = []
+        engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
+
+        try:
+            engine.on_ws_message('ws', {"custom_node_files": {"navigate": {"language": "python", "source": NAVIGATE_SOURCE}}})
+            acks = [m["CUSTOM_NODE_SYNC_RESULT"] for m in sent if "CUSTOM_NODE_SYNC_RESULT" in m]
+            assert len(acks) == 1
+            assert acks[0]["registered_tags"] == ["Navigate"]
+            assert acks[0]["failures"] == []
+        finally:
+            NODE_REGISTRY.pop("Navigate", None)
+
+    def test_custom_node_files_key_acks_with_a_failure_entry_for_a_bad_compile(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        sent = []
+        engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
+
+        engine.on_ws_message('ws', {"custom_node_files": {
+            "navigate": {"language": "cpp", "source": "not even valid c++", "xml_tag": "Navigate"},
+        }})
+        acks = [m["CUSTOM_NODE_SYNC_RESULT"] for m in sent if "CUSTOM_NODE_SYNC_RESULT" in m]
+        assert len(acks) == 1
+        assert acks[0]["registered_tags"] == []
+        assert len(acks[0]["failures"]) == 1
+        assert acks[0]["failures"][0]["name"] == "navigate"

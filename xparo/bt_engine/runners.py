@@ -324,22 +324,27 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     """Compiles `source` (a real BT::SyncActionNode/BT::ConditionNode
     subclass, as-is -- see module docstring) plus this module's own fixed
     host main() into one standalone executable under `build_dir`. Returns
-    the executable path on success, None on any failure (a bad compile
-    contributes nothing and is logged, never raised -- matching
-    plugin_loader.load_plugins' own "one bad file doesn't take down the
-    sync" posture). `header_source` is written alongside as
-    <node_name>.hpp and #include-d automatically if non-empty (matching
-    CustomNodeDefinition's own header_source field) -- real dependency/
-    build-flag support (extra find_package/target_link_libraries per
-    node) is intentionally NOT attempted here; see this function's return
-    value/caller for how a node needing more than behaviortree_cpp itself
-    degrades (skipped, not silently pretended to work).
+    (executable_path, None) on success, (None, reason) on any failure (a
+    bad compile contributes nothing and is logged, never raised --
+    matching plugin_loader.load_plugins' own "one bad file doesn't take
+    down the sync" posture). `reason` is a short, real diagnostic string --
+    previously only ever printed locally on the robot, now also threaded
+    back up through sync_custom_node_files/CUSTOM_NODE_SYNC_RESULT so a
+    project owner editing this file from the dashboard can actually see
+    why it didn't take, instead of it silently never registering.
+    `header_source` is written alongside as <node_name>.hpp and #include-d
+    automatically if non-empty (matching CustomNodeDefinition's own
+    header_source field) -- real dependency/build-flag support (extra
+    find_package/target_link_libraries per node) is intentionally NOT
+    attempted here; see this function's return value/caller for how a node
+    needing more than behaviortree_cpp itself degrades (skipped, not
+    silently pretended to work).
     """
     match = _CPP_CLASS_RE.search(source)
     if not match:
-        print(f"[bt_engine cpp runner] {node_name}: no class extending "
-              f"BT::SyncActionNode/BT::ConditionNode found -- not building")
-        return None
+        reason = "no class extending BT::SyncActionNode/BT::ConditionNode found"
+        print(f"[bt_engine cpp runner] {node_name}: {reason} -- not building")
+        return None, reason
     class_name = match.group(1)
 
     os.makedirs(build_dir, exist_ok=True)
@@ -367,12 +372,13 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     try:
         result = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"[bt_engine cpp runner] {node_name}: compile failed to run: {exc}")
-        return None
+        reason = f"compile failed to run: {exc}"
+        print(f"[bt_engine cpp runner] {node_name}: {reason}")
+        return None, reason
     if result.returncode != 0:
         print(f"[bt_engine cpp runner] {node_name}: compile failed:\\n{result.stderr[-2000:]}")
-        return None
-    return executable_path
+        return None, result.stderr[-500:]
+    return executable_path, None
 
 
 def make_cpp_node_factory(executable_path, output_keys):

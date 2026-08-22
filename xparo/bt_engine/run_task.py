@@ -96,6 +96,11 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         "task_id": task_id,
         "success": success,
         "duration_s": duration_s,
+        # Empty string (not omitted) for a clean FAILURE with no exception
+        # -- distinguishes "the tree deliberately returned FAILURE" from
+        # "something raised", which final_blackboard already had this
+        # whole time but never forwarded past this point.
+        "error": final_blackboard.get("_error", ""),
     }})
 
     if save_task_history and add_task_history is not None:

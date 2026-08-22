@@ -9,6 +9,7 @@ from . import remote_ops
 from .bt_engine import run_task
 from .bt_engine import plugin_loader
 from .bt_engine import runners
+from . import sync_hash
 
 record_bags = False
 xparo_database_size =  80
@@ -393,6 +394,26 @@ class Engine():
 
     _CUSTOM_NODE_FILE_EXTENSIONS = {'python': '.py', 'cpp': '.cpp', 'javascript': '.js', 'bash': '.sh'}
 
+    @staticmethod
+    def _read_sync_state(directory):
+        """Bidirectional file sync -- the {name: {hash, synced_at}}
+        baseline sidecar for a synced-entries folder (custom_aiml/
+        custom_maps; custom_node_files tracks the same fields inline on
+        its own manifest.json instead, since it already has one)."""
+        path = os.path.join(directory, 'sync_state.json')
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r') as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return {}
+
+    @staticmethod
+    def _write_sync_state(directory, state):
+        with open(os.path.join(directory, 'sync_state.json'), 'w') as file:
+            json.dump(state, file)
+
     def sync_custom_node_files(self, custom_node_files=None):
         """Multi-language custom BT node system, Phase 5/6/7 -- the robot-
         side half of apps/analytics/models.py's CustomFile/
@@ -415,6 +436,20 @@ class Engine():
         do with code -- reusing it would silently collide two unrelated
         features).
 
+        Bidirectional file sync (see /home/scientist/.claude/plans/
+        breezy-splashing-koala.md): Django-synced source files live one
+        level deeper than before, under a subfolder per language
+        (custom_node_files/{python,cpp,javascript,bash}/) -- a real,
+        git-trackable, language-separated layout instead of one flat
+        folder. A second, git-tracked `examples_manifest.json` sits
+        alongside the real `manifest.json` and is NEVER written by this
+        method -- it ships two known-good example nodes (one Action, one
+        Condition) per language, registered at startup with zero Django
+        connection required. The effective registry is
+        `examples_manifest.json UNION manifest.json`; a real Django-synced
+        entry wins on a name collision (logged as a sync_failures entry
+        for the shadowed example, not silently dropped).
+
         Registration differs by language (see runners.py's own module
         docstring for why): Python self-describes its own tag via
         `XML_TAG = "..."`, scanned by plugin_loader's existing class
@@ -434,11 +469,25 @@ class Engine():
         mirroring sync_bt_plugins/sync_bt_inline_nodes) -- the manifest
         carries everything needed to re-register without Django resending
         anything, since the actual source files are already on disk.
+
+        Returns a list of {"name", "language", "reason"} for every entry
+        that was skipped rather than registered -- these used to only ever
+        be printed here (never reaching Django/the dashboard at all,
+        i.e. a project owner editing this file had no way to know a
+        compile failed short of watching the robot's own stdout). The
+        caller (on_ws_message's "custom_node_files" branch) turns this
+        into a CUSTOM_NODE_SYNC_RESULT ack.
         """
         from .bt_engine.node_registry import NODE_REGISTRY
 
+        sync_failures = []
+
         folder = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files')
         manifest_path = os.path.join(folder, 'manifest.json')
+        examples_manifest_path = os.path.join(folder, 'examples_manifest.json')
+
+        def _language_dir(language):
+            return os.path.join(folder, language)
 
         if custom_node_files is not None:
             os.makedirs(folder, exist_ok=True)
@@ -458,28 +507,38 @@ class Engine():
                 extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(language)
                 if extension is None:
                     continue  # unrecognized language -- not written, not registered
-                source_path = os.path.join(folder, name + extension)
+                language_dir = _language_dir(language)
+                os.makedirs(language_dir, exist_ok=True)
+                source_path = os.path.join(language_dir, name + extension)
                 with open(source_path, 'w') as file:
                     file.write(entry.get('source', ''))
                 if language == 'bash':
                     os.chmod(source_path, 0o755)
+                # A fresh Django sync is by definition the new authoritative
+                # baseline -- content_hash/synced_at get set unconditionally
+                # here (see /home/scientist/.claude/plans/breezy-splashing-
+                # koala.md's Part 2/3: "Django changed -> push to robot,
+                # update baseline" applies to every entry Django just sent).
                 manifest[name] = {
                     'language': language,
                     'xml_tag': entry.get('xml_tag', ''),
                     'node_type': entry.get('node_type', 'action'),
                     'ports': entry.get('ports', []),
                     'header_source': entry.get('header_source', ''),
+                    'content_hash': sync_hash.content_hash(entry.get('source', ''), entry.get('header_source', '')),
+                    'synced_at': datetime.utcnow().isoformat(),
                 }
 
             for stale_name, stale_entry in previous_manifest.items():
                 if stale_name in manifest:
                     continue
-                stale_extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(stale_entry.get('language'), '')
+                stale_language = stale_entry.get('language')
+                stale_extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(stale_language)
+                if stale_extension is None:
+                    continue  # unrecognized/missing language -- nothing to clean up
                 for suffix in (stale_extension, '.hpp'):
-                    if not suffix:
-                        continue
                     try:
-                        os.remove(os.path.join(folder, stale_name + suffix))
+                        os.remove(os.path.join(_language_dir(stale_language), stale_name + suffix))
                     except OSError:
                         pass
 
@@ -494,36 +553,100 @@ class Engine():
                 except json.JSONDecodeError:
                     manifest = {}
 
+        # Bootstrap-on-read (see the plan's Part 5): a manifest entry
+        # written before this hash-tracking existed has no content_hash at
+        # all. Rather than a one-time migration (robots don't run Django
+        # migrations), compute it from whatever's on disk RIGHT NOW the
+        # first time it's read and write it back -- that becomes the new
+        # baseline, never treated as a retroactive conflict just because
+        # tracking is new.
+        manifest_needs_rewrite = False
+        for name, entry in manifest.items():
+            if entry.get('content_hash'):
+                continue
+            extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(entry.get('language'))
+            if extension is None:
+                continue
+            source_path = os.path.join(_language_dir(entry['language']), name + extension)
+            try:
+                with open(source_path, 'r') as file:
+                    source_on_disk = file.read()
+            except OSError:
+                continue
+            entry['content_hash'] = sync_hash.content_hash(source_on_disk, entry.get('header_source', ''))
+            entry['synced_at'] = datetime.utcnow().isoformat()
+            manifest_needs_rewrite = True
+        if manifest_needs_rewrite:
+            with open(manifest_path, 'w') as file:
+                json.dump(manifest, file)
+
+        # Git-tracked, sync-code-read-only -- ships two known-good example
+        # nodes (one Action, one Condition) per language, usable with zero
+        # Django connection ever established (a fresh `colcon build
+        # --symlink-install` alone is enough). Nested by language (unlike
+        # the real manifest.json's flat shape) so the same simple file
+        # name (e.g. greet_example) can exist once per language folder
+        # without colliding as JSON object keys -- each language's own
+        # xml_tag is still unique project-wide, matching CustomFile's own
+        # real constraint. A real Django-synced entry always wins on a
+        # name collision within the same language; the shadowed example
+        # is logged as a sync_failures entry rather than silently dropped.
+        examples_manifest = {}
+        if os.path.exists(examples_manifest_path):
+            with open(examples_manifest_path, 'r') as file:
+                try:
+                    examples_manifest = json.load(file)
+                except json.JSONDecodeError:
+                    examples_manifest = {}
+
+        effective_manifest = dict(manifest)
+        for language, language_examples in examples_manifest.items():
+            if not isinstance(language_examples, dict):
+                continue
+            for name, entry in language_examples.items():
+                if name in effective_manifest:
+                    sync_failures.append({
+                        "name": name, "language": language,
+                        "reason": "shadowed by a real custom node file with the same name",
+                    })
+                    continue
+                effective_manifest[name] = {**entry, 'language': language}
+        manifest = effective_manifest
+
         plugin_loader.unregister_tags(self._custom_node_file_tags)
         registered_tags = set()
 
         python_paths = [
-            os.path.join(folder, name + '.py')
+            os.path.join(_language_dir('python'), name + '.py')
             for name, entry in manifest.items() if entry.get('language') == 'python'
         ]
         registered_tags |= set(plugin_loader.register_plugins(python_paths).keys())
 
         js_entries = [(name, entry) for name, entry in manifest.items() if entry.get('language') == 'javascript']
         if js_entries:
-            js_runtime_dir = os.path.join(folder, 'js_runtime')
+            js_dir = _language_dir('javascript')
+            js_runtime_dir = os.path.join(js_dir, 'js_runtime')
             runners.ensure_js_runtime(js_runtime_dir)
             for name, entry in js_entries:
                 xml_tag = entry.get('xml_tag')
                 if not xml_tag:
+                    sync_failures.append({"name": name, "language": "javascript", "reason": "no xml_tag configured"})
                     continue
                 output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
                 NODE_REGISTRY[xml_tag] = runners.make_javascript_node_factory(
-                    os.path.join(folder, name + '.js'), js_runtime_dir, output_keys,
+                    os.path.join(js_dir, name + '.js'), js_runtime_dir, output_keys,
                 )
                 registered_tags.add(xml_tag)
 
+        bash_dir = _language_dir('bash')
         for name, entry in manifest.items():
             if entry.get('language') != 'bash':
                 continue
             xml_tag = entry.get('xml_tag')
             if not xml_tag:
+                sync_failures.append({"name": name, "language": "bash", "reason": "no xml_tag configured"})
                 continue
-            script_path = os.path.join(folder, name + '.sh')
+            script_path = os.path.join(bash_dir, name + '.sh')
 
             def _bash_builder(nm, attrs, blackboard, children, ros_node, script_path=script_path):
                 return runners.BashProcessNode(nm, attrs, blackboard, script_path=script_path, ros_node=ros_node)
@@ -533,23 +656,30 @@ class Engine():
 
         cpp_entries = [(name, entry) for name, entry in manifest.items() if entry.get('language') == 'cpp']
         if cpp_entries:
-            cpp_build_dir = os.path.join(folder, 'cpp_build')
+            cpp_dir = _language_dir('cpp')
+            cpp_build_dir = os.path.join(cpp_dir, 'cpp_build')
             for name, entry in cpp_entries:
                 xml_tag = entry.get('xml_tag')
-                cpp_path = os.path.join(folder, name + '.cpp')
-                if not xml_tag or not os.path.exists(cpp_path):
+                cpp_path = os.path.join(cpp_dir, name + '.cpp')
+                if not xml_tag:
+                    sync_failures.append({"name": name, "language": "cpp", "reason": "no xml_tag configured"})
+                    continue
+                if not os.path.exists(cpp_path):
+                    sync_failures.append({"name": name, "language": "cpp", "reason": "source file missing on disk"})
                     continue
                 with open(cpp_path, 'r') as file:
                     source = file.read()
                 output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
-                executable_path = runners.compile_cpp_node(source, entry.get('header_source', ''), cpp_build_dir, name)
+                executable_path, reason = runners.compile_cpp_node(source, entry.get('header_source', ''), cpp_build_dir, name)
                 if executable_path is None:
+                    sync_failures.append({"name": name, "language": "cpp", "reason": reason or "compile failed"})
                     continue
                 NODE_REGISTRY[xml_tag] = runners.make_cpp_node_factory(executable_path, output_keys)
                 registered_tags.add(xml_tag)
 
         self._custom_node_file_tags = registered_tags
         print(f"[bt_engine] loaded custom node file tags: {sorted(registered_tags)}")
+        return sync_failures
 
     def sync_rosbag_config(self, config):
         """`config` is apps/analytics/data_analyis.py's
@@ -732,8 +862,21 @@ class Engine():
                 with open(self.files["properties"], 'w') as file:
                     file.write(content)
             elif k=="custom_aiml":
+                # Bidirectional file sync: a synced custom_aiml entry used
+                # to be written directly into xparo_custom_behaviors_folder_path's
+                # own top level -- the exact same folder curated fixtures
+                # like quick_delivery_tree.xml live in. A user's tree
+                # merely sharing that name silently overwrote the fixture
+                # (a real, observed data-loss bug -- confirmed via `git
+                # status` showing quick_delivery_tree.xml dirty from
+                # exactly this). Its own subfolder makes that collision
+                # structurally impossible, and keeps the top level a
+                # curated-examples-only zone permanently.
+                custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
+                os.makedirs(custom_aiml_dir, exist_ok=True)
+                aiml_sync_state = self._read_sync_state(custom_aiml_dir)
                 for kk,vv in val.items():
-                    pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"],kk+'.xml')
+                    pth = os.path.join(custom_aiml_dir,kk+'.xml')
                     content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
 {vv}
@@ -742,13 +885,35 @@ class Engine():
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
                         file.write(content)
+                    # Fresh Django content is the new authoritative
+                    # baseline -- same "Django changed -> update baseline"
+                    # outcome the custom_node_files manifest already
+                    # applies, hashing the raw tree text (vv), not the
+                    # <root>/<BehaviorTree> wrapper around it.
+                    aiml_sync_state[kk] = {
+                        "hash": sync_hash.content_hash(vv),
+                        "synced_at": datetime.utcnow().isoformat(),
+                    }
+                self._write_sync_state(custom_aiml_dir, aiml_sync_state)
             elif k=="custom_maps":
+                # Same fix, same reasoning as custom_aiml just above --
+                # its own subfolder under xparo_custom_evns_folder_path,
+                # leaving that root free for any future curated env
+                # examples the same way.
+                custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
+                os.makedirs(custom_maps_dir, exist_ok=True)
+                maps_sync_state = self._read_sync_state(custom_maps_dir)
                 for kk,vv in val.items():
-                    pth = os.path.join(self.files["xparo_custom_evns_folder_path"],kk+'.env')
+                    pth = os.path.join(custom_maps_dir,kk+'.env')
                     content =  f'''{vv}'''
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
                         file.write(content)
+                    maps_sync_state[kk] = {
+                        "hash": sync_hash.content_hash(vv),
+                        "synced_at": datetime.utcnow().isoformat(),
+                    }
+                self._write_sync_state(custom_maps_dir, maps_sync_state)
             elif k=="custom_Sets" or k=="custom_sets":
                 for kk,vv in val.items():
                     pth = os.path.join(self.files["xparo_custom_files_folder_path"],kk)
@@ -791,13 +956,39 @@ class Engine():
                 # ({file_name: {"language":..., "source":...}}). See
                 # sync_custom_node_files' own docstring for what happens
                 # to non-Python entries today.
-                self.sync_custom_node_files(val)
+                #
+                # Always ack, matching FILE_LIST/DELETE_ACK/TELEOP_ACK's
+                # own "the caller always hears back" convention -- a
+                # compile/registration failure used to only ever be
+                # printed here, invisible to whoever just edited the file
+                # from the dashboard.
+                sync_failures = self.sync_custom_node_files(val)
+                self._send_dict({"CUSTOM_NODE_SYNC_RESULT": {
+                    "registered_tags": sorted(self._custom_node_file_tags),
+                    "failures": sync_failures,
+                }})
+            elif k=="REQUEST_LOCAL_FILE_CONTENT":
+                # Bidirectional file sync (see /home/scientist/.claude/
+                # plans/breezy-splashing-koala.md, Part 5): Django only
+                # ever asks for names whose hash it couldn't already
+                # resolve as a clean push-down -- this always answers with
+                # actual content, never decides anything about conflicts
+                # itself (that's entirely Django's call, see
+                # DataAnalysis.resolve_local_file_content); if Django ends
+                # up not pushing anything back for a name because it
+                # turned out to be a real conflict, this robot's own local
+                # copy is simply left exactly as it was.
+                self._send_dict({"LOCAL_FILE_CONTENT": self.get_local_file_content(val)})
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
             elif k=="get_initial_local_env_data":
                 self.get_initial_local_env_data()
             elif k=="sync_local_database":
-                self.get_local_files()
+                # Bidirectional file sync -- see get_local_file_state's own
+                # docstring for why this is a real, hash-aware report now
+                # instead of the unconditional raw-content push this used
+                # to be.
+                self._send_dict({"LOCAL_FILE_STATE": self.get_local_file_state()})
             elif k=="log_updated":
                 self.local_database.dashboard_receive({"log_updated":val},self.private_send)
                 self.local_database._stop_updates = False
@@ -916,8 +1107,8 @@ class Engine():
             with open(properties_path, 'r') as f:
                 result["properties"] = f.read()
 
-        # ---- Read custom_aiml (all .xml files in custom_behaviors folder) ----
-        custom_behaviors_path = self.files["xparo_custom_behaviors_folder_path"]
+        # ---- Read custom_aiml (all .xml files in custom_behaviors/custom_aiml) ----
+        custom_behaviors_path = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
         if os.path.exists(custom_behaviors_path):
             for filename in os.listdir(custom_behaviors_path):
                 if filename.endswith('.xml'):
@@ -936,8 +1127,8 @@ class Engine():
                         else:
                             result["custom_aiml"][filename[:-4]] = content
 
-        # ---- Read custom_maps (all .env files in custom_envs folder) ----
-        custom_envs_path = self.files["xparo_custom_evns_folder_path"]
+        # ---- Read custom_maps (all .env files in custom_envs/custom_maps) ----
+        custom_envs_path = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
         if os.path.exists(custom_envs_path):
             for filename in os.listdir(custom_envs_path):
                 if filename.endswith('.env'):
@@ -954,16 +1145,140 @@ class Engine():
                     with open(filepath, 'r') as f:
                         result["custom_sets"][filename] = f.read()
 
-        try:
-            with open(self.files["local_env"], 'r') as file:
-                content = file.read()
-                filtered_data = json.dumps({"save_aiml":result})
-                self.private_send(filtered_data,
-                                #   command_for="rest"
-                                )
-        except Exception as e:
-            print(e)
-            return ""
+        return result
+
+    def get_local_file_state(self):
+        """Bidirectional file sync (see /home/scientist/.claude/plans/
+        breezy-splashing-koala.md, Part 3): the robot's half of
+        LOCAL_FILE_STATE -- hash-only, not full content, matching this
+        feature's own "don't over-send" ethos (_get_custom_node_files_for_sync
+        only ever sends node-exposed files). Django compares these against
+        its own current + last-known-synced hashes and only ever asks back
+        for full content (REQUEST_LOCAL_FILE_CONTENT) for names that
+        actually disagree.
+
+        Supersedes this method's own predecessor here: get_local_files()
+        used to end by private_send-ing its raw content wrapped as
+        {"save_aiml": result} unconditionally, on every call -- an
+        uncontrolled, unconditional push with no hash/conflict awareness
+        at all, exactly the silent-overwrite risk this whole feature exists
+        to close. That side effect is gone; get_local_files() is now a
+        pure read, and this is the only thing that talks to Django, on
+        purpose, with actual conflict detection behind it.
+        """
+        local = self.get_local_files()
+
+        custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
+        custom_aiml_state = self._bootstrap_and_get_sync_state(custom_aiml_dir, local["custom_aiml"])
+
+        custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
+        custom_maps_state = self._bootstrap_and_get_sync_state(custom_maps_dir, local["custom_maps"])
+
+        # custom_node_files' hashes already live inline on manifest.json
+        # (bootstrapped by sync_custom_node_files itself, called here with
+        # no payload -- the same safe "reload whatever's already synced"
+        # startup case, harmless to re-run).
+        self.sync_custom_node_files()
+        node_files_manifest_path = os.path.join(
+            self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files', 'manifest.json',
+        )
+        node_files_state = {}
+        if os.path.exists(node_files_manifest_path):
+            with open(node_files_manifest_path, 'r') as file:
+                try:
+                    manifest = json.load(file)
+                except json.JSONDecodeError:
+                    manifest = {}
+            for name, entry in manifest.items():
+                if entry.get('content_hash'):
+                    node_files_state[name] = {"content_hash": entry['content_hash'], "language": entry.get('language', '')}
+
+        return {
+            "device_id": self.local_database.unique_id,
+            "custom_node_files": node_files_state,
+            "custom_aiml": {name: {"content_hash": s["hash"]} for name, s in custom_aiml_state.items()},
+            "custom_maps": {name: {"content_hash": s["hash"]} for name, s in custom_maps_state.items()},
+        }
+
+    def _bootstrap_and_get_sync_state(self, directory, current_content_by_name):
+        """Bootstrap-on-read (Part 5): anything present on disk right now
+        with no recorded baseline gets one computed from its CURRENT
+        content and written back, never flagged as a conflict just
+        because tracking is new."""
+        state = self._read_sync_state(directory)
+        changed = False
+        for name, content in current_content_by_name.items():
+            if name in state:
+                continue
+            state[name] = {"hash": sync_hash.content_hash(content), "synced_at": datetime.utcnow().isoformat()}
+            changed = True
+        if changed:
+            self._write_sync_state(directory, state)
+        return state
+
+    def get_local_file_content(self, requested):
+        """Bidirectional file sync (see /home/scientist/.claude/plans/
+        breezy-splashing-koala.md, Part 5): the actual current content for
+        whatever names Django asked for in REQUEST_LOCAL_FILE_CONTENT
+        (`{"custom_node_files": [...], "custom_aiml": [...], "custom_maps": [...]}`).
+        A name that's disappeared from disk since LOCAL_FILE_STATE was
+        reported (deleted mid-reconciliation) is simply omitted -- Django
+        treats a missing entry as "nothing to compare", not an error.
+        """
+        response = {
+            "device_id": self.local_database.unique_id,
+            "custom_node_files": {}, "custom_aiml": {}, "custom_maps": {},
+        }
+
+        node_files_folder = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_node_files')
+        manifest_path = os.path.join(node_files_folder, 'manifest.json')
+        manifest = {}
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r') as file:
+                try:
+                    manifest = json.load(file)
+                except json.JSONDecodeError:
+                    manifest = {}
+        for name in requested.get("custom_node_files", []):
+            entry = manifest.get(name)
+            if entry is None:
+                continue
+            extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(entry.get('language'))
+            if extension is None:
+                continue
+            source_path = os.path.join(node_files_folder, entry['language'], name + extension)
+            try:
+                with open(source_path, 'r') as file:
+                    source = file.read()
+            except OSError:
+                continue
+            response["custom_node_files"][name] = {"source": source, "header_source": entry.get('header_source', '')}
+
+        custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
+        for name in requested.get("custom_aiml", []):
+            path = os.path.join(custom_aiml_dir, name + '.xml')
+            try:
+                with open(path, 'r') as file:
+                    content = file.read()
+            except OSError:
+                continue
+            start = content.find('<BehaviorTree ID="MainTree">')
+            if start != -1:
+                start += len('<BehaviorTree ID="MainTree">')
+                end = content.find('</BehaviorTree>', start)
+                content = content[start:end].strip() if end != -1 else content
+            response["custom_aiml"][name] = content
+
+        custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
+        for name in requested.get("custom_maps", []):
+            path = os.path.join(custom_maps_dir, name + '.env')
+            try:
+                with open(path, 'r') as file:
+                    response["custom_maps"][name] = file.read()
+            except OSError:
+                continue
+
+        return response
 
     def send_initial_data(self):
         # self.private_send(json.dumps({"initisilaze_api":{}}))
