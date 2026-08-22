@@ -15,6 +15,8 @@ own real, git-tracked custom_behaviors/custom_envs).
 """
 import json
 
+from xparo.sync_hash import content_hash
+
 
 def _make_engine(tmp_path, **kwargs):
     from xparo.engine import Engine
@@ -233,6 +235,95 @@ class TestGetLocalFileStateIncludesNewlyDiscoveredFiles:
         state = engine.get_local_file_state()
 
         assert list(state["custom_node_files"].keys()).count("navigate") == 1
+
+
+class TestShippedExamplesAreDiscoverableToo:
+    """The examples ship for "zero Django connection required" usability
+    (Part 1 of the plan), but that must not mean they stay invisible to
+    the dashboard forever once a real connection DOES exist -- the user's
+    own complaint ("why am I not able to see already added files... got
+    syncing with behaviour tree also") named the shipped example scripts
+    themselves, not just hand-written new files."""
+
+    def test_a_shipped_example_not_yet_in_manifest_json_appears_in_local_file_state(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        node_files_dir = tmp_path / "custom_behaviors" / "custom_node_files"
+        (node_files_dir / "python").mkdir(parents=True)
+        (node_files_dir / "python" / "greet_example.py").write_text(PYTHON_NODE_SOURCE)
+        (node_files_dir / "examples_manifest.json").write_text(json.dumps({
+            "python": {"greet_example": {"xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": ""}},
+        }))
+
+        state = engine.get_local_file_state()
+
+        assert "greet_example" in state["custom_node_files"]
+
+    def test_once_adopted_into_manifest_json_the_example_is_no_longer_reported_as_new(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        node_files_dir = tmp_path / "custom_behaviors" / "custom_node_files"
+        (node_files_dir / "python").mkdir(parents=True)
+        (node_files_dir / "python" / "greet_example.py").write_text(PYTHON_NODE_SOURCE)
+        (node_files_dir / "examples_manifest.json").write_text(json.dumps({
+            "python": {"greet_example": {"xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": ""}},
+        }))
+        (node_files_dir / "manifest.json").write_text(json.dumps({
+            "greet_example": {
+                "language": "python", "xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": "",
+                "content_hash": "irrelevant-once-a-real-manifest-entry-exists",
+            },
+        }))
+
+        discovered = engine._discover_new_node_files(known_names={"greet_example"})
+
+        assert discovered == {}
+
+
+class TestAdoptedExampleShadowCheckIsHashAware:
+    """sync_custom_node_files' own "a real entry shadows an example with
+    the same name" log used to fire on NAME alone -- which would make
+    every single adopted example spam a false "shadowed" sync_failures
+    entry on every future Django push, forever, even though nothing is
+    actually wrong (the real entry IS that example, byte for byte). It
+    must only fire for a genuine, still-diverging collision.
+    """
+
+    def test_an_adopted_example_with_identical_content_is_not_reported_as_shadowed(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        node_files_dir = tmp_path / "custom_behaviors" / "custom_node_files"
+        (node_files_dir / "python").mkdir(parents=True)
+        (node_files_dir / "python" / "greet_example.py").write_text(PYTHON_NODE_SOURCE)
+        (node_files_dir / "examples_manifest.json").write_text(json.dumps({
+            "python": {"greet_example": {"xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": ""}},
+        }))
+        (node_files_dir / "manifest.json").write_text(json.dumps({
+            "greet_example": {
+                "language": "python", "xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": "",
+                "content_hash": content_hash(PYTHON_NODE_SOURCE, ""),
+            },
+        }))
+
+        failures = engine.sync_custom_node_files(None)
+
+        assert failures == []
+
+    def test_a_genuinely_different_file_with_the_same_name_is_still_reported_as_shadowed(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        node_files_dir = tmp_path / "custom_behaviors" / "custom_node_files"
+        (node_files_dir / "python").mkdir(parents=True)
+        (node_files_dir / "python" / "greet_example.py").write_text(PYTHON_NODE_SOURCE)
+        (node_files_dir / "examples_manifest.json").write_text(json.dumps({
+            "python": {"greet_example": {"xml_tag": "GreetExample", "node_type": "action", "ports": [], "header_source": ""}},
+        }))
+        (node_files_dir / "manifest.json").write_text(json.dumps({
+            "greet_example": {
+                "language": "python", "xml_tag": "Overridden", "node_type": "action", "ports": [], "header_source": "",
+                "content_hash": content_hash("totally different content, a real coincidental name clash", ""),
+            },
+        }))
+
+        failures = engine.sync_custom_node_files(None)
+
+        assert any(f["name"] == "greet_example" for f in failures)
 
 
 class TestGetLocalFileContentForNewlyDiscoveredFiles:

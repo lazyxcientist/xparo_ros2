@@ -7,8 +7,16 @@ compile, matching this repo's own "test against the real thing" convention).
 
 Copies the real examples into a tmp_path first (same reasoning as
 test_custom_node_files_sync.py's own _make_engine -- never let a test
-write real build artifacts, e.g. cpp_build/, into the actual git checkout).
+write real build artifacts, e.g. cpp_build/, into the actual git checkout)
+-- and, since custom_node_files/ now also collects real, gitignored,
+non-deterministic state right alongside the examples (manifest.json,
+cpp_build/, js_runtime/, __pycache__/, and this checkout's own real,
+sometimes-mid-edit CustomFile-backed sources), copies ONLY the exact
+files examples_manifest.json itself declares -- never a whole-directory
+copytree -- so this test stays hermetic no matter what real content
+someone's actively testing with happens to be sitting in that folder.
 """
+import json
 import os
 import shutil
 
@@ -28,11 +36,23 @@ _EXAMPLE_TAGS = [
     "GreetExampleBash", "BatteryOkExampleBash",
 ]
 
+_EXTENSIONS_BY_LANGUAGE = {"python": ".py", "cpp": ".cpp", "javascript": ".js", "bash": ".sh"}
+
 
 def _make_engine_with_real_examples(tmp_path):
     from xparo.engine import Engine
     dest = tmp_path / 'custom_node_files'
-    shutil.copytree(_REAL_EXAMPLES_DIR, dest)
+    dest.mkdir()
+    real_manifest_path = os.path.join(_REAL_EXAMPLES_DIR, 'examples_manifest.json')
+    shutil.copy(real_manifest_path, dest / 'examples_manifest.json')
+    with open(real_manifest_path, 'r') as file:
+        examples_manifest = json.load(file)
+    for language, entries in examples_manifest.items():
+        language_dir = dest / language
+        language_dir.mkdir()
+        for name in entries:
+            filename = name + _EXTENSIONS_BY_LANGUAGE[language]
+            shutil.copy(os.path.join(_REAL_EXAMPLES_DIR, language, filename), language_dir / filename)
     engine = Engine("secret", "proj-custom-node-file-examples-test", connection_type="offline")
     engine.files["xparo_custom_behaviors_folder_path"] = str(tmp_path)
     return engine

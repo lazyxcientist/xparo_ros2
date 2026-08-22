@@ -590,8 +590,16 @@ class Engine():
         # without colliding as JSON object keys -- each language's own
         # xml_tag is still unique project-wide, matching CustomFile's own
         # real constraint. A real Django-synced entry always wins on a
-        # name collision within the same language; the shadowed example
-        # is logged as a sync_failures entry rather than silently dropped.
+        # name collision within the same language -- and the ordinary,
+        # expected way that happens now is get_local_file_state/
+        # _discover_new_node_files adopting an example into Django once
+        # it's seen on disk, at which point manifest.json's entry IS
+        # this example, byte-for-byte, forever after. Only a name
+        # collision where the content has genuinely diverged (a real
+        # coincidence, not an adoption) is worth flagging as a
+        # sync_failures entry -- checked by content_hash, not just name,
+        # so an adopted example never spams a false "shadowed" report on
+        # every subsequent Django push.
         examples_manifest = {}
         if os.path.exists(examples_manifest_path):
             with open(examples_manifest_path, 'r') as file:
@@ -604,12 +612,21 @@ class Engine():
         for language, language_examples in examples_manifest.items():
             if not isinstance(language_examples, dict):
                 continue
+            example_extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(language)
             for name, entry in language_examples.items():
                 if name in effective_manifest:
-                    sync_failures.append({
-                        "name": name, "language": language,
-                        "reason": "shadowed by a real custom node file with the same name",
-                    })
+                    example_hash = None
+                    if example_extension:
+                        try:
+                            with open(os.path.join(_language_dir(language), name + example_extension), 'r') as file:
+                                example_hash = sync_hash.content_hash(file.read(), entry.get('header_source', ''))
+                        except OSError:
+                            pass
+                    if example_hash != effective_manifest[name].get('content_hash'):
+                        sync_failures.append({
+                            "name": name, "language": language,
+                            "reason": "shadowed by a real custom node file with the same name",
+                        })
                     continue
                 effective_manifest[name] = {**entry, 'language': language}
         manifest = effective_manifest
@@ -1347,20 +1364,26 @@ class Engine():
                     examples_manifest = json.load(file)
                 except json.JSONDecodeError:
                     examples_manifest = {}
-        known_names = set(manifest.keys()) | {
-            name for language_examples in examples_manifest.values()
-            if isinstance(language_examples, dict) for name in language_examples
-        }
-        # A file dropped directly into a language folder -- never synced
-        # from Django, not one of the shipped examples either -- is
-        # exactly the "user is not going to edit the build packages, he
-        # will edit or add files in the main package" case. Discovered
-        # here so LOCAL_FILE_STATE reports its hash the same as any other
-        # tracked file, and Django's own reconciliation (baseline=""
-        # since it's never seen this name) naturally treats it as
-        # disk-changed-only -- see resolve_local_file_content's ingest
-        # path, which now creates a new CustomFile (+ a best-effort
-        # CustomNodeDefinition) instead of silently dropping it.
+        known_names = set(manifest.keys())
+        # Only names Django already manages (manifest.json) are excluded
+        # here -- deliberately NOT the shipped examples too. A file
+        # dropped directly into a language folder (the "user is not going
+        # to edit the build packages, he will edit or add files in the
+        # main package" case) AND the git-tracked example scripts
+        # themselves are both real, main-file content the dashboard
+        # should be able to show/drag/edit -- "zero Django connection
+        # required" describes how the examples register at boot, not a
+        # promise that they stay invisible to Django forever once one
+        # actually exists. Discovered here so LOCAL_FILE_STATE reports
+        # their hash the same as any other tracked file, and Django's own
+        # reconciliation (baseline="" since it's never seen this name)
+        # naturally treats it as disk-changed-only -- see
+        # resolve_local_file_content's ingest path, which creates a new
+        # CustomFile (+ a best-effort CustomNodeDefinition) instead of
+        # silently dropping it. Once adopted, sync_custom_node_files'
+        # own shadow-check (compares content hashes, not just names)
+        # recognizes this as the same file, not a real collision, and
+        # stays quiet.
         for name, entry in self._discover_new_node_files(known_names).items():
             node_files_state[name] = {
                 "content_hash": sync_hash.content_hash(entry["source"], entry["header_source"]),
