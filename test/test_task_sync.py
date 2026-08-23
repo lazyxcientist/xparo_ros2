@@ -51,15 +51,36 @@ class TestResolveTreeXml:
 
         assert task_sync.resolve_tree_xml("", files).strip() == "<LoadNextDelivery />"
 
-    def test_a_name_reads_the_matching_custom_behaviors_file(self, tmp_path):
+    def test_a_name_reads_the_matching_custom_aiml_file(self, tmp_path):
+        # custom_aiml/<name>.xml, not flat under custom_behaviors/ --
+        # matches engine.py's own on_ws_message "custom_aiml" branch and
+        # get_local_file_content, which both read/write this exact
+        # subfolder (see this feature's own directory-restructure fix for
+        # why: a flat shared folder let a custom_aiml sync silently
+        # overwrite an unrelated curated fixture with the same name).
         files = _files(tmp_path)
-        pth = tmp_path / "custom_behaviors" / "quick_delivery_tree.xml"
+        aiml_dir = tmp_path / "custom_behaviors" / "custom_aiml"
+        aiml_dir.mkdir()
+        pth = aiml_dir / "quick_delivery_tree.xml"
         pth.write_text('<root BTCPP_format="4" main_tree_to_execute="MainTree">\n'
                         '<BehaviorTree ID="MainTree">\n<PlayAudio file_path="/x.mp3" />\n</BehaviorTree>\n</root>')
 
         result = task_sync.resolve_tree_xml("quick_delivery_tree", files)
 
         assert result.strip() == '<PlayAudio file_path="/x.mp3" />'
+
+    def test_a_file_still_sitting_at_the_old_flat_location_is_not_found(self, tmp_path):
+        """Regression guard for the exact bug this fix closes: a task
+        whose tree was actually synced through the custom_aiml mechanism
+        must never silently fall back to nothing just because an old,
+        stale copy happens to sit one level up."""
+        files = _files(tmp_path)
+        (tmp_path / "custom_behaviors" / "quick_delivery_tree.xml").write_text(
+            '<root BTCPP_format="4" main_tree_to_execute="MainTree">\n'
+            '<BehaviorTree ID="MainTree">\n<PlayAudio file_path="/x.mp3" />\n</BehaviorTree>\n</root>'
+        )
+
+        assert task_sync.resolve_tree_xml("quick_delivery_tree", files) == ""
 
     def test_missing_file_returns_empty_string_not_an_exception(self, tmp_path):
         files = _files(tmp_path)

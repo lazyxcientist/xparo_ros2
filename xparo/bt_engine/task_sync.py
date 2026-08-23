@@ -66,9 +66,20 @@ def _extract_behavior_tree_fragment(full_xml):
 
 def resolve_tree_xml(behaviour_tree_name, files):
     """`files` is Engine.files (the same dict every other sync branch in
-    engine.py already reads/writes through)."""
+    engine.py already reads/writes through).
+
+    A named tree lives in custom_behaviors/custom_aiml/<name>.xml, not
+    flat under custom_behaviors/ -- engine.py's own on_ws_message
+    "custom_aiml" branch and get_local_file_content both write/read it
+    from that same custom_aiml subfolder (see this feature's own
+    directory-restructure/collision fix); resolving the old flat path
+    here would find nothing for any task whose tree was ever actually
+    synced through that mechanism, and silently return "" -- which
+    tree_builder.build_tree then rejects as an "empty behaviour tree
+    fragment", not a clear "couldn't find this tree" error.
+    """
     if behaviour_tree_name:
-        path = os.path.join(files["xparo_custom_behaviors_folder_path"], f"{behaviour_tree_name}.xml")
+        path = os.path.join(files["xparo_custom_behaviors_folder_path"], 'custom_aiml', f"{behaviour_tree_name}.xml")
     else:
         path = files["behavior"]
     if not os.path.exists(path):
