@@ -61,6 +61,8 @@ import datetime
 import json
 import os
 
+import psutil
+
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import String, Bool
 from rosbag2_interfaces.srv import (
@@ -86,6 +88,27 @@ DEFAULT_ROSBAG_CONFIG = {
     'start_mode': 'auto',
     'start_delay_seconds': 0,
 }
+
+
+def is_any_rosbag_process_running():
+    """Process-level detection, independent of RosbagControl's service-
+    based state machine -- catches a `ros2 bag record` invocation launched
+    with a custom --node-name (the one case the shared-default-service-
+    name detection above genuinely can't see), so the dashboard can at
+    least report "something is recording" honestly even when it can't
+    identify or control which node owns it. Best-effort: a permission
+    error reading one process's cmdline just skips that process, never
+    raises.
+    """
+    for proc in psutil.process_iter(['cmdline']):
+        try:
+            cmdline = proc.info.get('cmdline') or []
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        joined = ' '.join(cmdline)
+        if 'ros2' in joined and 'bag' in joined and 'record' in joined:
+            return True
+    return False
 
 
 def load_rosbag_config(custom_behaviors_folder_path):
@@ -131,7 +154,7 @@ class RosbagControl:
     next to everything else this robot writes.
     """
 
-    def __init__(self, node, bag_dir, start_mode='auto', start_delay_seconds=0):
+    def __init__(self, node, bag_dir, start_mode='auto', start_delay_seconds=0, owns_launch_process=True):
         self.node = node
         self.bag_dir = bag_dir
         # 'auto' -- auto-start recording at boot (after the delay below,
@@ -141,6 +164,23 @@ class RosbagControl:
         self.start_mode = start_mode
         self.start_delay_seconds = max(0, start_delay_seconds or 0)
         self._start_delay_timer = None
+        # True only when THIS launch file also started its own
+        # rosbag2_recorder subprocess (xparo_launch.py's record_bags:=true
+        # ExecuteProcess) -- gates the boot-time forced-stop/auto-start
+        # dance below, which exists solely to clean up and then reopen
+        # *that* recorder's own throwaway boot session. False means "the
+        # user is running rosbag2 recording their own way -- via
+        # xparo_launch or launched completely separately -- just detect
+        # and drive whatever /rosbag2_recorder happens to exist, touch
+        # nothing at boot." Confirmed live: a plain `ros2 bag record`
+        # process exposes the exact same /rosbag2_recorder/{record,stop,
+        # resume,is_paused,is_discovery_running} service names as this
+        # launch file's own recorder, so the exact same service clients
+        # below transparently detect/control either one -- there was never
+        # a real detection gap here, only that RosbagControl itself used
+        # to not get constructed at all unless record_bags:=true (see
+        # xparo_ros.py's own fix for that).
+        self.owns_launch_process = owns_launch_process
 
         self.state = UNKNOWN
         self.recorder_alive = False
@@ -190,7 +230,18 @@ class RosbagControl:
         # _maybe_auto_start below), chained strictly *after* the cleanup
         # confirms CLOSED, never racing it -- XP_Database no longer calls
         # start_recording() from its own __init__ at all.
-        self.resync(on_done=self._boot_sequence)
+        #
+        # None of this applies when owns_launch_process is False: there is
+        # no boot-time throwaway session THIS process is responsible for
+        # (any session that exists belongs entirely to whatever external
+        # process opened it), so forcing a stop here would mean booting
+        # xparo_ros could silently kill a recording the user started on
+        # purpose, possibly before xparo_ros even connected. Just resync
+        # once to detect current reality and leave it alone.
+        if self.owns_launch_process:
+            self.resync(on_done=self._boot_sequence)
+        else:
+            self.resync()
 
     def _boot_sequence(self):
         self.handle_stop(on_done=self._maybe_auto_start)

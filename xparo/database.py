@@ -456,6 +456,26 @@ class XP_Database():
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
             return None
 
+    # A class attribute (not inlined into the method body) so a test can
+    # point this at a tmp_path fixture file instead of the real host's
+    # sysfs, the same "make the hardcoded path overridable" reasoning
+    # already applied elsewhere in this package (e.g. Engine.files).
+    CPU_THERMAL_ZONE_PATH = '/sys/class/thermal/thermal_zone0/temp'
+
+    def get_cpu_temperature(self):
+        """Best-effort CPU/board temperature via the standard Linux sysfs
+        thermal interface -- works the same way on a Jetson board as on a
+        generic Linux dev machine, unlike get_gpu_percent's nvidia-smi
+        (which is desktop/server-GPU-specific). Returns None (never a
+        faked 0) when no thermal zone is exposed, matching this method's
+        own "honest gap" precedent right above."""
+        try:
+            with open(self.CPU_THERMAL_ZONE_PATH, 'r') as file:
+                millidegrees = int(file.read().strip())
+            return millidegrees / 1000.0
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+
     def _average_resource_samples(self):
         """Averages every resource_samples snapshot collected since
         session start (get_smart_resource_consumption(), appended by

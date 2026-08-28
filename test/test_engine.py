@@ -196,6 +196,250 @@ def test_file_transfer_upload_round_trip_through_engine(tmp_path):
     assert last["FILE_COMPLETE"]["received"] == 5
 
 
+# ------------------------------------------------------------------
+# Fleet-management popups ported from the AUV GCS -- dispatch wiring only
+# (remote_ops.py's own tests cover the handler bodies in isolation).
+# ------------------------------------------------------------------
+class _FakeBtNode:
+    """Stands in for the real rclpy Node (Xparo) engine.bt_executor.node
+    points at -- exposes just enough for GET_ROS2_TOPICS/rosbag dispatch
+    to find what they're looking for."""
+    def __init__(self, rosbag_control=None, topics=None):
+        self.rosbag_control = rosbag_control
+        self._topics = topics or []
+
+    def get_topic_names_and_types(self):
+        return self._topics
+
+
+class _FakeBtExecutor:
+    def __init__(self, node):
+        self.node = node
+
+
+def test_run_command_passes_max_lines_through(tmp_path):
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"RUN_COMMAND": {
+        "command": "python3 -c \"[print(i) for i in range(50)]\"", "request_id": "r3", "max_lines": 5,
+    }})
+
+    import time
+    for _ in range(50):
+        if sent:
+            break
+        time.sleep(0.05)
+    import json
+    result = json.loads(sent[0])["COMMAND_RESULT"]
+    assert result["max_lines"] == 5
+    assert len(result["output"].splitlines()) == 5
+
+
+def test_reboot_robot_dispatches_to_remote_ops(tmp_path):
+    from unittest.mock import patch
+    import subprocess as _subprocess
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = _subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="a password is required",
+        )
+        engine.on_ws_message('ws', {"REBOOT_ROBOT": {}})
+        import time
+        for _ in range(50):
+            if sent:
+                break
+            time.sleep(0.05)
+
+    import json
+    result = json.loads(sent[0])["REBOOT_RESULT"]
+    assert result["success"] is False
+    assert result["needs_password"] is True
+
+
+def test_get_ros2_topics_dispatches_against_bt_executor_node():
+    engine = _make_engine()
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(topics=[("/foo", ["std_msgs/msg/String"])]))
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_ROS2_TOPICS": {}})
+
+    import json
+    topics = json.loads(sent[0])["ROS2_TOPICS"]["topics"]
+    assert topics == [{"name": "/foo", "types": ["std_msgs/msg/String"]}]
+
+
+def test_get_ros2_topics_with_no_bt_executor_returns_empty_list():
+    engine = _make_engine()
+    assert engine.bt_executor is None
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_ROS2_TOPICS": {}})
+
+    import json
+    assert json.loads(sent[0]) == {"ROS2_TOPICS": {"topics": []}}
+
+
+def test_get_rosbag_status_reads_the_live_rosbag_control_off_bt_executor_node():
+    from xparo import remote_ops
+    engine = _make_engine()
+    control = type("FakeControl", (), {"state": "writing", "recorder_alive": True})()
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosbag_control=control))
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_ROSBAG_STATUS": {}})
+
+    import json
+    status = json.loads(sent[0])["ROSBAG_STATUS"]
+    assert status["state"] == "writing"
+    assert status["recorder_alive"] is True
+
+
+def test_get_rosbag_status_with_no_bt_executor_reports_unavailable():
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_ROSBAG_STATUS": {}})
+
+    import json
+    status = json.loads(sent[0])["ROSBAG_STATUS"]
+    assert status["state"] == "unavailable"
+    assert status["recorder_alive"] is False
+
+
+def test_start_stop_save_rosbag_dispatch_to_the_live_control():
+    class FakeControl:
+        state = "closed"
+        recorder_alive = True
+        def __init__(self):
+            self.calls = []
+        def handle_start(self):
+            self.calls.append("start")
+            self.state = "writing"
+        def handle_stop(self, on_done=None):
+            self.calls.append("stop")
+            self.state = "closed"
+
+    control = FakeControl()
+    engine = _make_engine()
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosbag_control=control))
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"START_ROSBAG": {}})
+    engine.on_ws_message('ws', {"SAVE_ROSBAG": {}})  # alias for stop
+    engine.on_ws_message('ws', {"STOP_ROSBAG": {}})
+
+    assert control.calls == ["start", "stop", "stop"]
+    import json
+    actions = [json.loads(m)["ROSBAG_ACTION_RESULT"]["action"] for m in sent]
+    assert actions == ["start", "save", "stop"]
+
+
+def test_watch_error_logs_enables_the_flag_and_resets_read_position():
+    engine = _make_engine()
+    engine._error_log_read_position = 123  # simulate a stale position from a previous watch
+    assert engine._error_log_watch_enabled is False
+
+    engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})
+
+    assert engine._error_log_watch_enabled is True
+    assert engine._error_log_read_position is None
+
+
+def test_unwatch_error_logs_disables_the_flag():
+    engine = _make_engine()
+    engine._error_log_watch_enabled = True
+
+    engine.on_ws_message('ws', {"UNWATCH_ERROR_LOGS": {}})
+
+    assert engine._error_log_watch_enabled is False
+
+
+def test_tail_new_error_log_lines_only_returns_error_and_fatal_lines(tmp_path):
+    engine = _make_engine()
+    log_dir = tmp_path / "latest_run"
+    log_dir.mkdir()
+    rosout = log_dir / "rosout.log"
+    rosout.write_text(
+        "[INFO] [123] [some_node]: everything fine\n"
+        "[ERROR] [124] [some_node]: something broke\n"
+        "[WARN] [125] [some_node]: a warning, not an error\n"
+        "[FATAL] [126] [some_node]: total meltdown\n"
+    )
+    engine.ROS2_LOG_BASE_DIR = str(tmp_path)
+    # Simulates a watch already in progress (position 0 = start of file) --
+    # the "brand new watch starts from EOF, not history" behavior is its
+    # own separate test below.
+    engine._error_log_read_position = 0
+
+    lines = engine._tail_new_error_log_lines()
+
+    assert len(lines) == 2
+    assert "something broke" in lines[0]
+    assert "total meltdown" in lines[1]
+
+
+def test_tail_new_error_log_lines_starts_from_end_of_file_not_history(tmp_path):
+    """_error_log_read_position starts None -- WATCH_ERROR_LOGS deliberately
+    never backfills whatever errors already happened before it was turned
+    on."""
+    engine = _make_engine()
+    log_dir = tmp_path / "latest_run"
+    log_dir.mkdir()
+    rosout = log_dir / "rosout.log"
+    rosout.write_text("[ERROR] [1] [n]: old error, before watch started\n")
+    engine.ROS2_LOG_BASE_DIR = str(tmp_path)
+    assert engine._error_log_read_position is None
+
+    first_call = engine._tail_new_error_log_lines()
+    assert first_call == []  # nothing new -- position jumped straight to EOF
+
+    with open(rosout, 'a') as f:
+        f.write("[ERROR] [2] [n]: a new error, after watch started\n")
+    second_call = engine._tail_new_error_log_lines()
+    assert len(second_call) == 1
+    assert "a new error" in second_call[0]
+
+
+def test_tail_new_error_log_lines_with_no_ros_log_dir_returns_empty(tmp_path):
+    engine = _make_engine()
+    engine.ROS2_LOG_BASE_DIR = str(tmp_path / "does_not_exist")
+    assert engine._tail_new_error_log_lines() == []
+
+
+def test_get_live_status_dispatches_to_remote_ops(tmp_path):
+    engine = _make_engine()
+    engine.local_database.get_smart_resource_consumption = lambda: {
+        "cpu_avg_percent": 10.0, "ram_used_percent": 20.0, "disk_used_percent": 30.0, "gpu_percent": None,
+    }
+    engine.local_database.get_cpu_temperature = lambda: 55.5
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_LIVE_STATUS": {}})
+    import time
+    for _ in range(50):
+        if sent:
+            break
+        time.sleep(0.05)
+
+    import json
+    status = json.loads(sent[0])["LIVE_STATUS"]
+    assert status["cpu_percent"] == 10.0
+    assert status["temp_c"] == 55.5
+    assert status["uptime_seconds"] >= 0
+    assert "battery" not in status
+
+
 def test_persisted_credential_is_scoped_to_project_id(tmp_path):
     """Found via a real local-testing session: credential.json used to
     store just {"value": ...}, with no notion of which project it was

@@ -76,6 +76,21 @@ class Engine():
         self.transfer_dir = os.path.join(self.xparo_folder, 'transferred_files')
         self.file_transfer = remote_ops.FileTransferSession(self.transfer_dir)
 
+        # GET_LIVE_STATUS's uptime field -- when this Engine (this robot's
+        # connection/process) itself started, not any Django-tracked
+        # logging session.
+        self._engine_started_at = time.time()
+        # WATCH_ERROR_LOGS/UNWATCH_ERROR_LOGS -- gates _error_log_watch_loop
+        # below, same "always-running timer, gated by a flag" shape as the
+        # AUV GCS's blackbox/compass stream toggles (default off: only pay
+        # for tailing the log file while a client actually has the error
+        # log popup open). _error_log_read_position=None means "start from
+        # the current end of the file" -- deliberately never backfills
+        # history from before the watch was turned on.
+        self._error_log_watch_enabled = False
+        self._error_log_read_position = None
+        self._error_log_lock = threading.Lock()
+
         self.xparo_behavior_path = os.path.join(self.xparo_folder,'config','default.xml')
         self.xparo_file_path = os.path.join(self.xparo_folder,'config','default.txt')
         self.xparo_env_path = os.path.join(self.xparo_folder,'config','default.env')
@@ -164,6 +179,7 @@ class Engine():
                                             self.BAG_DIR,self.record_bags,rosbag_control)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
+            threading.Thread(target=self._error_log_watch_loop, daemon=True).start()
         except:
             print("you are offline")
 
@@ -251,6 +267,71 @@ class Engine():
                 seconds_since_resource_update = 0
                 if not self.local_database._stop_updates and self.local_database.session_id:
                     self.local_database.update_logging_session(self.private_send)
+
+    # ROS2's own rosout.log level markers -- deliberately a plain substring
+    # check (not a regex/formal parse) matching this repo's "cheap and
+    # honest, not clever" posture for best-effort diagnostics.
+    _ERROR_LOG_LEVEL_MARKERS = ('[ERROR]', '[FATAL]')
+    ERROR_LOG_WATCH_INTERVAL_SEC = 3.0
+    # A class attribute (not inlined) so a test can point this at a
+    # tmp_path fixture instead of the real ~/.ros/log/ -- same reasoning
+    # as XP_Database.CPU_THERMAL_ZONE_PATH.
+    ROS2_LOG_BASE_DIR = os.path.expanduser('~/.ros/log/')
+
+    def _tail_new_error_log_lines(self):
+        """Independent of XP_Database.get_ros2_jazzy_logs' own persisted
+        read-pointer (used by the unrelated, 120s-cadence resource-history
+        feature) -- sharing that pointer would mean whichever of the two
+        features reads first "eats" the new lines out from under the
+        other. This keeps its own in-memory position instead, reset to
+        None (meaning "the current end of the file, no history") every
+        time WATCH_ERROR_LOGS turns the feature back on.
+        """
+        log_base_dir = self.ROS2_LOG_BASE_DIR
+        if not os.path.isdir(log_base_dir):
+            return []
+        subdirs = [
+            os.path.join(log_base_dir, d) for d in os.listdir(log_base_dir)
+            if os.path.isdir(os.path.join(log_base_dir, d))
+        ]
+        if not subdirs:
+            return []
+        rosout_path = os.path.join(max(subdirs, key=os.path.getmtime), 'rosout.log')
+        if not os.path.exists(rosout_path):
+            return []
+        with open(rosout_path, 'r') as file:
+            if self._error_log_read_position is None:
+                file.seek(0, os.SEEK_END)
+            else:
+                file.seek(self._error_log_read_position)
+            lines = file.readlines()
+            self._error_log_read_position = file.tell()
+        return [
+            line.rstrip('\n') for line in lines
+            if any(marker in line for marker in self._ERROR_LOG_LEVEL_MARKERS)
+        ]
+
+    def _error_log_watch_loop(self):
+        while True:
+            time.sleep(self.ERROR_LOG_WATCH_INTERVAL_SEC)
+            with self._error_log_lock:
+                enabled = self._error_log_watch_enabled
+            if not enabled:
+                continue
+            try:
+                for line in self._tail_new_error_log_lines():
+                    self._send_dict({"ERROR_LOG_ENTRY": {"message": line, "timestamp": time.time()}})
+            except Exception as e:
+                print(f"[error_log_watch] failed to tail rosout.log: {e}")
+
+    def _get_rosbag_control(self):
+        """Same lookup sync_rosbag_config already uses -- Engine never
+        keeps its own reference (bt_executor, and therefore its node,
+        doesn't exist yet at Engine construction time), so every caller
+        re-resolves it fresh, live, each time it's actually needed."""
+        if self.bt_executor is None:
+            return None
+        return getattr(self.bt_executor.node, 'rosbag_control', None)
 
     #########################################################################################
     def connect(self):
@@ -1023,10 +1104,12 @@ class Engine():
                 command = val.get("command", "")
                 request_id = val.get("request_id")
                 timeout = remote_ops.clamp_command_timeout(val.get("timeout"))
+                max_lines = val.get("max_lines")
                 if command.strip():
                     threading.Thread(
                         target=remote_ops.handle_run_command,
                         args=(command, request_id, timeout, self._send_dict),
+                        kwargs={"max_lines": max_lines},
                         daemon=True,
                     ).start()
                 else:
@@ -1047,6 +1130,59 @@ class Engine():
                 self.file_transfer.handle_file_chunk(val)
             elif k=="FILE_COMPLETE":
                 self.file_transfer.handle_file_complete(self._send_dict)
+            # ---- Fleet-management popups ported from the AUV GCS (see
+            # /home/scientist/.claude/plans/breezy-splashing-koala.md) --
+            # same remote_ops.py "plain function + send_response callback"
+            # shape as the Phase 4 remote-ops handlers just above.
+            elif k=="REBOOT_ROBOT":
+                threading.Thread(
+                    target=remote_ops.handle_reboot,
+                    args=(val.get("password"), self._send_dict),
+                    daemon=True,
+                ).start()
+            elif k=="GET_ROS2_TOPICS":
+                if self.bt_executor is not None:
+                    remote_ops.handle_list_ros2_topics(self.bt_executor.node, self._send_dict)
+                else:
+                    self._send_dict({"ROS2_TOPICS": {"topics": []}})
+            elif k=="GET_ROS2_PARAMS":
+                if self.bt_executor is not None:
+                    threading.Thread(
+                        target=remote_ops.handle_list_ros2_params,
+                        args=(self.bt_executor.node, self._send_dict),
+                        daemon=True,
+                    ).start()
+                else:
+                    self._send_dict({"ROS2_PARAMS": {"params": [], "errors": ["no live ROS2 node on this connection"]}})
+            elif k=="SET_ROS2_PARAM":
+                threading.Thread(
+                    target=remote_ops.handle_set_ros2_param,
+                    args=(val.get("node", ""), val.get("name", ""), val.get("value", ""), val.get("request_id"), self._send_dict),
+                    daemon=True,
+                ).start()
+            elif k=="GET_ROSBAG_STATUS":
+                self._send_dict({"ROSBAG_STATUS": remote_ops.get_rosbag_status(self._get_rosbag_control())})
+            elif k in ("START_ROSBAG", "STOP_ROSBAG", "SAVE_ROSBAG"):
+                action = {"START_ROSBAG": "start", "STOP_ROSBAG": "stop", "SAVE_ROSBAG": "save"}[k]
+                remote_ops.handle_rosbag_action(self._get_rosbag_control(), action, self._send_dict)
+            elif k=="WATCH_ERROR_LOGS":
+                with self._error_log_lock:
+                    self._error_log_watch_enabled = True
+                    self._error_log_read_position = None
+            elif k=="UNWATCH_ERROR_LOGS":
+                with self._error_log_lock:
+                    self._error_log_watch_enabled = False
+            elif k=="GET_LIVE_STATUS":
+                threading.Thread(
+                    target=remote_ops.handle_get_live_status,
+                    args=(
+                        self.local_database.get_smart_resource_consumption,
+                        self.local_database.get_cpu_temperature,
+                        time.time() - self._engine_started_at,
+                        self._send_dict,
+                    ),
+                    daemon=True,
+                ).start()
             elif k=="RUN_TASK":
                 # bt_executor is None when this Engine isn't owned by a
                 # live Xparo node (standalone use, or every test in this

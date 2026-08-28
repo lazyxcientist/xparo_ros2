@@ -145,7 +145,24 @@ class Xparo(Node):
         # on (that's `self`, here) -- it can't be built inside Engine/
         # XP_Database/BlackboxOrchestrator, none of which are rclpy-aware
         # (Engine is usable standalone, outside ROS2 entirely -- see its
-        # own __main__ block). Only construct it when actually recording.
+        # own __main__ block).
+        #
+        # Always constructed now, regardless of record_bags -- a real,
+        # reported bug: record_bags used to gate this object's very
+        # existence, so a robot launched without record_bags:=true (this
+        # project's own default) had literally nothing watching
+        # /rosbag2_recorder's services at all, even for a completely
+        # separate `ros2 bag record` process the user started by hand.
+        # Confirmed live: `ros2 bag record` exposes the exact same
+        # /rosbag2_recorder/{record,stop,resume,is_paused,
+        # is_discovery_running} service names regardless of who launches
+        # it -- RosbagControl's own service clients were always capable of
+        # driving/detecting ANY such recorder, they just never got built.
+        # record_bags now only controls owns_launch_process below (whether
+        # THIS launch file also started its own recorder subprocess that
+        # needs its throwaway boot session force-closed) -- watching/
+        # controlling whatever recorder actually exists is unconditional.
+        #
         # start_mode/start_delay_seconds come from whatever was persisted
         # by a previous sync (Manage_Dash.py's rosbag_config, relayed via
         # engine.py's sync_rosbag_config) -- read here, before
@@ -157,7 +174,8 @@ class Xparo(Node):
             self, self.BAG_DIR,
             start_mode=rosbag_config['start_mode'],
             start_delay_seconds=rosbag_config['start_delay_seconds'],
-        ) if self.record_bags else None
+            owns_launch_process=self.record_bags,
+        )
 
         # record_bags and BAG_DIR must go in through the constructor, not be
         # set as post-construction attributes -- Engine.__init__ already

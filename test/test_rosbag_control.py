@@ -11,7 +11,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from xparo.rosbag_control import RosbagControl, CLOSED, PAUSED, WRITING, UNKNOWN
+from xparo.rosbag_control import (
+    RosbagControl, CLOSED, PAUSED, WRITING, UNKNOWN, is_any_rosbag_process_running,
+)
 
 
 class FakeFuture:
@@ -374,3 +376,99 @@ class TestBootSequenceAutoStart:
         delayed_start_cb()
 
         assert len(control.record_client.calls) == 1
+
+
+class TestOwnsLaunchProcess:
+    """Regression coverage for a real bug found live: RosbagControl used
+    to only ever be constructed at all when record_bags:=true (see
+    xparo_ros.py's own fix), so a robot recording via a completely
+    separate `ros2 bag record` invocation -- or via xparo_launch with
+    record_bags left at its default False -- had nothing watching it.
+    Fixed by always constructing RosbagControl and gating only the
+    boot-time forced-stop/auto-start dance (which exists purely to clean
+    up THIS launch's own throwaway boot session) behind
+    owns_launch_process. These go through the real __init__ (unlike
+    _make_control's __new__ bypass above), since owns_launch_process's
+    branch lives inside __init__ itself.
+    """
+
+    def test_owns_launch_process_true_is_the_default_and_force_stops_a_session_left_open(self):
+        node = FakeNode()
+        # An unconfigured FakeClient's call_async falls back to
+        # FakeFuture(result=MagicMock()) -- MagicMock().running/.paused
+        # are both truthy, simulating "a session is already open and
+        # writing" without needing to queue anything explicitly.
+        control = RosbagControl(node, '/tmp/bags', start_mode='task')
+        # A real Stop request was issued to close the boot-time session --
+        # settling into CLOSED itself only happens once _verify_after's
+        # delayed re-check timer fires (see the existing boot-sequence
+        # tests above), not asserted here; the point of this test is that
+        # owns_launch_process=True (the default) does try to close it.
+        assert len(control.stop_client.calls) == 1
+
+    def test_owns_launch_process_false_never_force_stops_an_existing_session(self):
+        node = FakeNode()
+        control = RosbagControl(node, '/tmp/bags', start_mode='task', owns_launch_process=False)
+        # resync() still ran (state reflects real detected reality)...
+        assert control.state in (PAUSED, WRITING)
+        # ...but nothing was ever stopped -- this session belongs entirely
+        # to whatever external process opened it.
+        assert control.stop_client.calls == []
+
+    def test_owns_launch_process_false_never_auto_starts_even_with_start_mode_auto(self):
+        node = FakeNode()
+        control = RosbagControl(node, '/tmp/bags', start_mode='auto', owns_launch_process=False)
+        assert control.record_client.calls == []
+        assert control.resume_client.calls == []
+
+    def test_owns_launch_process_false_still_detects_a_closed_session(self):
+        node = FakeNode()
+        control = RosbagControl(node, '/tmp/bags', owns_launch_process=False)
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.resync()
+        assert control.state == CLOSED
+        assert control.stop_client.calls == []
+
+
+class TestIsAnyRosbagProcessRunning:
+    """Independent of RosbagControl's own /rosbag2_recorder service-based
+    state machine -- a plain process-table scan, so a `ros2 bag record`
+    launched with a custom --node-name (the one case service-name-based
+    detection genuinely can't identify) still shows up as "something is
+    recording" at all, honestly. Real subprocesses, not mocked psutil --
+    matches this repo's own "real execution over mocking" convention.
+    """
+
+    def test_detects_a_real_process_whose_cmdline_looks_like_a_bag_recording(self):
+        import subprocess
+        import time
+        proc = subprocess.Popen([
+            "python3", "-c", "import time; time.sleep(5)",
+            "ros2", "bag", "record",  # trailing argv, ignored by the script, visible in its cmdline
+        ])
+        try:
+            for _ in range(20):
+                if is_any_rosbag_process_running():
+                    break
+                time.sleep(0.1)
+            assert is_any_rosbag_process_running() is True
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_returns_false_once_the_process_is_gone(self):
+        import subprocess
+        proc = subprocess.Popen(["python3", "-c", "import time; time.sleep(0.01)", "ros2", "bag", "record"])
+        proc.wait(timeout=5)
+        assert is_any_rosbag_process_running() is False
+
+    def test_an_unrelated_process_is_not_a_false_positive(self):
+        import subprocess
+        import time
+        proc = subprocess.Popen(["python3", "-c", "import time; time.sleep(5)"])
+        try:
+            time.sleep(0.2)
+            assert is_any_rosbag_process_running() is False
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)

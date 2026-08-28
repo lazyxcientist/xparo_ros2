@@ -102,6 +102,30 @@ class TestGetGpuPercent:
             assert db.get_gpu_percent() is None
 
 
+class TestGetCpuTemperature:
+    def test_reads_a_real_looking_sysfs_thermal_zone(self, tmp_path):
+        db = _make_database(tmp_path)
+        zone_file = tmp_path / "thermal_zone0_temp"
+        zone_file.write_text("54200\n")
+        db.CPU_THERMAL_ZONE_PATH = str(zone_file)
+
+        assert db.get_cpu_temperature() == 54.2
+
+    def test_returns_none_when_no_thermal_zone_is_exposed(self, tmp_path):
+        db = _make_database(tmp_path)
+        db.CPU_THERMAL_ZONE_PATH = str(tmp_path / "does_not_exist")
+
+        assert db.get_cpu_temperature() is None
+
+    def test_malformed_contents_do_not_raise(self, tmp_path):
+        db = _make_database(tmp_path)
+        zone_file = tmp_path / "thermal_zone0_temp"
+        zone_file.write_text("not-a-number\n")
+        db.CPU_THERMAL_ZONE_PATH = str(zone_file)
+
+        assert db.get_cpu_temperature() is None
+
+
 class TestAverageResourceSamples:
     def test_no_samples_returns_an_empty_dict(self, tmp_path):
         db = _make_database(tmp_path)

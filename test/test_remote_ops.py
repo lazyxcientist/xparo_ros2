@@ -6,8 +6,11 @@ driving them; test_engine.py covers the dispatch wiring on top of this.
 """
 import base64
 import os
+import subprocess
 import time
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -286,3 +289,372 @@ def test_only_one_upload_tracked_at_a_time(tmp_path):
 
     assert (tmp_path / "second.bin").read_bytes() == b"x"
     assert not (tmp_path / "first.bin").exists() or (tmp_path / "first.bin").stat().st_size == 0
+
+
+# ------------------------------------------------------------------
+# Folder download -- zipped server-side, then streamed through the exact
+# same chunked FILE_REQ/FILE_CHUNK/FILE_COMPLETE sequence as a single file.
+# ------------------------------------------------------------------
+def test_downloading_a_folder_zips_it_and_streams_the_zip(tmp_path):
+    folder = tmp_path / "mission_logs"
+    folder.mkdir()
+    (folder / "a.txt").write_text("alpha")
+    (folder / "b.txt").write_text("bravo")
+    sub = folder / "nested"
+    sub.mkdir()
+    (sub / "c.txt").write_text("charlie")
+
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "mission_logs", "direction": "download"}, responses.append)
+
+    req_msgs = [r["FILE_REQ"] for r in responses if "FILE_REQ" in r]
+    chunk_msgs = [r["FILE_CHUNK"] for r in responses if "FILE_CHUNK" in r]
+    complete_msgs = [r["FILE_COMPLETE"] for r in responses if "FILE_COMPLETE" in r]
+
+    assert req_msgs[0]["filename"] == "mission_logs.zip"
+    assert complete_msgs[0]["status"] == "ok"
+
+    reassembled = b"".join(base64.b64decode(c["data"]) for c in chunk_msgs)
+    zip_tmp = tmp_path / "_reassembled.zip"
+    zip_tmp.write_bytes(reassembled)
+    with zipfile.ZipFile(zip_tmp) as zf:
+        names = set(zf.namelist())
+        assert "a.txt" in names and "b.txt" in names
+        assert any(n.endswith("c.txt") for n in names)
+        assert zf.read("a.txt") == b"alpha"
+
+
+def test_downloading_a_folder_cleans_up_its_temp_zip(tmp_path):
+    folder = tmp_path / "small_folder"
+    folder.mkdir()
+    (folder / "x.txt").write_text("x")
+    session = remote_ops.FileTransferSession(str(tmp_path))
+
+    session.handle_file_req({"filename": "small_folder", "direction": "download"}, lambda r: None)
+
+    # No stray xparo_folder_dl_* temp dirs left behind in the system tmp dir.
+    import tempfile as _tempfile
+    leftovers = [
+        name for name in os.listdir(_tempfile.gettempdir())
+        if name.startswith("xparo_folder_dl_")
+    ]
+    assert leftovers == []
+
+
+# ------------------------------------------------------------------
+# Power management -- reboot. Subprocess is mocked here, deliberately --
+# the one legitimate exception to this file's "real execution" convention,
+# since actually running `sudo reboot` would take down whatever machine
+# runs this test suite.
+# ------------------------------------------------------------------
+def test_handle_reboot_passwordless_success_sends_nothing():
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        remote_ops.handle_reboot(None, responses.append)
+    assert responses == []
+    mock_run.assert_called_once()
+    assert mock_run.call_args.args[0] == ["sudo", "-n", "reboot"]
+
+
+def test_handle_reboot_passwordless_failure_reports_needs_password():
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="sudo: a password is required",
+        )
+        remote_ops.handle_reboot(None, responses.append)
+    result = responses[0]["REBOOT_RESULT"]
+    assert result["success"] is False
+    assert result["needs_password"] is True
+
+
+def test_handle_reboot_with_password_pipes_it_via_stdin_not_argv():
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        remote_ops.handle_reboot("hunter2", responses.append)
+    args, kwargs = mock_run.call_args
+    assert args[0] == ["sudo", "-S", "reboot"]
+    assert "hunter2" not in args[0]  # never a CLI arg
+    assert kwargs["input"] == "hunter2\n"
+
+
+def test_handle_reboot_wrong_password_reports_failure():
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="Sorry, try again.\nsudo: a password is required",
+        )
+        remote_ops.handle_reboot("wrong", responses.append)
+    result = responses[0]["REBOOT_RESULT"]
+    assert result["success"] is False
+    assert result["needs_password"] is True
+
+
+def test_handle_reboot_timeout_reports_failure():
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="sudo -n reboot", timeout=10.0)
+        remote_ops.handle_reboot(None, responses.append)
+    assert responses[0]["REBOOT_RESULT"]["success"] is False
+
+
+# ------------------------------------------------------------------
+# ROS2 introspection -- topics (fake node stub, since the interesting
+# behavior here is sorting/shaping, not rclpy itself) and parameters
+# (real `ros2` CLI subprocess calls -- verified live against an actual
+# throwaway rclpy node with declared scalar/list/bool parameters before
+# this test was written, confirming ros2 param dump's real output format:
+# block-style `- item` lists at the SAME indent as their key, wrapped in
+# `<node>: {ros__parameters: {...}}`).
+# ------------------------------------------------------------------
+class _FakeRos2Node:
+    def __init__(self, topics=None, nodes=None):
+        self._topics = topics or []
+        self._nodes = nodes or []
+
+    def get_topic_names_and_types(self):
+        return self._topics
+
+    def get_node_names_and_namespaces(self):
+        return self._nodes
+
+
+def test_handle_list_ros2_topics_sorts_and_shapes():
+    node = _FakeRos2Node(topics=[
+        ("/zzz_topic", ["std_msgs/msg/String"]),
+        ("/aaa_topic", ["std_msgs/msg/Bool", "std_msgs/msg/Empty"]),
+    ])
+    responses = []
+    remote_ops.handle_list_ros2_topics(node, responses.append)
+    topics = responses[0]["ROS2_TOPICS"]["topics"]
+    assert [t["name"] for t in topics] == ["/aaa_topic", "/zzz_topic"]
+    assert topics[0]["types"] == ["std_msgs/msg/Bool", "std_msgs/msg/Empty"]
+
+
+REAL_PARAM_DUMP_OUTPUT = """/param_dump_test_node:
+  ros__parameters:
+    my_double: 3.14
+    my_int_list:
+    - 1
+    - 2
+    - 3
+    my_string: hello world
+    my_string_list:
+    - a
+    - b
+    start_type_description_service: true
+    use_sim_time: false
+"""
+
+
+def test_parse_param_dump_matches_real_ros2_param_dump_output():
+    """REAL_PARAM_DUMP_OUTPUT above is not hypothetical -- it's the exact,
+    byte-for-byte output `ros2 param dump` produced against a real rclpy
+    node in this environment (ROS2 Jazzy) with those five parameters
+    declared, captured before this parser was written this way. An
+    earlier version of this parser assumed flow-style `[1, 2, 3]` lists
+    and no `<node>/ros__parameters` wrapper -- both wrong, caught by
+    actually running the real CLI rather than guessing its format.
+    """
+    result = dict(remote_ops._parse_param_dump(REAL_PARAM_DUMP_OUTPUT))
+    assert result == {
+        "my_double": 3.14,
+        "my_int_list": [1, 2, 3],
+        "my_string": "hello world",
+        "my_string_list": ["a", "b"],
+        "start_type_description_service": True,
+        "use_sim_time": False,
+    }
+
+
+def test_handle_list_ros2_params_real_subprocess_reports_a_clean_error_for_a_missing_node():
+    """Real, unmocked `ros2 param dump` call against a node that
+    genuinely doesn't exist -- confirmed live to fail fast (~1s, exit
+    code 1, "Node not found"), not hang, so this is safe to run for real
+    in a test rather than mocking subprocess.run.
+    """
+    node = _FakeRos2Node(nodes=[("definitely_not_a_real_node_xyz", "/")])
+    responses = []
+    remote_ops.handle_list_ros2_params(node, responses.append)
+    result = responses[0]["ROS2_PARAMS"]
+    assert result["params"] == []
+    assert len(result["errors"]) == 1
+    assert "/definitely_not_a_real_node_xyz" in result["errors"][0]
+
+
+def test_handle_list_ros2_params_stops_within_its_total_time_budget():
+    node = _FakeRos2Node(nodes=[("definitely_not_a_real_node_xyz", "/")])
+    responses = []
+    with patch('xparo.remote_ops.LIST_PARAMS_TOTAL_BUDGET_SEC', 0.0):
+        remote_ops.handle_list_ros2_params(node, responses.append)
+    result = responses[0]["ROS2_PARAMS"]
+    assert any("budget" in e for e in result["errors"])
+
+
+def test_handle_set_ros2_param_real_subprocess_reports_failure_for_a_missing_node():
+    """Real, unmocked `ros2 param set` call -- same fast-fail reasoning
+    as the params-list test above."""
+    responses = []
+    remote_ops.handle_set_ros2_param(
+        "/definitely_not_a_real_node_xyz", "some_param", "5", "req-9", responses.append,
+    )
+    result = responses[0]["SET_ROS2_PARAM_RESULT"]
+    assert result["request_id"] == "req-9"
+    assert result["success"] is False
+
+
+def test_handle_set_ros2_param_never_uses_shell_true():
+    """node/param/value all arrive over the network -- argv-list form
+    only, confirmed by inspecting the actual subprocess.run call."""
+    with patch('xparo.remote_ops.subprocess.run') as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+        remote_ops.handle_set_ros2_param("/n", "p", "v; rm -rf /", "req-1", lambda r: None)
+    args, kwargs = mock_run.call_args
+    assert isinstance(args[0], list)
+    assert kwargs.get("shell") is not True
+
+
+# ------------------------------------------------------------------
+# Rosbag recording control -- thin wrappers around a live RosbagControl,
+# stubbed here (spinning up the real rosbag2_recorder service infra is
+# out of scope for a unit test; rosbag_control.py's own tests already
+# cover the real state machine against real services).
+# ------------------------------------------------------------------
+class _FakeRosbagControl:
+    def __init__(self, state="closed", recorder_alive=True):
+        self.state = state
+        self.recorder_alive = recorder_alive
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def handle_start(self):
+        self.start_calls += 1
+        self.state = "writing"
+
+    def handle_stop(self, on_done=None):
+        self.stop_calls += 1
+        self.state = "closed"
+        if on_done:
+            on_done()
+
+
+def test_get_rosbag_status_when_unavailable():
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=False):
+        assert remote_ops.get_rosbag_status(None) == {
+            "state": "unavailable", "recorder_alive": False, "process_detected": False,
+        }
+
+
+def test_get_rosbag_status_reflects_live_state():
+    control = _FakeRosbagControl(state="writing", recorder_alive=True)
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=True):
+        assert remote_ops.get_rosbag_status(control) == {
+            "state": "writing", "recorder_alive": True, "process_detected": True,
+        }
+
+
+def test_get_rosbag_status_flags_a_process_recorder_control_cant_identify():
+    """The whole point of process_detected: a recorder launched with a
+    custom --node-name never answers /rosbag2_recorder's services, so
+    RosbagControl itself sees CLOSED/dead -- but a plain process-table
+    scan still honestly reports that something is recording."""
+    control = _FakeRosbagControl(state="closed", recorder_alive=False)
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=True):
+        status = remote_ops.get_rosbag_status(control)
+    assert status["recorder_alive"] is False
+    assert status["process_detected"] is True
+
+
+def test_handle_rosbag_action_start_calls_handle_start():
+    control = _FakeRosbagControl(state="closed")
+    responses = []
+    remote_ops.handle_rosbag_action(control, "start", responses.append)
+    assert control.start_calls == 1
+    assert responses[0]["ROSBAG_ACTION_RESULT"]["action"] == "start"
+    assert responses[0]["ROSBAG_ACTION_RESULT"]["state"] == "writing"
+
+
+def test_handle_rosbag_action_stop_calls_handle_stop():
+    control = _FakeRosbagControl(state="writing")
+    responses = []
+    remote_ops.handle_rosbag_action(control, "stop", responses.append)
+    assert control.stop_calls == 1
+    assert responses[0]["ROSBAG_ACTION_RESULT"]["state"] == "closed"
+
+
+def test_handle_rosbag_action_save_is_an_alias_for_stop():
+    """Single-mcap-file mode means save/split has nowhere distinct to go
+    (rosbag_control.py's own control_cb hard-disables it) -- Save calls
+    the exact same handle_stop() as Stop, just labeled differently."""
+    control = _FakeRosbagControl(state="writing")
+    responses = []
+    remote_ops.handle_rosbag_action(control, "save", responses.append)
+    assert control.stop_calls == 1
+    assert control.start_calls == 0
+    assert responses[0]["ROSBAG_ACTION_RESULT"]["action"] == "save"
+    assert responses[0]["ROSBAG_ACTION_RESULT"]["state"] == "closed"
+
+
+def test_handle_rosbag_action_with_no_live_control_still_replies():
+    responses = []
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=False):
+        remote_ops.handle_rosbag_action(None, "start", responses.append)
+    assert responses[0]["ROSBAG_ACTION_RESULT"] == {
+        "action": "start", "state": "unavailable", "recorder_alive": False, "process_detected": False,
+    }
+
+
+# ------------------------------------------------------------------
+# Live system status -- one-shot on-demand snapshot
+# ------------------------------------------------------------------
+def test_handle_get_live_status_shapes_the_response():
+    responses = []
+    remote_ops.handle_get_live_status(
+        get_resource_consumption=lambda: {
+            "cpu_avg_percent": 12.5, "ram_used_percent": 40.0,
+            "disk_used_percent": 55.0, "gpu_percent": None,
+        },
+        get_cpu_temperature=lambda: 47.3,
+        uptime_seconds=125.0,
+        send_response=responses.append,
+    )
+    assert responses[0] == {"LIVE_STATUS": {
+        "cpu_percent": 12.5, "ram_percent": 40.0, "disk_percent": 55.0,
+        "gpu_percent": None, "temp_c": 47.3, "uptime_seconds": 125.0,
+    }}
+    assert "battery" not in responses[0]["LIVE_STATUS"]
+
+
+# ------------------------------------------------------------------
+# Terminal -- per-request max_lines (previously a fixed module constant)
+# ------------------------------------------------------------------
+def test_clamp_command_max_lines_defaults_and_bounds():
+    assert remote_ops.clamp_command_max_lines(None) == remote_ops.RUN_COMMAND_MAX_LINES
+    assert remote_ops.clamp_command_max_lines("not-a-number") == remote_ops.RUN_COMMAND_MAX_LINES
+    assert remote_ops.clamp_command_max_lines(0) == 1
+    assert remote_ops.clamp_command_max_lines(99999) == remote_ops.MAX_COMMAND_MAX_LINES
+    assert remote_ops.clamp_command_max_lines(10) == 10
+
+
+def test_handle_run_command_respects_a_custom_max_lines():
+    cmd = "python3 -c \"[print(i) for i in range(50)]\""
+    responses = []
+    remote_ops.handle_run_command(cmd, "req-5", 10.0, responses.append, max_lines=5)
+    result = responses[0]["COMMAND_RESULT"]
+    lines = result["output"].splitlines()
+    assert result["truncated"] is True
+    assert result["max_lines"] == 5
+    assert len(lines) == 5
+    assert lines[-1] == "49"
+
+
+def test_handle_run_command_default_max_lines_unchanged_when_not_specified():
+    cmd = "python3 -c \"[print(i) for i in range(200)]\""
+    responses = []
+    remote_ops.handle_run_command(cmd, "req-6", 10.0, responses.append)
+    result = responses[0]["COMMAND_RESULT"]
+    assert len(result["output"].splitlines()) == remote_ops.RUN_COMMAND_MAX_LINES
+    assert result["max_lines"] == remote_ops.RUN_COMMAND_MAX_LINES

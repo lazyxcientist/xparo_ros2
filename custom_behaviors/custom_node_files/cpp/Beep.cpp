@@ -14,7 +14,7 @@ public:
     BT::NodeStatus tick() override
     {
         auto times = getInput<std::string>("times");
-        std::cout << "[Beep] beeping " << times.value() << " time(s)" << std::endl;
+        std::cout << "[Beep] beeping okay great amazing " << times.value() << " time(s)" << std::endl;
         return BT::NodeStatus::SUCCESS;
     }
 };
