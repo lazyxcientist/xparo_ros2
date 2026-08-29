@@ -256,6 +256,8 @@ class XP_Database():
         return_dict['used_disk'] = f"{disk_info.used / (1024 ** 3):.2f} GB"
         return_dict['free_disk'] = f"{disk_info.free / (1024 ** 3):.2f} GB"
         return_dict['device_id'] = self.unique_id
+        return_dict['xparo_git_commit'] = self.get_xparo_git_commit()
+        return_dict['ros_distro'] = os.environ.get('ROS_DISTRO')
         # Network/Location data (Adding Public IP)
         return_dict["locations"] = {}
         return_dict["public_ip"] = None
@@ -454,6 +456,31 @@ class XP_Database():
             first_line = result.stdout.strip().splitlines()[0]
             return float(first_line)
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+            return None
+
+    def get_xparo_git_commit(self):
+        """Best-effort xparo software identity for the fleet version/
+        inventory view -- this package.xml's own <version> is a hardcoded,
+        never-updated "0.0.0" (confirmed), so a real git commit is the
+        only honest way to know what a given robot is actually running.
+        `--symlink-install` means this very file's __file__ resolves
+        (through the symlink, via realpath) back into the real source
+        checkout, so `git -C <that dir>` finds the repo normally in the
+        common dev/staging case; a plain, non-symlinked install (this
+        file copied straight into install/, no source tree alongside it)
+        genuinely isn't a git checkout at all, so returning None there is
+        correct, not a bug to work around.
+        """
+        try:
+            package_dir = os.path.dirname(os.path.realpath(__file__))
+            result = subprocess.run(
+                ['git', '-C', package_dir, 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip() or None
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
     # A class attribute (not inlined into the method body) so a test can

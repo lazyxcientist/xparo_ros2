@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import os
+import psutil
 from datetime import datetime
 from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
@@ -80,16 +81,6 @@ class Engine():
         # connection/process) itself started, not any Django-tracked
         # logging session.
         self._engine_started_at = time.time()
-        # WATCH_ERROR_LOGS/UNWATCH_ERROR_LOGS -- gates _error_log_watch_loop
-        # below, same "always-running timer, gated by a flag" shape as the
-        # AUV GCS's blackbox/compass stream toggles (default off: only pay
-        # for tailing the log file while a client actually has the error
-        # log popup open). _error_log_read_position=None means "start from
-        # the current end of the file" -- deliberately never backfills
-        # history from before the watch was turned on.
-        self._error_log_watch_enabled = False
-        self._error_log_read_position = None
-        self._error_log_lock = threading.Lock()
 
         self.xparo_behavior_path = os.path.join(self.xparo_folder,'config','default.xml')
         self.xparo_file_path = os.path.join(self.xparo_folder,'config','default.txt')
@@ -179,7 +170,6 @@ class Engine():
                                             self.BAG_DIR,self.record_bags,rosbag_control)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
-            threading.Thread(target=self._error_log_watch_loop, daemon=True).start()
         except:
             print("you are offline")
 
@@ -259,8 +249,7 @@ class Engine():
         while True:
             time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
-            self.private_send(json.dumps({"ROBOT_HEARTBEAT": {"device_id": self.local_database.unique_id}}),
-                               command_for="rest")
+            self.private_send(json.dumps(self._build_heartbeat_payload()), command_for="rest")
 
             seconds_since_resource_update += HEARTBEAT_INTERVAL_SECONDS
             if seconds_since_resource_update >= self.local_database.update_interval:
@@ -268,61 +257,35 @@ class Engine():
                 if not self.local_database._stop_updates and self.local_database.session_id:
                     self.local_database.update_logging_session(self.private_send)
 
-    # ROS2's own rosout.log level markers -- deliberately a plain substring
-    # check (not a regex/formal parse) matching this repo's "cheap and
-    # honest, not clever" posture for best-effort diagnostics.
-    _ERROR_LOG_LEVEL_MARKERS = ('[ERROR]', '[FATAL]')
-    ERROR_LOG_WATCH_INTERVAL_SEC = 3.0
-    # A class attribute (not inlined) so a test can point this at a
-    # tmp_path fixture instead of the real ~/.ros/log/ -- same reasoning
-    # as XP_Database.CPU_THERMAL_ZONE_PATH.
-    ROS2_LOG_BASE_DIR = os.path.expanduser('~/.ros/log/')
+    def _build_heartbeat_payload(self):
+        """Extracted from _logging_update_loop so the diagnostics_level
+        glue is directly testable without driving the loop's own
+        time.sleep. Folded into the existing heartbeat rather than a
+        separate message -- cheap (see _refresh_self_diagnostics' own
+        docstring) and this is exactly what Phase B's alerting/attention-
+        triage queue needs: a worsening level reaching Django without
+        anyone needing a diagnostics popup open."""
+        self._refresh_self_diagnostics()
+        aggregator = self._get_diagnostics_aggregator()
+        diagnostics_level = aggregator.snapshot()["overall_level"] if aggregator is not None else None
+        return {"ROBOT_HEARTBEAT": {
+            "device_id": self.local_database.unique_id,
+            "diagnostics_level": diagnostics_level,
+        }}
 
-    def _tail_new_error_log_lines(self):
-        """Independent of XP_Database.get_ros2_jazzy_logs' own persisted
-        read-pointer (used by the unrelated, 120s-cadence resource-history
-        feature) -- sharing that pointer would mean whichever of the two
-        features reads first "eats" the new lines out from under the
-        other. This keeps its own in-memory position instead, reset to
-        None (meaning "the current end of the file, no history") every
-        time WATCH_ERROR_LOGS turns the feature back on.
-        """
-        log_base_dir = self.ROS2_LOG_BASE_DIR
-        if not os.path.isdir(log_base_dir):
-            return []
-        subdirs = [
-            os.path.join(log_base_dir, d) for d in os.listdir(log_base_dir)
-            if os.path.isdir(os.path.join(log_base_dir, d))
-        ]
-        if not subdirs:
-            return []
-        rosout_path = os.path.join(max(subdirs, key=os.path.getmtime), 'rosout.log')
-        if not os.path.exists(rosout_path):
-            return []
-        with open(rosout_path, 'r') as file:
-            if self._error_log_read_position is None:
-                file.seek(0, os.SEEK_END)
-            else:
-                file.seek(self._error_log_read_position)
-            lines = file.readlines()
-            self._error_log_read_position = file.tell()
-        return [
-            line.rstrip('\n') for line in lines
-            if any(marker in line for marker in self._ERROR_LOG_LEVEL_MARKERS)
-        ]
-
-    def _error_log_watch_loop(self):
-        while True:
-            time.sleep(self.ERROR_LOG_WATCH_INTERVAL_SEC)
-            with self._error_log_lock:
-                enabled = self._error_log_watch_enabled
-            if not enabled:
-                continue
-            try:
-                for line in self._tail_new_error_log_lines():
-                    self._send_dict({"ERROR_LOG_ENTRY": {"message": line, "timestamp": time.time()}})
-            except Exception as e:
-                print(f"[error_log_watch] failed to tail rosout.log: {e}")
+    def _get_rosout_watcher(self):
+        """Same lookup/reasoning as _get_rosbag_control just below --
+        RosoutWatcher (rosout_watcher.py) replaced the old rosout.log
+        file-tailer entirely: confirmed live against this repo's own
+        ~/.ros/log/ history that rosout.log never actually exists in this
+        ROS2 Jazzy setup (only launch.log does, and that's just the
+        launch orchestrator's own messages) -- the file-tailer was
+        watching a file that could never appear. /rosout is the real,
+        always-published topic every node's logger writes to regardless
+        of file-logging config."""
+        if self.bt_executor is None:
+            return None
+        return getattr(self.bt_executor.node, 'rosout_watcher', None)
 
     def _get_rosbag_control(self):
         """Same lookup sync_rosbag_config already uses -- Engine never
@@ -332,6 +295,35 @@ class Engine():
         if self.bt_executor is None:
             return None
         return getattr(self.bt_executor.node, 'rosbag_control', None)
+
+    def _get_diagnostics_aggregator(self):
+        """Same lookup/reasoning as _get_rosbag_control just above."""
+        if self.bt_executor is None:
+            return None
+        return getattr(self.bt_executor.node, 'diagnostics_aggregator', None)
+
+    def _refresh_self_diagnostics(self):
+        """xparo's own bootstrap DiagnosticStatus entries -- see
+        diagnostics_aggregator.py's module docstring for why this exists
+        (a robot with zero external /diagnostics publishers still gets a
+        meaningful snapshot). Deliberately cheap (no blocking psutil call
+        like get_smart_resource_consumption's 1s cpu_percent sample) since
+        this runs on every 30s heartbeat, not just on an on-demand GET.
+        """
+        aggregator = self._get_diagnostics_aggregator()
+        if aggregator is None:
+            return
+        rosbag_control = self._get_rosbag_control()
+        if rosbag_control is not None:
+            level = 'ok' if rosbag_control.recorder_alive else 'error'
+            aggregator.record_self_status('xparo.rosbag_recorder', level, f"state={rosbag_control.state}")
+        try:
+            disk_percent = psutil.disk_usage('/').percent
+        except OSError:
+            disk_percent = None
+        if disk_percent is not None:
+            level = 'error' if disk_percent >= 95 else ('warn' if disk_percent >= 85 else 'ok')
+            aggregator.record_self_status('xparo.disk_usage', level, f"{disk_percent:.1f}% used")
 
     #########################################################################################
     def connect(self):
@@ -1166,12 +1158,20 @@ class Engine():
                 action = {"START_ROSBAG": "start", "STOP_ROSBAG": "stop", "SAVE_ROSBAG": "save"}[k]
                 remote_ops.handle_rosbag_action(self._get_rosbag_control(), action, self._send_dict)
             elif k=="WATCH_ERROR_LOGS":
-                with self._error_log_lock:
-                    self._error_log_watch_enabled = True
-                    self._error_log_read_position = None
+                watcher = self._get_rosout_watcher()
+                if watcher is not None:
+                    watcher._live_push = lambda entry: self._send_dict({"ERROR_LOG_ENTRY": entry})
+                    watcher.watch_enabled = True
+                    # Show what's already been seen since boot immediately,
+                    # not just future events -- matches the old feature's
+                    # own "opening the popup shows something right away"
+                    # expectation.
+                    for entry in watcher.recent_entries():
+                        self._send_dict({"ERROR_LOG_ENTRY": entry})
             elif k=="UNWATCH_ERROR_LOGS":
-                with self._error_log_lock:
-                    self._error_log_watch_enabled = False
+                watcher = self._get_rosout_watcher()
+                if watcher is not None:
+                    watcher.watch_enabled = False
             elif k=="GET_LIVE_STATUS":
                 threading.Thread(
                     target=remote_ops.handle_get_live_status,
@@ -1183,6 +1183,16 @@ class Engine():
                     ),
                     daemon=True,
                 ).start()
+            elif k=="GET_DIAGNOSTICS_SNAPSHOT":
+                self._refresh_self_diagnostics()
+                aggregator = self._get_diagnostics_aggregator()
+                snapshot = aggregator.snapshot() if aggregator is not None else {"components": {}, "overall_level": None}
+                self._send_dict({"DIAGNOSTICS_SNAPSHOT": snapshot})
+            elif k=="GET_XPARO_VERSION":
+                self._send_dict({"XPARO_VERSION": {
+                    "xparo_git_commit": self.local_database.get_xparo_git_commit(),
+                    "ros_distro": os.environ.get("ROS_DISTRO"),
+                }})
             elif k=="RUN_TASK":
                 # bt_executor is None when this Engine isn't owned by a
                 # live Xparo node (standalone use, or every test in this

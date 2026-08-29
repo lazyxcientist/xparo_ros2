@@ -126,6 +126,38 @@ class TestGetCpuTemperature:
         assert db.get_cpu_temperature() is None
 
 
+class TestGetXparoGitCommit:
+    def test_reports_this_real_checkouts_own_real_commit(self, tmp_path):
+        """Real, unmocked call -- database.py genuinely lives inside this
+        repo's own real git checkout, so this exercises the real git
+        subprocess against real, live repo state (not a fixture)."""
+        db = _make_database(tmp_path)
+        import os
+        import xparo.database as database_module
+        package_dir = os.path.dirname(os.path.realpath(database_module.__file__))
+        expected = subprocess.run(
+            ['git', '-C', package_dir, 'rev-parse', 'HEAD'], capture_output=True, text=True,
+        ).stdout.strip()
+
+        commit = db.get_xparo_git_commit()
+
+        assert commit == expected
+        assert len(commit) == 40  # a real, full SHA-1 hex string
+
+    def test_returns_none_when_git_reports_failure(self, tmp_path):
+        db = _make_database(tmp_path)
+        with patch('xparo.database.subprocess.run') as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=128, stdout='', stderr='fatal: not a git repository',
+            )
+            assert db.get_xparo_git_commit() is None
+
+    def test_git_not_installed_does_not_raise(self, tmp_path):
+        db = _make_database(tmp_path)
+        with patch('xparo.database.subprocess.run', side_effect=FileNotFoundError()):
+            assert db.get_xparo_git_commit() is None
+
+
 class TestAverageResourceSamples:
     def test_no_samples_returns_an_empty_dict(self, tmp_path):
         db = _make_database(tmp_path)

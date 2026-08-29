@@ -202,11 +202,13 @@ def test_file_transfer_upload_round_trip_through_engine(tmp_path):
 # ------------------------------------------------------------------
 class _FakeBtNode:
     """Stands in for the real rclpy Node (Xparo) engine.bt_executor.node
-    points at -- exposes just enough for GET_ROS2_TOPICS/rosbag dispatch
-    to find what they're looking for."""
-    def __init__(self, rosbag_control=None, topics=None):
+    points at -- exposes just enough for GET_ROS2_TOPICS/rosbag/
+    diagnostics dispatch to find what they're looking for."""
+    def __init__(self, rosbag_control=None, topics=None, diagnostics_aggregator=None, rosout_watcher=None):
         self.rosbag_control = rosbag_control
         self._topics = topics or []
+        self.diagnostics_aggregator = diagnostics_aggregator
+        self.rosout_watcher = rosout_watcher
 
     def get_topic_names_and_types(self):
         return self._topics
@@ -344,76 +346,65 @@ def test_start_stop_save_rosbag_dispatch_to_the_live_control():
     assert actions == ["start", "save", "stop"]
 
 
-def test_watch_error_logs_enables_the_flag_and_resets_read_position():
+def _make_rosout_watcher(on_new_error=None):
+    """Real RosoutWatcher against a trivial subscription-recording stub
+    node (mirrors test_diagnostics_aggregator.py's own FakeNode) -- real
+    execution over a hand-rolled fake watcher."""
+    from xparo.rosout_watcher import RosoutWatcher
+
+    class _StubNode:
+        def create_subscription(self, *a, **k):
+            return MagicMock()
+
+    return RosoutWatcher(_StubNode(), on_new_error=on_new_error)
+
+
+def test_watch_error_logs_enables_the_watcher_and_wires_live_push():
     engine = _make_engine()
-    engine._error_log_read_position = 123  # simulate a stale position from a previous watch
-    assert engine._error_log_watch_enabled is False
+    watcher = _make_rosout_watcher()
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
+    assert watcher.watch_enabled is False
 
     engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})
 
-    assert engine._error_log_watch_enabled is True
-    assert engine._error_log_read_position is None
+    assert watcher.watch_enabled is True
+    assert watcher._live_push is not None
 
 
-def test_unwatch_error_logs_disables_the_flag():
+def test_watch_error_logs_replays_whatever_was_already_seen_since_boot():
+    """Opening the popup shows recent history immediately, not just
+    future events -- matches the old (file-tailing) feature's own
+    expectation, now sourced from RosoutWatcher's own buffer."""
+    from rcl_interfaces.msg import Log
     engine = _make_engine()
-    engine._error_log_watch_enabled = True
+    watcher = _make_rosout_watcher()
+    watcher._on_log(Log(name='some_node', msg='already happened', level=Log.ERROR))
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})
+
+    import json
+    messages = [json.loads(m)["ERROR_LOG_ENTRY"]["message"] for m in sent]
+    assert "already happened" in messages
+
+
+def test_unwatch_error_logs_disables_the_watcher():
+    engine = _make_engine()
+    watcher = _make_rosout_watcher()
+    watcher.watch_enabled = True
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
 
     engine.on_ws_message('ws', {"UNWATCH_ERROR_LOGS": {}})
 
-    assert engine._error_log_watch_enabled is False
+    assert watcher.watch_enabled is False
 
 
-def test_tail_new_error_log_lines_only_returns_error_and_fatal_lines(tmp_path):
+def test_watch_error_logs_with_no_bt_executor_is_a_safe_noop():
     engine = _make_engine()
-    log_dir = tmp_path / "latest_run"
-    log_dir.mkdir()
-    rosout = log_dir / "rosout.log"
-    rosout.write_text(
-        "[INFO] [123] [some_node]: everything fine\n"
-        "[ERROR] [124] [some_node]: something broke\n"
-        "[WARN] [125] [some_node]: a warning, not an error\n"
-        "[FATAL] [126] [some_node]: total meltdown\n"
-    )
-    engine.ROS2_LOG_BASE_DIR = str(tmp_path)
-    # Simulates a watch already in progress (position 0 = start of file) --
-    # the "brand new watch starts from EOF, not history" behavior is its
-    # own separate test below.
-    engine._error_log_read_position = 0
-
-    lines = engine._tail_new_error_log_lines()
-
-    assert len(lines) == 2
-    assert "something broke" in lines[0]
-    assert "total meltdown" in lines[1]
-
-
-def test_tail_new_error_log_lines_starts_from_end_of_file_not_history(tmp_path):
-    """_error_log_read_position starts None -- WATCH_ERROR_LOGS deliberately
-    never backfills whatever errors already happened before it was turned
-    on."""
-    engine = _make_engine()
-    log_dir = tmp_path / "latest_run"
-    log_dir.mkdir()
-    rosout = log_dir / "rosout.log"
-    rosout.write_text("[ERROR] [1] [n]: old error, before watch started\n")
-    engine.ROS2_LOG_BASE_DIR = str(tmp_path)
-    assert engine._error_log_read_position is None
-
-    first_call = engine._tail_new_error_log_lines()
-    assert first_call == []  # nothing new -- position jumped straight to EOF
-
-    with open(rosout, 'a') as f:
-        f.write("[ERROR] [2] [n]: a new error, after watch started\n")
-    second_call = engine._tail_new_error_log_lines()
-    assert len(second_call) == 1
-    assert "a new error" in second_call[0]
-
-
-def test_tail_new_error_log_lines_with_no_ros_log_dir_returns_empty(tmp_path):
-    engine = _make_engine()
-    engine.ROS2_LOG_BASE_DIR = str(tmp_path / "does_not_exist")
-    assert engine._tail_new_error_log_lines() == []
+    engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})  # must not raise
+    engine.on_ws_message('ws', {"UNWATCH_ERROR_LOGS": {}})  # must not raise
 
 
 def test_get_live_status_dispatches_to_remote_ops(tmp_path):
@@ -528,6 +519,130 @@ def test_fall_back_to_raw_secret_clears_the_file_and_replaces_the_transport(tmp_
     assert mock_transport_cls.call_args.args[1] == engine.project_id
     new_transport.connect.assert_called_once()
     assert engine.transport is new_transport
+
+
+def _make_diagnostics_aggregator():
+    """A real DiagnosticsAggregator against a trivial subscription-
+    recording stub node (mirrors test_diagnostics_aggregator.py's own
+    FakeNode) -- real execution over a hand-rolled fake aggregator."""
+    from xparo.diagnostics_aggregator import DiagnosticsAggregator
+
+    class _StubNode:
+        def create_subscription(self, *a, **k):
+            return MagicMock()
+
+    return DiagnosticsAggregator(_StubNode())
+
+
+def test_get_diagnostics_snapshot_dispatches_against_bt_executor_node():
+    engine = _make_engine()
+    aggregator = _make_diagnostics_aggregator()
+    # A name GET_DIAGNOSTICS_SNAPSHOT's own _refresh_self_diagnostics call
+    # (real psutil disk usage, no rosbag_control here) never touches --
+    # simulates an entry that arrived over the real /diagnostics topic.
+    aggregator.record_self_status('nav2/amcl', 'warn', 'localization degraded')
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(diagnostics_aggregator=aggregator))
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_DIAGNOSTICS_SNAPSHOT": {}})
+
+    import json
+    snapshot = json.loads(sent[0])["DIAGNOSTICS_SNAPSHOT"]
+    assert snapshot["components"]["nav2/amcl"]["level"] == "warn"
+    assert snapshot["overall_level"] == "warn"
+
+
+def test_get_diagnostics_snapshot_with_no_bt_executor_reports_empty():
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    engine.on_ws_message('ws', {"GET_DIAGNOSTICS_SNAPSHOT": {}})
+
+    import json
+    assert json.loads(sent[0])["DIAGNOSTICS_SNAPSHOT"] == {"components": {}, "overall_level": None}
+
+
+def test_get_xparo_version_reports_commit_and_distro():
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+
+    import os
+    with patch.object(engine.local_database, 'get_xparo_git_commit', return_value='abc123'), \
+         patch.dict(os.environ, {'ROS_DISTRO': 'jazzy'}):
+        engine.on_ws_message('ws', {"GET_XPARO_VERSION": {}})
+
+    import json
+    result = json.loads(sent[0])["XPARO_VERSION"]
+    assert result == {"xparo_git_commit": "abc123", "ros_distro": "jazzy"}
+
+
+def test_refresh_self_diagnostics_records_rosbag_and_disk_status():
+    engine = _make_engine()
+    aggregator = _make_diagnostics_aggregator()
+
+    class _FakeRosbagControl:
+        state = "writing"
+        recorder_alive = True
+
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
+        rosbag_control=_FakeRosbagControl(), diagnostics_aggregator=aggregator,
+    ))
+
+    engine._refresh_self_diagnostics()
+
+    snapshot = aggregator.snapshot()
+    assert snapshot["components"]["xparo.rosbag_recorder"]["level"] == "ok"
+    assert "state=writing" in snapshot["components"]["xparo.rosbag_recorder"]["message"]
+    assert "xparo.disk_usage" in snapshot["components"]
+
+
+def test_refresh_self_diagnostics_flags_a_dead_recorder_as_an_error():
+    engine = _make_engine()
+    aggregator = _make_diagnostics_aggregator()
+
+    class _FakeDeadRosbagControl:
+        state = "unknown"
+        recorder_alive = False
+
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
+        rosbag_control=_FakeDeadRosbagControl(), diagnostics_aggregator=aggregator,
+    ))
+
+    engine._refresh_self_diagnostics()
+
+    assert aggregator.snapshot()["components"]["xparo.rosbag_recorder"]["level"] == "error"
+
+
+def test_refresh_self_diagnostics_with_no_bt_executor_is_a_safe_noop():
+    engine = _make_engine()
+    engine._refresh_self_diagnostics()  # must not raise
+
+
+def test_build_heartbeat_payload_includes_diagnostics_level():
+    engine = _make_engine()
+    aggregator = _make_diagnostics_aggregator()
+
+    class _FakeRosbagControl:
+        state = "closed"
+        recorder_alive = True
+
+    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
+        rosbag_control=_FakeRosbagControl(), diagnostics_aggregator=aggregator,
+    ))
+
+    payload = engine._build_heartbeat_payload()
+
+    assert payload["ROBOT_HEARTBEAT"]["device_id"] == engine.local_database.unique_id
+    assert payload["ROBOT_HEARTBEAT"]["diagnostics_level"] in ("ok", "warn", "error", "stale")
+
+
+def test_build_heartbeat_payload_diagnostics_level_is_none_with_no_bt_executor():
+    engine = _make_engine()
+    payload = engine._build_heartbeat_payload()
+    assert payload["ROBOT_HEARTBEAT"]["diagnostics_level"] is None
 
 
 def test_fall_back_to_raw_secret_tolerates_an_already_missing_file(tmp_path):

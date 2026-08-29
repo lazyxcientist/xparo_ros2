@@ -29,6 +29,8 @@ from datetime import datetime
 
 from xparo.engine import Engine
 from xparo.rosbag_control import RosbagControl, load_rosbag_config
+from xparo.diagnostics_aggregator import DiagnosticsAggregator
+from xparo.rosout_watcher import RosoutWatcher
 from xparo.bt_engine.executor import BehaviorTreeExecutor
 
 try:
@@ -175,6 +177,25 @@ class Xparo(Node):
             start_mode=rosbag_config['start_mode'],
             start_delay_seconds=rosbag_config['start_delay_seconds'],
             owns_launch_process=self.record_bags,
+        )
+
+        # Same ownership pattern as rosbag_control just above -- needs a
+        # real Node to subscribe to /diagnostics on, so it's built here,
+        # not inside Engine (which is usable standalone, outside ROS2
+        # entirely). Engine reaches it the same way it already reaches
+        # rosbag_control: getattr(self.bt_executor.node, ..., None).
+        self.diagnostics_aggregator = DiagnosticsAggregator(self)
+
+        # Same ownership pattern again -- subscribes to /rosout for
+        # real-time ERROR/FATAL capture (replaces the old rosout.log
+        # file-tailer, confirmed live to never actually exist in this
+        # ROS2 setup). on_new_error is a lazy closure over self.xparo_engine
+        # (not yet constructed at this point) rather than a direct bound
+        # method reference -- safe because /rosout callbacks only ever
+        # fire once rclpy is spinning, well after __init__ returns and
+        # self.xparo_engine is set below.
+        self.rosout_watcher = RosoutWatcher(
+            self, on_new_error=lambda entry: self.xparo_engine._send_dict({"ERROR_OCCURRED": entry}),
         )
 
         # record_bags and BAG_DIR must go in through the constructor, not be

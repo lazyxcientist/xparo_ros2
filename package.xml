@@ -12,6 +12,7 @@
   <depend>rclcpp</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>diagnostic_msgs</depend>
 
 
   <!-- <depend>python3-pyaudio</depend> -->
