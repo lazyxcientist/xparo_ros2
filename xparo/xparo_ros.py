@@ -17,6 +17,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import Joy
@@ -31,6 +32,13 @@ from xparo.engine import Engine
 from xparo.rosbag_control import RosbagControl, load_rosbag_config
 from xparo.diagnostics_aggregator import DiagnosticsAggregator
 from xparo.rosout_watcher import RosoutWatcher
+from xparo.health import ProblemTracker
+from xparo.engine import HEALTH_FLUSH_SEC
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
+
+SELF_DIAGNOSTICS_PERIOD_SEC = 1.0
+_DIAG_LEVELS = {'ok': DiagnosticStatus.OK, 'warn': DiagnosticStatus.WARN,
+                'error': DiagnosticStatus.ERROR, 'stale': DiagnosticStatus.STALE}
 from xparo.bt_engine.executor import BehaviorTreeExecutor
 
 try:
@@ -101,6 +109,13 @@ class Xparo(Node):
             "tethered_channels_config_path", xparo_config.get("tethered_channels_config_path", "")
         ).value
         self.tethered_channels_config = self._load_tethered_channels_config(self.tethered_channels_config_path)
+        # Ads Center: who draws this robot's ads on its screen -- "native"
+        # (xparo's own always-on-top player, for robots without XP-shell),
+        # "xpshell" (hand them to XP-shell's Kivy player over ROS 2) or
+        # "off". See xparo/ads/backends/.
+        self.xparo_ads_display = self.declare_parameter(
+            "xparo_ads_display", xparo_config.get("xparo_ads_display", "native")
+        ).value
 
 
         self.ask_question = self.create_subscription(String, '/xparo/ask', self.ask_question_fun, 10)
@@ -184,19 +199,15 @@ class Xparo(Node):
         # not inside Engine (which is usable standalone, outside ROS2
         # entirely). Engine reaches it the same way it already reaches
         # rosbag_control: getattr(self.bt_executor.node, ..., None).
-        self.diagnostics_aggregator = DiagnosticsAggregator(self)
-
-        # Same ownership pattern again -- subscribes to /rosout for
-        # real-time ERROR/FATAL capture (replaces the old rosout.log
-        # file-tailer, confirmed live to never actually exist in this
-        # ROS2 setup). on_new_error is a lazy closure over self.xparo_engine
-        # (not yet constructed at this point) rather than a direct bound
-        # method reference -- safe because /rosout callbacks only ever
-        # fire once rclpy is spinning, well after __init__ returns and
-        # self.xparo_engine is set below.
-        self.rosout_watcher = RosoutWatcher(
-            self, on_new_error=lambda entry: self.xparo_engine._send_dict({"ERROR_OCCURRED": entry}),
-        )
+        # One problem list for the Health & Errors popup, fed by both
+        # /diagnostics (every node's status, xparo's own included -- see
+        # _publish_self_diagnostics) and /rosout ERROR/FATAL lines.
+        # Engine.flush_health sends what changed every HEALTH_FLUSH_SEC.
+        self.problem_tracker = ProblemTracker()
+        self.diagnostics_aggregator = DiagnosticsAggregator(self, tracker=self.problem_tracker)
+        self.rosout_watcher = RosoutWatcher(self, self.problem_tracker)
+        self.self_diagnostics_pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
+        self.task_result_pub = self.create_publisher(String, '/xparo/task_result', 10)
 
         # record_bags and BAG_DIR must go in through the constructor, not be
         # set as post-construction attributes -- Engine.__init__ already
@@ -217,6 +228,7 @@ class Xparo(Node):
                               tethered_channels_config = self.tethered_channels_config)
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
+        self.xparo_engine.on_task_event = self._on_task_event
         # Composable, owned by this node like self.rosbag_control above --
         # unlike that one, it needs the already-built xparo_engine (to call
         # add_live_update/add_task_history on), so it can only be
@@ -236,7 +248,55 @@ class Xparo(Node):
         # system's own Python nodes -- persisted per-file .py files under
         # custom_behaviors/custom_node_files/ from a previous sync.
         self.xparo_engine.sync_custom_node_files()
+        # Before connect(), so the first connection asks for the ad schedule.
+        self.xparo_engine.setup_ads(self.xparo_ads_display, node=self)
         self.xparo_engine.connect()
+        self.create_timer(SELF_DIAGNOSTICS_PERIOD_SEC, self._publish_self_diagnostics)
+        self.create_timer(HEALTH_FLUSH_SEC, self.xparo_engine.flush_health)
+
+    def _publish_self_diagnostics(self):
+        """xparo's own health on the standard /diagnostics topic (1 Hz, the
+        usual diagnostic_updater rate): dashboard connection, rosbag
+        recorder, task engine, disk. rqt_robot_monitor and friends see it,
+        and this node's own DiagnosticsAggregator picks it up like any
+        other publisher's."""
+        try:
+            statuses = self.xparo_engine.self_health_statuses()
+        except Exception as e:
+            self.get_logger().warn(f"couldn't build xparo's own diagnostics: {e}")
+            return
+        msg = DiagnosticArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        hardware_id = self.xparo_engine.local_database.unique_id
+        for name, level, message in statuses:
+            status = DiagnosticStatus()
+            status.level = _DIAG_LEVELS.get(level, DiagnosticStatus.ERROR)
+            status.name = name
+            status.message = message
+            status.hardware_id = hardware_id
+            msg.status.append(status)
+        self.self_diagnostics_pub.publish(msg)
+
+    def _on_task_event(self, kind, info):
+        """Engine.on_task_event: a task's start and result, in this node's
+        log and (results) on /xparo/task_result -- so a task triggered with
+        `ros2 topic pub /xparo/run_task ...` visibly does something here."""
+        title = info.get("task_title") or info.get("task_id") or "task"
+        run = f"run {info.get('run_id')}" if info.get("run_id") else "not started"
+        if kind == "started":
+            limit = f", time limit {info['timeout_s']:.0f}s" if info.get("timeout_s") else ""
+            self.get_logger().info(f"Task '{title}' started ({run}, trigger {info.get('trigger') or '-'}{limit})")
+            return
+        if info.get("success"):
+            self.get_logger().info(f"Task '{title}' finished: SUCCESS in {float(info.get('duration_s') or 0):.1f}s ({run})")
+        else:
+            why = info.get("explanation") or info.get("error") or info.get("outcome") or "failed"
+            if info.get("error") and info["error"] not in why:
+                why = f"{why} {info['error']}"  # e.g. which node is invalid, not just "it has errors"
+            self.get_logger().warn(f"Task '{title}' FAILED ({info.get('outcome') or 'failed'}, {run}): {why}")
+        out = String()
+        out.data = json.dumps(info, default=str)
+        self.task_result_pub.publish(out)
 
 
 
@@ -338,7 +398,9 @@ def main(args=None):
     xparo = Xparo()
     try:
         rclpy.spin(xparo)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # SIGINT (Ctrl+C, ros2 launch's first stop signal) or SIGTERM /
+        # another shutdown -- either way, finish below and exit.
         pass
     # Sends this session's final Logs_history update (total runtime,
     # average CPU/RAM/disk/GPU consumption across the whole session) while
@@ -350,6 +412,14 @@ def main(args=None):
         xparo.xparo_engine.local_database.stop_logging_session(xparo.xparo_engine.private_send)
     except Exception as e:
         xparo.get_logger().error(f"Failed to send final logging session update: {e}")
+    if xparo.xparo_engine.ad_manager is not None:
+        xparo.xparo_engine.ad_manager.stop()
+    try:
+        # A clean websocket close, so the dashboard shows the robot
+        # offline right away instead of after the heartbeat timeout.
+        xparo.xparo_engine.transport.close()
+    except Exception as e:
+        xparo.get_logger().warn(f"Couldn't close the dashboard connection cleanly: {e}")
     xparo.destroy_node()
     rclpy.try_shutdown()
 

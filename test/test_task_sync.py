@@ -176,6 +176,12 @@ class TestBuildRunTaskVal:
             # "development", the least-trusted reading (see
             # build_run_task_val's own comment).
             "stage": "development",
+            # Not in this (older) cache either: handle_run_task falls back
+            # to its default time limit; title/tree name label the report.
+            "timeout_s": None,
+            "task_title": "",
+            "tree_name": "",
+            "trigger": "ros_topic",
         }
 
 

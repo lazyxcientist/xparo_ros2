@@ -19,3 +19,10 @@ custom_behaviors/custom_node_files/cpp/cpp_build/
 custom_behaviors/custom_node_files/javascript/js_runtime/
 custom_behaviors/custom_aiml/
 custom_envs/custom_maps/
+
+# Stress test finding F3 (LOW): engine.py's _persist_credential writes this
+# robot's live ROBOT_CREDENTIAL (its auth secret for the Django server)
+# here at runtime -- it was never gitignored, so a plain `git add -A` run
+# from inside a real deployment's checkout could commit a live credential
+# to history.
+config/credential.json

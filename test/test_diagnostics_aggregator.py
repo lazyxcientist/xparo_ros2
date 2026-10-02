@@ -27,6 +27,10 @@ def _status(name, level, message=''):
     return DiagnosticStatus(name=name, level=level, message=message)
 
 
+def _array(*statuses):
+    return DiagnosticArray(status=list(statuses))
+
+
 class TestSubscription:
     def test_subscribes_to_the_standard_diagnostics_topic(self):
         node = FakeNode()
@@ -111,7 +115,8 @@ class TestRecordSelfStatus:
         aggregator = DiagnosticsAggregator(node)
         aggregator.record_self_status('xparo.rosbag_recorder', 'error', 'state=unknown')
         snapshot = aggregator.snapshot()
-        assert snapshot["components"]["xparo.rosbag_recorder"] == {
+        component = snapshot["components"]["xparo.rosbag_recorder"]
+        assert {k: component[k] for k in ("level", "message", "stale")} == {
             "level": "error", "message": "state=unknown", "stale": False,
         }
         assert snapshot["overall_level"] == "error"
@@ -121,3 +126,28 @@ class TestRecordSelfStatus:
         aggregator = DiagnosticsAggregator(node)
         snapshot = aggregator.snapshot()
         assert snapshot == {"components": {}, "overall_level": "ok"}
+
+
+class TestFeedsTheProblemTracker:
+    """Every /diagnostics status reaches health.ProblemTracker, so warn/
+    error/stale components are counted and listed in Health & Errors."""
+
+    def test_topic_statuses_and_self_statuses_reach_the_tracker(self):
+        from xparo.health import ProblemTracker
+        tracker = ProblemTracker()
+        aggregator = DiagnosticsAggregator(FakeNode(), tracker=tracker)
+        aggregator._on_diagnostics(_array(_status('lidar', DiagnosticStatus.ERROR, 'no scans')))
+        aggregator.record_self_status('xparo: disk usage', 'warn', '90% used')
+        names = sorted(e['name'] for e in tracker.entries())
+        assert names == ['lidar', 'xparo: disk usage']
+
+    def test_a_component_that_stops_publishing_is_counted_as_stale_once(self):
+        from xparo.health import ProblemTracker
+        tracker = ProblemTracker()
+        aggregator = DiagnosticsAggregator(FakeNode(), tracker=tracker)
+        aggregator._on_diagnostics(_array(_status('lidar', DiagnosticStatus.OK, 'fine')))
+        aggregator._latest['lidar']['last_seen'] -= 1000
+        aggregator.check_stale()
+        aggregator.check_stale()
+        stale = [e for e in tracker.entries() if e['level'] == 'stale']
+        assert len(stale) == 1 and stale[0]['count'] == 1

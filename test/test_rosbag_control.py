@@ -13,6 +13,7 @@ import pytest
 
 from xparo.rosbag_control import (
     RosbagControl, CLOSED, PAUSED, WRITING, UNKNOWN, is_any_rosbag_process_running,
+    FIRST_CHECK_DELAY_SEC, SERVICE_WAIT_SEC,
 )
 
 
@@ -41,6 +42,12 @@ class FakeClient:
         return self
 
     def wait_for_service(self, timeout_sec=None):
+        # Blocking inside the node's single executor thread froze the
+        # whole xparo node -- RosbagControl must only ever use the
+        # non-blocking service_is_ready().
+        raise AssertionError("RosbagControl must not block on wait_for_service")
+
+    def service_is_ready(self):
         return self.service_available
 
     def call_async(self, request):
@@ -54,6 +61,8 @@ class FakeNode:
     def __init__(self):
         self.clients = {}
         self.timers = []
+        self.logger = MagicMock()
+        self.destroyed_timers = []
 
     def create_client(self, srv_type, name):
         client = FakeClient()
@@ -71,8 +80,17 @@ class FakeNode:
         self.timers.append((period, callback, timer))
         return timer
 
+    def destroy_timer(self, timer):
+        self.destroyed_timers.append(timer)
+
     def get_logger(self):
-        return MagicMock()
+        return self.logger
+
+    def fire_timers(self, period):
+        """Fires (once) every recorded timer with this period."""
+        for p, callback, _timer in list(self.timers):
+            if p == period:
+                callback()
 
 
 def _discovery_response(running):
@@ -81,6 +99,14 @@ def _discovery_response(running):
 
 def _paused_response(paused):
     return FakeFuture(result=MagicMock(paused=paused))
+
+
+def _init_runtime_state(control):
+    control.state = UNKNOWN
+    control.recorder_alive = False
+    control._reported_reachable = None
+    control._pending_start_until = None
+    control._busy = False
 
 
 def _make_control(bag_dir='/tmp/bags', start_mode='task', start_delay_seconds=0):
@@ -102,8 +128,8 @@ def _make_control(bag_dir='/tmp/bags', start_mode='task', start_delay_seconds=0)
     control.start_mode = start_mode
     control.start_delay_seconds = max(0, start_delay_seconds or 0)
     control._start_delay_timer = None
-    control.state = UNKNOWN
-    control.recorder_alive = False
+    control.owns_launch_process = True
+    _init_runtime_state(control)
     from rosbag2_interfaces.srv import Record, Stop, Resume, SplitBagfile, IsPaused, IsDiscoveryRunning
     control.record_client = node.create_client(Record, '/rosbag2_recorder/record')
     control.stop_client = node.create_client(Stop, '/rosbag2_recorder/stop')
@@ -163,8 +189,8 @@ def test_boot_sequence_stops_a_session_left_open_at_launch():
     control = RosbagControl.__new__(RosbagControl)
     control.node = node
     control.bag_dir = '/tmp/bags'
-    control.state = UNKNOWN
-    control.recorder_alive = False
+    control.owns_launch_process = True
+    _init_runtime_state(control)
     control.record_client = node.create_client(Record, '/rosbag2_recorder/record')
     control.stop_client = node.create_client(Stop, '/rosbag2_recorder/stop')
     control.resume_client = node.create_client(Resume, '/rosbag2_recorder/resume')
@@ -399,6 +425,7 @@ class TestOwnsLaunchProcess:
         # are both truthy, simulating "a session is already open and
         # writing" without needing to queue anything explicitly.
         control = RosbagControl(node, '/tmp/bags', start_mode='task')
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)  # the first check is deferred
         # A real Stop request was issued to close the boot-time session --
         # settling into CLOSED itself only happens once _verify_after's
         # delayed re-check timer fires (see the existing boot-sequence
@@ -409,6 +436,7 @@ class TestOwnsLaunchProcess:
     def test_owns_launch_process_false_never_force_stops_an_existing_session(self):
         node = FakeNode()
         control = RosbagControl(node, '/tmp/bags', start_mode='task', owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)  # the first check is deferred
         # resync() still ran (state reflects real detected reality)...
         assert control.state in (PAUSED, WRITING)
         # ...but nothing was ever stopped -- this session belongs entirely
@@ -418,16 +446,90 @@ class TestOwnsLaunchProcess:
     def test_owns_launch_process_false_never_auto_starts_even_with_start_mode_auto(self):
         node = FakeNode()
         control = RosbagControl(node, '/tmp/bags', start_mode='auto', owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)  # the first check is deferred
         assert control.record_client.calls == []
         assert control.resume_client.calls == []
 
     def test_owns_launch_process_false_still_detects_a_closed_session(self):
         node = FakeNode()
         control = RosbagControl(node, '/tmp/bags', owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)  # the first check is deferred
         control.is_discovery_client.queue_response(_discovery_response(False))
         control.resync()
         assert control.state == CLOSED
         assert control.stop_client.calls == []
+
+
+class TestNoRecorderRunning:
+    """Regression coverage for "[ERROR] is_discovery_running service
+    unreachable -- state UNKNOWN." every 5 s, and the node freezing: with
+    no recorder running, the watchdog used to block the node's only
+    executor thread for 2 s on every tick and log the same ERROR forever.
+    """
+
+    def _control(self, owns_launch_process):
+        node = FakeNode()
+        control = RosbagControl(node, '/tmp/bags', start_mode='task', owns_launch_process=owns_launch_process)
+        for client in node.clients.values():
+            client.service_available = False
+        return node, control
+
+    def _messages(self, node, level):
+        return [c.args[0] for c in getattr(node.logger, level).call_args_list]
+
+    def test_first_check_is_deferred_so_a_running_recorder_has_time_to_be_discovered(self):
+        node, control = self._control(owns_launch_process=False)
+        assert control.state == UNKNOWN
+        assert [t[0] for t in node.timers].count(FIRST_CHECK_DELAY_SEC) == 1
+
+    def test_missing_recorder_is_reported_once_not_every_watchdog_tick(self):
+        node, control = self._control(owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)
+        for _ in range(10):
+            control.watchdog_cb()
+        infos = [m for m in self._messages(node, 'info') if 'No rosbag2 recorder is running' in m]
+        assert len(infos) == 1
+        # Not an error when this launch never started a recorder itself.
+        assert not [m for m in self._messages(node, 'error') if 'recorder' in m.lower()]
+
+    def test_missing_recorder_is_one_error_when_this_launch_owns_it(self):
+        node, control = self._control(owns_launch_process=True)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)
+        for _ in range(10):
+            control.watchdog_cb()
+        errors = [m for m in self._messages(node, 'error') if 'unreachable' in m]
+        assert len(errors) == 1
+
+    def test_recorder_coming_back_is_reported_once(self):
+        node, control = self._control(owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)
+        control.is_discovery_client.service_available = True
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.watchdog_cb()
+        assert control.state == CLOSED
+        assert [m for m in self._messages(node, 'info') if 'reachable again' in m] == ['rosbag2 recorder reachable again.']
+
+    def test_start_without_a_recorder_is_remembered_and_fires_when_one_appears(self):
+        node, control = self._control(owns_launch_process=False)
+        node.fire_timers(FIRST_CHECK_DELAY_SEC)
+        control.handle_start()
+        assert control.record_client.calls == []  # nothing to talk to yet, and no recursion
+
+        for client in node.clients.values():
+            client.service_available = True
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.record_client.queue_response(FakeFuture(result=MagicMock(return_code=0, error_string='')))
+        control.watchdog_cb()          # recorder discovered -> start scheduled
+        node.fire_timers(0.1)
+        assert len(control.record_client.calls) == 1
+
+    def test_a_call_to_a_missing_service_retries_on_a_timer_instead_of_waiting(self):
+        node, control = self._control(owns_launch_process=False)
+        control.state = PAUSED
+        control.handle_start()  # PAUSED -> resume, but the service isn't up
+        retry_timers = [t for t in node.timers if t[0] == SERVICE_WAIT_SEC]
+        assert len(retry_timers) == 1
+        assert control.resume_client.calls == []
 
 
 class TestIsAnyRosbagProcessRunning:

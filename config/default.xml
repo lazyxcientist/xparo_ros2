@@ -1,5 +1,10 @@
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
-
+<Sequence name="Greet_visitor">
+<SpeakText text="Bonjour! I'm XPARO robot."  name="Say_hello"/>
+<SpeakText text="Welcome!"  name="SpeakText_action_1737400000000_a1b2c3"/>
+<Wait seconds="2"  name="Pause"/>
+<SpeakText text="Have a great day!"  name="Say_goodbye"/>
+</Sequence>
 </BehaviorTree>
 </root>

@@ -60,6 +60,7 @@ and needs a different signal.
 import datetime
 import json
 import os
+import time
 
 import psutil
 
@@ -132,8 +133,16 @@ RELIABLE_QOS = QoSProfile(
     depth=10,
 )
 
-SERVICE_WAIT_SEC = 2.0
+SERVICE_WAIT_SEC = 2.0   # delay between retries of a call whose service isn't up yet
 MAX_RETRIES = 3
+# The first recorder check waits this long after startup -- a recorder
+# that IS running is usually not discovered yet the instant this node
+# starts, and saying "no recorder" then would be wrong.
+FIRST_CHECK_DELAY_SEC = 1.5
+# A start requested while no recorder is reachable (dashboard Start, the
+# /ros2_bag_control topic, auto-start at boot) is remembered this long and
+# fires as soon as a recorder appears, instead of being dropped.
+PENDING_START_WINDOW_SEC = 60.0
 WATCHDOG_PERIOD_SEC = 5.0
 STATUS_PERIOD_SEC = 1.0
 POST_ACTION_VERIFY_DELAY_SEC = 0.3   # let the recorder settle before re-checking
@@ -184,6 +193,15 @@ class RosbagControl:
 
         self.state = UNKNOWN
         self.recorder_alive = False
+        # None until the first check has run; then whether the recorder
+        # was reachable last time -- "unreachable" is logged once per
+        # transition, not on every watchdog tick (it used to log the same
+        # ERROR every 5 s forever when no recorder was running).
+        self._reported_reachable = None
+        self._pending_start_until = None
+        # True while a service call is in flight -- the watchdog's resync
+        # waits for it instead of racing it.
+        self._busy = False
 
         self.record_client = node.create_client(Record, '/rosbag2_recorder/record')
         self.stop_client = node.create_client(Stop, '/rosbag2_recorder/stop')
@@ -238,10 +256,54 @@ class RosbagControl:
         # xparo_ros could silently kill a recording the user started on
         # purpose, possibly before xparo_ros even connected. Just resync
         # once to detect current reality and leave it alone.
+        first_check = self._boot_sequence if self.owns_launch_process else None
+        self._after(FIRST_CHECK_DELAY_SEC, lambda: self.resync(on_done=first_check))
+
+    def _after(self, delay_sec, callback):
+        """One-shot timer on the host node. Nothing here may block: every
+        callback of the xparo node (subscriptions, BT nodes waiting on
+        topics, parameter services) shares one executor thread. The old
+        wait_for_service(timeout_sec=2) calls ran inside that thread every
+        5 s, freezing the whole node ~40% of the time whenever no
+        recorder was running (confirmed live: `ros2 param get /xparo ...`
+        took up to 1.6 s longer than it should)."""
+        timer = None
+
+        def _fire():
+            timer.cancel()
+            self.node.destroy_timer(timer)
+            callback()
+        timer = self.node.create_timer(delay_sec, _fire)
+        return timer
+
+    def _note_reachable(self, reachable):
+        """Logs recorder reachability only when it changes."""
+        if reachable == self._reported_reachable:
+            return
+        first = self._reported_reachable is None
+        self._reported_reachable = reachable
+        if reachable:
+            if not first:
+                self.node.get_logger().info('rosbag2 recorder reachable again.')
+            if self._pending_start_until is not None:
+                pending = self._pending_start_until
+                self._pending_start_until = None
+                if time.monotonic() <= pending:
+                    self.node.get_logger().info('Recorder is up -- starting the recording that was requested.')
+                    self._after(0.1, self.handle_start)
+            return
         if self.owns_launch_process:
-            self.resync(on_done=self._boot_sequence)
+            # record_bags:=true -- this launch started a recorder, so it
+            # being gone is a real problem.
+            self.node.get_logger().error(
+                'rosbag2 recorder unreachable (/rosbag2_recorder services not found) -- recording is not possible '
+                'until it comes back.' if first else
+                'RECORDER UNREACHABLE. Expect auto-respawn per launch file into a new segment. '
+                'Previously closed segments remain valid.')
         else:
-            self.resync()
+            self.node.get_logger().info(
+                'No rosbag2 recorder is running -- recording controls stay idle until one starts '
+                '(launch with record_bags:=true, or run `ros2 bag record`).')
 
     def _boot_sequence(self):
         self.handle_stop(on_done=self._maybe_auto_start)
@@ -269,11 +331,12 @@ class RosbagControl:
     # ---------- the single source of truth (two-signal check) ----------
 
     def resync(self, on_done=None):
-        """Determine real state via is_discovery_running, then is_paused. Never guess."""
-        if not self.is_discovery_client.wait_for_service(timeout_sec=SERVICE_WAIT_SEC):
+        """Determine real state via is_discovery_running, then is_paused.
+        Never guess, never block (see _after)."""
+        if not self.is_discovery_client.service_is_ready():
             self.recorder_alive = False
             self.state = UNKNOWN
-            self.node.get_logger().error('is_discovery_running service unreachable -- state UNKNOWN.')
+            self._note_reachable(False)
             if on_done:
                 on_done()
             return
@@ -284,6 +347,7 @@ class RosbagControl:
             try:
                 discovery_res = f.result()
                 self.recorder_alive = True
+                self._note_reachable(True)
             except Exception as e:
                 self.recorder_alive = False
                 self.state = UNKNOWN
@@ -298,7 +362,7 @@ class RosbagControl:
                 return
 
             # Session is open -- now check whether it's actively writing.
-            if not self.is_paused_client.wait_for_service(timeout_sec=SERVICE_WAIT_SEC):
+            if not self.is_paused_client.service_is_ready():
                 self.node.get_logger().error('is_paused unreachable while discovery is running -- state UNKNOWN.')
                 self._set_state(UNKNOWN, on_done)
                 return
@@ -332,10 +396,8 @@ class RosbagControl:
         starting recording only once the boot-session close is verified
         CLOSED, not merely requested).
         """
-        def _check():
-            timer.cancel()
-            self.resync(on_done=lambda: self._log_verify_result(expected_state, ok_msg, on_done))
-        timer = self.node.create_timer(POST_ACTION_VERIFY_DELAY_SEC, _check)
+        self._after(POST_ACTION_VERIFY_DELAY_SEC,
+                    lambda: self.resync(on_done=lambda: self._log_verify_result(expected_state, ok_msg, on_done)))
 
     def _log_verify_result(self, expected_state, ok_msg, on_done=None):
         if self.state == expected_state:
@@ -351,15 +413,10 @@ class RosbagControl:
     # ---------- watchdog / status ----------
 
     def watchdog_cb(self):
-        was_alive = self.recorder_alive
+        # Reachability changes are logged by _note_reachable, once each.
+        if self._busy:
+            return
         self.resync()
-        if was_alive and not self.recorder_alive:
-            self.node.get_logger().error(
-                'RECORDER UNREACHABLE. Expect auto-respawn per launch file into a new '
-                'segment. Previously closed segments remain valid.'
-            )
-        elif not was_alive and self.recorder_alive:
-            self.node.get_logger().info('Recorder reachable again.')
 
     def publish_status(self):
         s = String()
@@ -390,16 +447,17 @@ class RosbagControl:
 
     def handle_start(self):
         if self.state == UNKNOWN:
-            # Retries itself once resync() resolves a real state, rather
-            # than just bailing -- matters because start_recording() can
-            # legitimately be called (e.g. from XP_Database.__init__, via
-            # BlackboxOrchestrator) before the host node's executor has
-            # started spinning, i.e. before resync()'s own async service
-            # calls have had any chance to resolve. Bounded by real
-            # service-call/timeout delays each cycle (SERVICE_WAIT_SEC),
-            # not a tight loop.
-            self.node.get_logger().error('State unknown -- re-syncing before acting.')
-            self.resync(on_done=self.handle_start)
+            if not self.is_discovery_client.service_is_ready():
+                # No recorder to talk to. Used to re-call itself through
+                # resync straight away -- with a non-blocking check that
+                # would recurse without end. Instead the request is kept
+                # and fires once a recorder appears (see _note_reachable).
+                self._pending_start_until = time.monotonic() + PENDING_START_WINDOW_SEC
+                self.node.get_logger().warn(
+                    f'Recording requested, but no rosbag2 recorder is running -- it will start if one '
+                    f'appears within {PENDING_START_WINDOW_SEC:.0f}s.')
+                return
+            self.resync(on_done=lambda: None if self.state == UNKNOWN else self.handle_start())
             return
         if self.state == WRITING:
             self.node.get_logger().info('Already recording -- skipping start.')
@@ -453,54 +511,39 @@ class RosbagControl:
     # ---------- generic call helpers ----------
 
     def _call(self, client, request, name, on_ok, retries_left=MAX_RETRIES):
-        if not client.wait_for_service(timeout_sec=SERVICE_WAIT_SEC):
-            if retries_left > 0:
-                self.node.get_logger().warn(f'{name} service not ready, retrying ({retries_left} left)...')
-                self._call(client, request, name, on_ok, retries_left - 1)
-            else:
-                self.node.get_logger().error(f'{name} FAILED: service unreachable after retries.')
-                self.resync()
-            return
-
-        future = client.call_async(request)
-
-        def _done(f):
-            try:
-                f.result()
-                on_ok()
-            except Exception as e:
-                if retries_left > 0:
-                    self.node.get_logger().warn(f'{name} call failed ({e}), retrying ({retries_left} left)...')
-                    self._call(client, request, name, on_ok, retries_left - 1)
-                else:
-                    self.node.get_logger().error(f'{name} FAILED after retries: {e}')
-                    self.resync()
-
-        future.add_done_callback(_done)
+        self._call_checked(client, request, name, lambda _res: on_ok(), retries_left)
 
     def _call_checked(self, client, request, name, on_response, retries_left=MAX_RETRIES):
-        """Like _call, but hands the actual response (with return_code) to the caller."""
-        if not client.wait_for_service(timeout_sec=SERVICE_WAIT_SEC):
+        """Calls a recorder service and hands the response to on_response.
+        A service that isn't up yet is retried on a timer, SERVICE_WAIT_SEC
+        apart -- never waited for in place (see _after)."""
+        if not client.service_is_ready():
             if retries_left > 0:
                 self.node.get_logger().warn(f'{name} service not ready, retrying ({retries_left} left)...')
-                self._call_checked(client, request, name, on_response, retries_left - 1)
+                self._after(SERVICE_WAIT_SEC,
+                            lambda: self._call_checked(client, request, name, on_response, retries_left - 1))
             else:
+                self._busy = False
                 self.node.get_logger().error(f'{name} FAILED: service unreachable after retries.')
                 self.resync()
             return
 
+        self._busy = True
         future = client.call_async(request)
 
         def _done(f):
+            self._busy = False
             try:
                 res = f.result()
-                on_response(res)
             except Exception as e:
                 if retries_left > 0:
                     self.node.get_logger().warn(f'{name} call failed ({e}), retrying ({retries_left} left)...')
-                    self._call_checked(client, request, name, on_response, retries_left - 1)
+                    self._after(SERVICE_WAIT_SEC,
+                                lambda: self._call_checked(client, request, name, on_response, retries_left - 1))
                 else:
                     self.node.get_logger().error(f'{name} FAILED after retries: {e}')
                     self.resync()
+                return
+            on_response(res)
 
         future.add_done_callback(_done)

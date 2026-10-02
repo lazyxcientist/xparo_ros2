@@ -5,6 +5,7 @@ point of the port is that they don't know or care which transport is
 driving them; test_engine.py covers the dispatch wiring on top of this.
 """
 import base64
+import math
 import os
 import subprocess
 import time
@@ -88,10 +89,10 @@ def test_handle_teleop_pads_short_payload():
 def test_handle_teleop_does_not_truncate_longer_payload():
     joy_calls = []
     remote_ops.handle_teleop(
-        [1.0, 2.0, 3.0, 4.0, 5.0], [1, 0, 1, 1], lambda a, b: joy_calls.append((a, b)), lambda r: None,
+        [1.0, -1.0, 0.5, -0.5, 0.25], [1, 0, 1, 1], lambda a, b: joy_calls.append((a, b)), lambda r: None,
     )
     axes, buttons = joy_calls[0]
-    assert axes == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert axes == [1.0, -1.0, 0.5, -0.5, 0.25]
     assert buttons == [1, 0, 1, 1]
 
 
@@ -101,6 +102,49 @@ def test_handle_teleop_coerces_types():
     axes, buttons = joy_calls[0]
     assert axes[0] == 0.5 and isinstance(axes[0], float)
     assert buttons[0] == 1 and isinstance(buttons[0], int)
+
+
+# 2026-09-29 stress test finding F13 (MEDIUM): confirmed live -- a TELEOP
+# payload of {"axes": [Infinity, -Infinity, NaN, 99999999.9],
+# "buttons": [1,0,1]} was published straight to the real Joy topic with
+# zero validation. Downstream fin/thruster control expects a normalized
+# [-1.0, 1.0] axis; a NaN or huge value reaching an actuator is a hardware
+# safety issue.
+def test_handle_teleop_clamps_out_of_range_axes():
+    joy_calls = []
+    remote_ops.handle_teleop(
+        [99999999.9, -99999999.9, 1.5, -1.5], [], lambda a, b: joy_calls.append((a, b)), lambda r: None,
+    )
+    axes, _ = joy_calls[0]
+    assert axes == [1.0, -1.0, 1.0, -1.0]
+
+
+def test_handle_teleop_neutralizes_non_finite_axes():
+    joy_calls = []
+    remote_ops.handle_teleop(
+        [float("inf"), float("-inf"), float("nan"), 0.3],
+        [1, 0, 1], lambda a, b: joy_calls.append((a, b)), lambda r: None,
+    )
+    axes, _ = joy_calls[0]
+    assert axes == [0.0, 0.0, 0.0, 0.3]
+
+
+def test_handle_teleop_reproduces_the_exact_confirmed_exploit_payload():
+    """The exact payload confirmed live to reach the real Joy topic
+    unvalidated: {"axes": [Infinity, -Infinity, NaN, 99999999.9],
+    "buttons": [1,0,1]}."""
+    joy_calls = []
+    responses = []
+    remote_ops.handle_teleop(
+        [float("inf"), float("-inf"), float("nan"), 99999999.9],
+        [1, 0, 1], lambda a, b: joy_calls.append((a, b)), responses.append,
+    )
+    axes, buttons = joy_calls[0]
+    assert all(math.isfinite(a) for a in axes)
+    assert all(-1.0 <= a <= 1.0 for a in axes)
+    assert axes == [0.0, 0.0, 0.0, 1.0]
+    assert buttons == [1, 0, 1]
+    assert responses[0] == {"TELEOP_ACK": {"success": True}}  # still acked, not dropped
 
 
 # ------------------------------------------------------------------
@@ -216,6 +260,120 @@ def test_upload_filename_is_basenamed(tmp_path):
     session.handle_file_complete(lambda r: None)
     assert (tmp_path / "evil.bin").exists()
     assert not (tmp_path.parent.parent / "etc" / "evil.bin").exists()
+
+
+# 2026-09-28 stress test finding F7 (HIGH): confirmed live -- a FILE_REQ
+# declaring size=10 bytes, followed by 5 MiB of FILE_CHUNK data, was
+# written to disk in full with no limit at all, and FILE_COMPLETE reported
+# {"status": "ok", "expected": 10, "received": 5242880} instead of
+# rejecting the mismatch.
+def test_sending_far_more_than_the_declared_size_is_aborted_not_written_in_full(tmp_path):
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "small_claim.bin", "direction": "upload", "size": 10}, responses.append)
+
+    oversized_chunk = b"x" * (1024 * 1024)  # 1 MiB, way past the declared 10 bytes
+    session.handle_file_chunk({"data": base64.b64encode(oversized_chunk).decode()}, responses.append)
+
+    assert "error" in responses[-1]
+    assert "limit" in responses[-1]["error"]["message"]
+    # The partial/oversized write was discarded, not left on disk looking
+    # like a normal file.
+    assert not (tmp_path / "small_claim.bin").exists()
+    # The session is clean -- a FILE_COMPLETE after an abort is a no-op,
+    # not a crash or a stale "ok".
+    session.handle_file_complete(responses.append)
+    assert responses[-1]["error"]["message"].startswith("upload exceeded")  # unchanged since the abort
+
+
+def test_a_declared_size_over_the_hard_cap_is_refused_before_any_file_is_created(tmp_path):
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req(
+        {"filename": "huge.bin", "direction": "upload", "size": remote_ops.MAX_UPLOAD_SIZE_BYTES + 1},
+        responses.append,
+    )
+    assert "error" in responses[-1]
+    assert "too large" in responses[-1]["error"]["message"]
+    assert not (tmp_path / "huge.bin").exists()
+    assert session._current_upload is None  # never even started
+
+
+def test_uploading_more_than_the_hard_cap_is_aborted_even_with_no_declared_size(tmp_path):
+    """The declared `size` was confirmed live to be pure decoration -- this
+    covers the OTHER half: a sender that declares nothing (or 0) is still
+    bounded by the hard cap, not unlimited."""
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    session.handle_file_req({"filename": "undeclared.bin", "direction": "upload"}, lambda r: None)
+
+    chunk = b"y" * (1024 * 1024)
+    sent_total = 0
+    aborted_at = None
+    responses = []
+    # A real attacker would just keep sending; stop as soon as it aborts
+    # rather than actually writing 200+ MiB in a unit test.
+    while sent_total < remote_ops.MAX_UPLOAD_SIZE_BYTES + (2 * 1024 * 1024):
+        session.handle_file_chunk({"data": base64.b64encode(chunk).decode()}, responses.append)
+        sent_total += len(chunk)
+        if responses and "error" in responses[-1]:
+            aborted_at = sent_total
+            break
+    assert aborted_at is not None, "never aborted -- the hard cap did nothing"
+    assert not (tmp_path / "undeclared.bin").exists()
+
+
+def test_a_size_mismatch_on_complete_is_reported_as_an_error_and_the_file_is_discarded(tmp_path):
+    """Even when the total stays under every cap, FILE_COMPLETE must not
+    silently say "ok" for a transfer that doesn't match what it promised
+    -- a truncated or short transfer is exactly as much a lie as an
+    oversized one."""
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "short.bin", "direction": "upload", "size": 100}, responses.append)
+    session.handle_file_chunk({"data": base64.b64encode(b"only ten!!").decode()}, responses.append)  # 10, not 100
+    session.handle_file_complete(responses.append)
+
+    result = responses[-1]["FILE_COMPLETE"]
+    assert result["status"] == "error"
+    assert result["expected"] == 100
+    assert result["received"] == 10
+    assert not (tmp_path / "short.bin").exists()
+
+
+def test_a_matching_transfer_still_reports_ok_exactly_as_before(tmp_path):
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "exact.bin", "direction": "upload", "size": 5}, responses.append)
+    session.handle_file_chunk({"data": base64.b64encode(b"exact").decode()}, responses.append)
+    session.handle_file_complete(responses.append)
+
+    assert responses[-1] == {"FILE_COMPLETE": {"status": "ok", "expected": 5, "received": 5}}
+    assert (tmp_path / "exact.bin").read_bytes() == b"exact"
+
+
+def test_no_declared_size_at_all_is_not_treated_as_a_mismatch(tmp_path):
+    """expected_size == 0 means "nothing to check against" (not every real
+    caller sets it) -- must not be misread as "received 0 bytes was
+    expected" and falsely flagged as a mismatch."""
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "no_size_given.bin", "direction": "upload"}, responses.append)
+    session.handle_file_chunk({"data": base64.b64encode(b"some data").decode()}, responses.append)
+    session.handle_file_complete(responses.append)
+
+    assert responses[-1]["FILE_COMPLETE"]["status"] == "ok"
+    assert (tmp_path / "no_size_given.bin").exists()
+
+
+def test_malformed_chunk_data_aborts_and_reports_an_error_instead_of_silently_vanishing(tmp_path):
+    session = remote_ops.FileTransferSession(str(tmp_path))
+    responses = []
+    session.handle_file_req({"filename": "bad_b64.bin", "direction": "upload", "size": 5}, responses.append)
+    session.handle_file_chunk({"data": "not valid base64!!!"}, responses.append)
+
+    assert "error" in responses[-1]
+    assert session._current_upload is None
+    assert not (tmp_path / "bad_b64.bin").exists()
 
 
 def test_download_round_trip(tmp_path):

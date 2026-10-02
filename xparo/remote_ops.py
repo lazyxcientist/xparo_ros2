@@ -11,6 +11,7 @@ see transports/base.py) without caring which one delivered the message --
 that's the actual point of Phase 2's Transport abstraction.
 """
 import base64
+import math
 import os
 import shutil
 import subprocess
@@ -409,7 +410,24 @@ def handle_teleop(axes, buttons, joy_publish, send_response):
     needs an actual ROS2 node context this module deliberately doesn't
     depend on.
     """
-    axes = [float(a) for a in (axes or [])]
+    # Finding F13 (confirmed live): a payload like {"axes": [Infinity,
+    # -Infinity, NaN, 99999999.9], "buttons": [1,0,1]} was published to the
+    # real Joy topic completely unvalidated -- fin/thruster control code
+    # downstream expects a normalized [-1.0, 1.0] joystick axis, and a NaN
+    # or a huge out-of-range value reaching an actuator is a real hardware
+    # safety issue, not just a data-quality one. Non-finite values are
+    # neutralized to 0.0 (a stick that can't be trusted is treated as
+    # centered, not passed through), and everything else is clamped.
+    def _sanitize_axis(a):
+        try:
+            a = float(a)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(a):
+            return 0.0
+        return max(-1.0, min(1.0, a))
+
+    axes = [_sanitize_axis(a) for a in (axes or [])]
     buttons = [int(bool(b)) for b in (buttons or [])]
     if len(axes) < MIN_JOY_AXES:
         axes += [0.0] * (MIN_JOY_AXES - len(axes))
@@ -503,6 +521,22 @@ def handle_delete_file(base_dir, rel_path, send_response):
 # ----------------------------------------------------------------------
 FILE_CHUNK_SIZE = 65536
 
+# 2026-09-28 stress test finding F7 (HIGH): confirmed live -- a FILE_REQ
+# declaring size=10 bytes, followed by 5 MiB of FILE_CHUNK data, was
+# written to disk in full with no limit at all, and FILE_COMPLETE reported
+# {"status": "ok", "expected": 10, "received": 5242880} instead of
+# rejecting the mismatch. Reachable by any Editor-role project member (the
+# same bar as normal task editing) via FILE_REQ/FILE_CHUNK/FILE_COMPLETE,
+# which Manage_Dash.py relays to the targeted robot -- an unbounded
+# disk-fill DoS, and every transfer (truncated, corrupted, or wildly
+# oversized) used to be reported as a success, so nothing could ever tell
+# a good upload from a bad one. This is a JSON/base64-chunked control-
+# channel transfer (config/log files, custom node sources -- see this
+# class's own docstring), never meant to carry bulk data; 200 MiB is
+# generous headroom above any real use case in this repo while still
+# bounding the damage a single upload can do.
+MAX_UPLOAD_SIZE_BYTES = 200 * 1024 * 1024
+
 
 class FileTransferSession:
     """One long-lived instance per Engine (not per-message) -- only one
@@ -528,7 +562,19 @@ class FileTransferSession:
                 # overwrite _current_upload -- that would leak the old
                 # file handle. Close it out first, same as _abort_upload.
                 self._abort_upload()
-                size = req.get("size", 0)
+                try:
+                    size = int(req.get("size", 0) or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                # A declared size over the cap is refused outright, before
+                # any file is even opened -- the sender is telling us
+                # upfront this transfer is too big (finding F7).
+                if size > MAX_UPLOAD_SIZE_BYTES:
+                    send_response({"error": {
+                        "message": f"file too large: declared {size} bytes, "
+                                   f"the limit is {MAX_UPLOAD_SIZE_BYTES} bytes",
+                    }})
+                    return
                 dest_path = self.base_dir / filename
                 try:
                     f = open(dest_path, "wb")
@@ -585,26 +631,114 @@ class FileTransferSession:
         except Exception as e:
             send_response({"error": {"message": str(e)}})
 
-    def handle_file_chunk(self, chunk_payload):
+    def handle_file_chunk(self, chunk_payload, send_response=None):
+        """send_response is optional (defaults to a no-op) purely so every
+        pre-existing caller/test that never cared about a reply keeps
+        working unchanged -- engine.py's own dispatch always passes the
+        real one now, which is what actually delivers the error below.
+        """
         if not self._current_upload:
             return
+        respond = send_response or (lambda payload: None)
         try:
             data = base64.b64decode(chunk_payload.get("data", ""))
-            self._current_upload["file"].write(data)
-            self._current_upload["received"] += len(data)
         except Exception:
-            self._abort_upload()
+            self._abort_upload(delete_partial=True)
+            respond({"error": {"message": "malformed FILE_CHUNK data, upload aborted"}})
+            return
+        # The cap that actually matters (finding F7): received bytes are
+        # checked against it on EVERY chunk, independent of whatever the
+        # sender originally declared as `size` in FILE_REQ (that alone was
+        # confirmed live to be pure decoration -- a declared size of 10
+        # bytes did nothing to stop 5 MiB of chunks from being written in
+        # full). A declared expected_size, if smaller than the hard cap,
+        # tightens the limit further -- a transfer must not exceed what it
+        # said it would send either.
+        limit = MAX_UPLOAD_SIZE_BYTES
+        expected = self._current_upload["expected_size"]
+        if expected > 0:
+            limit = min(limit, expected)
+        if self._current_upload["received"] + len(data) > limit:
+            over_by = self._current_upload["received"] + len(data) - limit
+            self._abort_upload(delete_partial=True)
+            respond({"error": {
+                "message": f"upload exceeded its size limit by {over_by} bytes -- aborted, nothing was kept",
+            }})
+            return
+        try:
+            self._current_upload["file"].write(data)
+        except Exception as e:
+            self._abort_upload(delete_partial=True)
+            respond({"error": {"message": f"couldn't write upload: {e}"}})
+            return
+        self._current_upload["received"] += len(data)
 
     def handle_file_complete(self, send_response):
         if not self._current_upload:
             return
         expected = self._current_upload["expected_size"]
         received = self._current_upload["received"]
+        path = Path(self._current_upload["file"].name)
         self._current_upload["file"].close()
         self._current_upload = None
+        # Finding F7's other half: FILE_COMPLETE used to unconditionally
+        # report "ok" even when received didn't match what was declared --
+        # confirmed live as {"status": "ok", "expected": 10,
+        # "received": 5242880}, so the dashboard could never actually tell
+        # a good upload from a truncated/corrupted/oversized one. A
+        # declared expected_size of 0 (or missing) has nothing to check
+        # against -- not every real caller sets it -- so that case is left
+        # as "ok" purely on having reached FILE_COMPLETE at all.
+        if expected > 0 and received != expected:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            send_response({"FILE_COMPLETE": {
+                "status": "error", "expected": expected, "received": received,
+                "message": f"size mismatch: expected {expected} bytes, received {received} -- upload discarded",
+            }})
+            return
         send_response({"FILE_COMPLETE": {"status": "ok", "expected": expected, "received": received}})
 
-    def _abort_upload(self):
+    def _abort_upload(self, delete_partial=False):
         if self._current_upload:
+            path = Path(self._current_upload["file"].name)
             self._current_upload["file"].close()
             self._current_upload = None
+            if delete_partial:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+# ----------------------------------------------------------------------
+# Shared path-traversal guard
+# ----------------------------------------------------------------------
+def safe_path_in(base_dir, name):
+    """Resolves `name` (untrusted -- a filename or tree/env name chosen by
+    a project member, arriving over the wire) against base_dir, and
+    returns the resulting Path only if it stays inside base_dir; returns
+    None otherwise. Same resolve()+startswith(base+sep) guard already used
+    correctly by handle_delete_file/handle_file_req above (a bare
+    startswith(base) wrongly accepts a sibling directory that merely
+    shares base's string as a prefix).
+
+    Confirmed live (2026-09-28 stress test) that without a check like this
+    at the point of writing, engine.py's custom_aiml/custom_maps/
+    custom_Sets sync (`os.path.join(dir, name + ext)`, no containment
+    check at all) writes a synced name of "../../etc/whatever" straight
+    through to that traversed location, past the package root, with fully
+    attacker-controlled content. Django's own validate_custom_file_name
+    (apps/analytics/models.py, outer repo) now rejects such a name before
+    it's ever saved/relayed -- but a robot must not depend on that alone:
+    a different or older server, or any other future sender of these same
+    sync keys, might not enforce it. This is the robot's own last line of
+    defense, independent of what sent the message.
+    """
+    base = Path(base_dir).resolve()
+    target = (base / name).resolve()
+    if target != base and not str(target).startswith(str(base) + os.sep):
+        return None
+    return target

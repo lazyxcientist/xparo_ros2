@@ -46,10 +46,19 @@ class CountingParallel(py_trees.composites.Parallel):
         successes = sum(1 for c in self.children if c.status == common.Status.SUCCESS)
         failures = sum(1 for c in self.children if c.status == common.Status.FAILURE)
 
+        still_running = len(self.children) - successes - failures
         if failures >= self.failure_count:
             new_status = common.Status.FAILURE
         elif successes >= self.success_count:
             new_status = common.Status.SUCCESS
+        elif successes + still_running < self.success_count:
+            # BT.CPP: once enough children have finished that success_count
+            # can no longer be reached, the Parallel fails. Without this,
+            # e.g. one SUCCESS + one FAILURE with both counts at "all"
+            # stayed RUNNING forever (every child frozen, nothing to wait on).
+            self.feedback_message = (f"{successes} succeeded, {failures} failed: success_count="
+                                     f"{self.success_count} can no longer be reached")
+            new_status = common.Status.FAILURE
         else:
             new_status = common.Status.RUNNING
 

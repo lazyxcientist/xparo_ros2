@@ -251,12 +251,52 @@ class TestRunTaskOnWsMessageRoundTrip:
         assert task_result["task_id"] == "abc-123"
         assert task_result["success"] is True
 
-    def test_no_bt_executor_attached_is_a_safe_noop(self):
-        """Matches TELEOP's own posture for a live-node-less Engine (its
-        default joy_publish is a no-op) -- RUN_TASK must not raise just
-        because this Engine isn't owned by a real Xparo node (every test
-        in this repo, and any standalone use -- see this file's own
-        __main__ block)."""
+    def test_live_updates_carry_the_runs_run_id(self):
+        """Finding F8 (MEDIUM): confirmed live -- ADD_live_update_bt used to
+        omit run_id entirely, so two tasks running concurrently produced
+        indistinguishable live node-status updates on the wire; the
+        dashboard's live canvas had no way to tell them apart. Every
+        ADD_live_update_bt sent during a real RUN_TASK dispatch must carry
+        the same run_id as that run's own TASK_RESULT.
+        """
+        engine = _make_engine(xparo_stage="development")
+        sent = []
+        engine.transport.send = lambda message, command_for=None: sent.append(message)
+        engine.bt_executor = BehaviorTreeExecutor(node=MagicMock(), engine=engine)
+
+        engine.on_ws_message('ws', {"RUN_TASK": {
+            "task_id": "abc-live",
+            "tree_xml": "<LoadNextDelivery />",
+            "blackboard": {},
+            "save_task_history": False,
+        }})
+
+        task_result = None
+        live_updates = []
+        for _ in range(50):
+            live_updates = []
+            for raw in sent:
+                parsed = json.loads(raw)
+                if "TASK_RESULT" in parsed:
+                    task_result = parsed["TASK_RESULT"]
+                if "ADD_live_update_bt" in parsed:
+                    live_updates.append(parsed["ADD_live_update_bt"])
+            if task_result:
+                break
+            time.sleep(0.05)
+
+        assert task_result is not None, f"TASK_RESULT never arrived; sent={sent}"
+        assert live_updates, "no live updates were sent during the run"
+        for update in live_updates:
+            assert update["run_id"] == task_result["run_id"]
+
+    def test_no_bt_executor_attached_reports_a_clear_non_retryable_failure(self):
+        """RUN_TASK must not raise just because this Engine isn't owned by
+        a real Xparo node (every test in this repo, and any standalone
+        use). It used to be dropped silently, which left the dashboard's
+        "Run now" waiting until its own timeout with no explanation; now
+        the robot says why, and marks it not retryable so
+        restart_on_failure doesn't re-dispatch it in a loop."""
         engine = _make_engine()
         sent = []
         engine.transport.send = lambda message, command_for=None: sent.append(message)
@@ -264,5 +304,10 @@ class TestRunTaskOnWsMessageRoundTrip:
 
         engine.on_ws_message('ws', {"RUN_TASK": {"task_id": "x", "tree_xml": "<LoadNextDelivery />"}})
 
-        time.sleep(0.1)
-        assert sent == []
+        results = [json.loads(m)["TASK_RESULT"] for m in sent if "TASK_RESULT" in json.loads(m)]
+        assert len(results) == 1
+        assert results[0]["task_id"] == "x"
+        assert results[0]["success"] is False
+        assert results[0]["outcome"] == "no_executor"
+        assert results[0]["retryable"] is False
+        assert "ROS 2" in results[0]["error"]

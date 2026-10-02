@@ -8,6 +8,7 @@ from datetime import datetime
 from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
+from . import connectivity
 from .bt_engine import run_task
 from .bt_engine import plugin_loader
 from .bt_engine import runners
@@ -21,6 +22,12 @@ xparo_database_size =  80
 # robot flips to "offline" there.
 HEARTBEAT_INTERVAL_SECONDS = 30
 
+# Health & Errors popup: problems go to the dashboard in batches this far
+# apart (xparo_ros.py's timer), and a "Watch live" request lasts this long
+# unless the popup renews it.
+HEALTH_FLUSH_SEC = 2.0
+HEALTH_WATCH_SEC = 600.0
+
 # Status mapping
 STATUS_MAP = {
     "IDLE": 0,
@@ -31,10 +38,32 @@ STATUS_MAP = {
 }
 
 
+NO_EXECUTOR_ERROR = (
+    "This robot's XPARO process is running without its ROS 2 node, so it can't run behaviour trees. "
+    "Start XPARO on the robot with its ROS 2 launch file (ros2 launch xparo xparo_launch.py)."
+)
+
+
 class Engine():
     def __init__(self,secret_key,project_id,connection_type = "websocket",record_bags=record_bags,BAG_DIR=None,environment=None,rosbag_control=None,joy_publish=None,xparo_transport="django_ws",tethered_channels_config=None,xparo_stage="production"):
         global xparo_database_size
-        self.tmp_folder = "."
+        self.xparo_folder = os.path.abspath(os.path.join( os.path.dirname(__file__), os.pardir))
+        # Finding F2 (MEDIUM): tmp_folder used to be the bare relative path
+        # "." -- xparo_database_path (log_pointers.json, the send_later
+        # outbox) and BAG_DIR ended up wherever the process happened to be
+        # launched from (systemd's default "/", a different cwd from a
+        # manual terminal run vs. a ros2 launch, etc). Depending on the
+        # LAUNCHING SHELL'S cwd for where persistent robot state lives means
+        # the same robot can silently start reading/writing a completely
+        # different log_pointers.json / send_later.json / bag directory on
+        # its next restart -- confirmed live by starting the same Engine
+        # from two different working directories and observing two disjoint
+        # "./xparo/<project_id>/" trees. self.xparo_folder (the installed
+        # package's own location, already used below for every other
+        # per-robot data path -- transfer_dir, custom_behaviors, etc) is
+        # absolute and independent of the caller's cwd, so it's used here
+        # too instead of a fresh ad-hoc relative base.
+        self.tmp_folder = self.xparo_folder
         xparo_database_path = os.path.join(self.tmp_folder,"xparo",project_id,'database')
         # BAG_DIR must arrive through the constructor, same reasoning as
         # record_bags just below -- XP_Database (and, if recording, the
@@ -42,7 +71,6 @@ class Engine():
         # so a caller setting self.BAG_DIR afterward (as xparo_ros.py used
         # to) has no effect on where bags actually get written.
         self.BAG_DIR = BAG_DIR or os.path.join(self.tmp_folder,"xparo",project_id,'ros_bags')
-        self.xparo_folder = os.path.abspath(os.path.join( os.path.dirname(__file__), os.pardir))
         self.connection_type = connection_type #"websocket" # "rest" , "websocket" , "hybrid" , "offline"
         # joy_publish(axes, buttons) -> None -- publishing a real
         # sensor_msgs/Joy message needs an actual ROS2 node context, which
@@ -60,6 +88,10 @@ class Engine():
         # than an AttributeError, for Engine's standalone-outside-ROS2 use
         # (see this file's own __main__ block) and every test in this repo.
         self.bt_executor = None
+        # ads.AdManager -- set up by setup_ads() (xparo_ros.py calls it
+        # with the xparo_ads_display launch argument). None = this robot
+        # shows no ads, and ads_schedule messages are ignored.
+        self.ad_manager = None
         # Phase 13 -- XML tags sync_bt_inline_nodes most recently
         # registered, so a resync can unregister exactly those before
         # re-registering the current file set (load_plugins/register_plugins
@@ -77,10 +109,30 @@ class Engine():
         self.transfer_dir = os.path.join(self.xparo_folder, 'transferred_files')
         self.file_transfer = remote_ops.FileTransferSession(self.transfer_dir)
 
+        # 2026-09-28 stress test finding F5 (HIGH): a task's own TASK_RESULT
+        # and its ADD_Task_history_database record used to be one-shot,
+        # fire-and-forget sends -- if the connection happened to be down
+        # right when a task finished (confirmed live: kill the server while
+        # a task is mid-run, bring it back), both were simply lost forever,
+        # with no retry on reconnect. Queued here instead, flushed on every
+        # successful (re)connection (send_initial_data, called via
+        # on_connected) -- see _send_important_dict/_flush_pending_important_sends.
+        self._pending_important_sends = []
+        self._pending_important_sends_lock = threading.Lock()
+
         # GET_LIVE_STATUS's uptime field -- when this Engine (this robot's
         # connection/process) itself started, not any Django-tracked
         # logging session.
         self._engine_started_at = time.time()
+        # Health & Errors / task feedback state -- see flush_health,
+        # self_health_statuses and _task_started/_task_finished.
+        self._health_watch_until = 0.0
+        self._health_full_report_due = True
+        self._running_task_info = {}
+        self._last_task_outcome = None
+        # on_task_event(kind, info), kind "started"|"finished" -- set by
+        # xparo_ros.py to log and publish /xparo/task_result.
+        self.on_task_event = None
 
         self.xparo_behavior_path = os.path.join(self.xparo_folder,'config','default.xml')
         self.xparo_file_path = os.path.join(self.xparo_folder,'config','default.txt')
@@ -203,7 +255,16 @@ class Engine():
 
     def _persist_credential(self, raw_value):
         os.makedirs(os.path.dirname(self.xparo_credential_path), exist_ok=True)
-        with open(self.xparo_credential_path, 'w') as file:
+        # Finding F3 (LOW): this is the robot's live auth secret for the
+        # Django server -- written with default open() permissions
+        # (confirmed live: 0644, readable by any local user on the
+        # machine), rather than restricted to the owner like an SSH key or
+        # any other on-disk credential. os.open with mode=0o600 sets that
+        # from the moment the file is created (no window where a default-
+        # permission file briefly exists), and the umask can only narrow
+        # it further, never widen it.
+        fd = os.open(self.xparo_credential_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as file:
             json.dump({'value': raw_value, 'project_id': self.project_id}, file)
 
     def _fall_back_to_raw_secret(self):
@@ -273,16 +334,106 @@ class Engine():
             "diagnostics_level": diagnostics_level,
         }}
 
+    def _get_problem_tracker(self):
+        """health.ProblemTracker owned by the Xparo node (fed by /rosout
+        and /diagnostics) -- same lookup/reasoning as _get_rosbag_control
+        just below."""
+        if self.bt_executor is None:
+            return None
+        return getattr(self.bt_executor.node, 'problem_tracker', None)
+
+    def flush_health(self):
+        """Called every HEALTH_FLUSH_SEC by xparo_ros.py. Sends problems
+        that are new or recurred since the last flush as one batch (Django
+        adds count_delta to the stored count), and the live component
+        board while someone watches. Nothing is sent while the connection
+        is down: the tracker keeps counting and everything goes out on the
+        first flush after reconnecting."""
+        tracker = self._get_problem_tracker()
+        if tracker is None:
+            return
+        if self.connection_type in ("websocket", "hybrid") and not getattr(self.transport, 'websocket_connected', True) \
+                and not getattr(self.transport, 'rest_fallback_active', False):
+            return
+        aggregator = self._get_diagnostics_aggregator()
+        if aggregator is not None:
+            aggregator.check_stale()
+        full = self._health_full_report_due
+        changes = tracker.flush(full=full)
+        if changes or full:
+            self._health_full_report_due = False
+            self._send_dict({"PROBLEMS_REPORT": {
+                "device_id": self.local_database.unique_id,
+                # First report after each (re)connect: the complete set of
+                # what's active now -- everything else is resolved.
+                "full": full,
+                "entries": [{
+                    "source": c["source"], "name": c["name"], "level": c["level"], "message": c["message"],
+                    "count_delta": c["count_delta"], "active": c["active"], "hardware_id": c["hardware_id"],
+                } for c in changes],
+            }})
+        if aggregator is not None and time.monotonic() < self._health_watch_until:
+            self._send_dict({"DIAGNOSTICS_SNAPSHOT": aggregator.snapshot()})
+
+    def self_health_statuses(self):
+        """xparo's own statuses ([(name, level, message)]) -- published on
+        /diagnostics by xparo_ros.py every second, and recorded straight
+        into the aggregator by _refresh_self_diagnostics when there's no
+        live node publishing them."""
+        from . import health
+        rosbag_control = self._get_rosbag_control()
+        rosbag = None if rosbag_control is None else {
+            "alive": rosbag_control.recorder_alive, "state": rosbag_control.state,
+            "owns_launch_process": getattr(rosbag_control, 'owns_launch_process', True),
+        }
+        try:
+            disk_percent = psutil.disk_usage('/').percent
+        except OSError:
+            disk_percent = None
+        mode = "tethered_tcp" if self.transport.__class__.__name__ == "TetheredTcpTransport" else self.connection_type
+        connected = bool(getattr(self.transport, 'websocket_connected', True)) or \
+            bool(getattr(self.transport, 'rest_fallback_active', False)) or mode == "rest"
+        running = [info.get("task_title") or info.get("task_id") or "task" for info in self._running_task_info.values()]
+        return health.self_statuses(
+            {"mode": mode, "connected": connected}, rosbag,
+            {"running": running, "last": self._last_task_outcome}, disk_percent,
+        )
+
+    # ---- task events: dashboard + ROS feedback ----------------------------
+    def _task_started(self, payload):
+        """on_started for run_task.handle_run_task."""
+        info = payload.get("TASK_STARTED") or {}
+        self._running_task_info[info.get("run_id")] = info
+        self._send_dict(payload)
+        self._emit_task_event("started", info)
+
+    def _task_finished(self, payload):
+        """send_response for run_task.handle_run_task: the final result
+        must survive a connection outage (finding F5), so it's queued."""
+        info = payload.get("TASK_RESULT") or {}
+        started = self._running_task_info.pop(info.get("run_id"), {})
+        title = info.get("task_title") or started.get("task_title") or info.get("task_id") or "task"
+        self._last_task_outcome = {
+            "title": title, "success": bool(info.get("success")),
+            "explanation": info.get("explanation") or info.get("error") or "",
+        }
+        self._send_important_dict(payload)
+        self._emit_task_event("finished", info)
+
+    def _emit_task_event(self, kind, info):
+        """Tells whoever runs this Engine (xparo_ros.py: ROS log +
+        /xparo/task_result) -- before this, a task started from
+        /xparo/run_task printed nothing at all on the robot, so from the
+        ROS side it looked like it never ran."""
+        callback = self.on_task_event
+        if callback is None:
+            return
+        try:
+            callback(kind, info)
+        except Exception as e:
+            print(f"[task] event hook failed: {e}")
+
     def _get_rosout_watcher(self):
-        """Same lookup/reasoning as _get_rosbag_control just below --
-        RosoutWatcher (rosout_watcher.py) replaced the old rosout.log
-        file-tailer entirely: confirmed live against this repo's own
-        ~/.ros/log/ history that rosout.log never actually exists in this
-        ROS2 Jazzy setup (only launch.log does, and that's just the
-        launch orchestrator's own messages) -- the file-tailer was
-        watching a file that could never appear. /rosout is the real,
-        always-published topic every node's logger writes to regardless
-        of file-logging config."""
         if self.bt_executor is None:
             return None
         return getattr(self.bt_executor.node, 'rosout_watcher', None)
@@ -313,17 +464,13 @@ class Engine():
         aggregator = self._get_diagnostics_aggregator()
         if aggregator is None:
             return
-        rosbag_control = self._get_rosbag_control()
-        if rosbag_control is not None:
-            level = 'ok' if rosbag_control.recorder_alive else 'error'
-            aggregator.record_self_status('xparo.rosbag_recorder', level, f"state={rosbag_control.state}")
-        try:
-            disk_percent = psutil.disk_usage('/').percent
-        except OSError:
-            disk_percent = None
-        if disk_percent is not None:
-            level = 'error' if disk_percent >= 95 else ('warn' if disk_percent >= 85 else 'ok')
-            aggregator.record_self_status('xparo.disk_usage', level, f"{disk_percent:.1f}% used")
+        # A missing rosbag recorder used to be recorded as 'error' even
+        # when recording was simply off (record_bags:=false, the default),
+        # so every such robot showed an overall "error" level on the fleet
+        # page -- health.self_statuses only calls it an error when this
+        # launch started a recorder itself.
+        for name, level, message in self.self_health_statuses():
+            aggregator.record_self_status(name, level, message)
 
     #########################################################################################
     def connect(self):
@@ -339,6 +486,69 @@ class Engine():
         """
         self.private_send(json.dumps(payload))
 
+    def _xparo_server_reachable(self):
+        """WIFI_CONNECT's auto-revert check: can this robot reach the XPARO
+        server over whatever network it's on now? A fresh HTTP request,
+        not the websocket's state -- right after a network switch the old
+        socket can still look connected while being dead."""
+        base_url = getattr(self.transport, 'website_base_url', None)
+        if not base_url:
+            return True  # tethered_tcp: no server to reach, nothing to revert for
+        return connectivity.http_reachable(base_url + '/')
+
+    def _on_network_changed(self):
+        reconnect = getattr(self.transport, 'force_reconnect', None)
+        if reconnect is not None:
+            reconnect()
+
+    def _try_send_dict(self, payload):
+        """Like _send_dict, but reports whether the send is likely to have
+        actually gone anywhere -- used by _send_important_dict/
+        _flush_pending_important_sends below to decide what to retry.
+        websocket-client's own send() can raise outright on a KNOWN-dead
+        socket (the common case, confirmed live as a "Broken pipe"), but a
+        connection that's died without the client noticing yet may accept
+        the write locally without it ever arriving -- transport.
+        websocket_connected (see transports/django_ws.py's own docstring
+        on exactly this) is the best signal already available in this
+        codebase for "does this transport currently believe it's live",
+        checked in addition to catching a raised exception, not instead of.
+        """
+        try:
+            self.private_send(json.dumps(payload))
+            return bool(getattr(self.transport, 'websocket_connected', True))
+        except Exception as e:
+            print(f"[Engine] send failed, queued for retry on reconnect: {e}")
+            return False
+
+    def _send_important_dict(self, payload):
+        """For a message that must not be silently lost if the connection
+        is down right now -- a task's final TASK_RESULT, primarily (see
+        run_task.py's own use of this via the send_response callback
+        engine.py wires up for RUN_TASK). Queues for retry instead of just
+        failing once; _flush_pending_important_sends actually retries them,
+        called on every successful (re)connection.
+        """
+        if self._try_send_dict(payload):
+            return
+        with self._pending_important_sends_lock:
+            self._pending_important_sends.append(payload)
+
+    def _flush_pending_important_sends(self):
+        """Called once a connection is confirmed usable again
+        (send_initial_data, via on_connected) -- retries everything queued
+        by _send_important_dict/add_task_history while the connection was
+        down. Whatever still can't be sent (a reconnect that itself drops
+        again immediately) stays queued for the NEXT successful connect,
+        in original order, rather than being dropped.
+        """
+        with self._pending_important_sends_lock:
+            pending, self._pending_important_sends = self._pending_important_sends, []
+        still_pending = [p for p in pending if not self._try_send_dict(p)]
+        if still_pending:
+            with self._pending_important_sends_lock:
+                self._pending_important_sends = still_pending + self._pending_important_sends
+
     def send(self,message,remote_name="default"):
         filtered_data = json.dumps({"ask_bot_api":{"unique_id":self.local_database.unique_id, "data":{"from robot":"testing one.."},"question":message}})
         self.private_send(filtered_data,
@@ -346,19 +556,35 @@ class Engine():
                           )
 
     def add_task_history(self,message):
-        filtered_data = json.dumps({"ADD_Task_history_database":{"unique_id":self.local_database.unique_id,
+        # 2026-09-28 stress test finding F5: a task history record is
+        # exactly the kind of thing that must not be silently lost if the
+        # connection happens to be down at the moment a task finishes --
+        # routed through _send_important_dict (queued + retried on the
+        # next reconnect) instead of a one-shot private_send, unlike
+        # add_live_update just below (a live nicety, fine to drop).
+        payload = {"ADD_Task_history_database":{"unique_id":self.local_database.unique_id,
                                                                 "input_data": message.get("input_data", {}),
                                                                 "output_data": message.get("output_data", {}),
                                                                 "type": message.get("type", "generic_task"),
                                                                 "created_at": message.get("created_at", datetime.now().isoformat())
-                                                                }})
-        self.private_send(filtered_data,
-                        #   command_for="rest"
-                          )
+                                                                }}
+        self._send_important_dict(payload)
 
     def add_live_update(self,message):
         filtered_data = json.dumps({"ADD_live_update_bt":{"unique_id":self.local_database.unique_id,
 
+                                                                # Finding F8 (MEDIUM): this filter used to drop
+                                                                # run_id entirely, so two tasks running at once
+                                                                # produced indistinguishable live node-status
+                                                                # updates on the wire -- the dashboard's live
+                                                                # canvas had no way to tell them apart.
+                                                                "run_id": message.get("run_id"),
+                                                                # Which task/tree this status belongs to, so the
+                                                                # Behaviour editor only lights up the tree that's
+                                                                # actually running (absent for Nav2's own log).
+                                                                "task_id": message.get("task_id"),
+                                                                "tree_name": message.get("tree_name"),
+                                                                "task_title": message.get("task_title"),
                                                                 "node_name": message.get("node_name", ""),
                                                                 "node_type": message.get("node_type", ""),
                                                                 "uid": message.get("uid", 0),
@@ -704,7 +930,16 @@ class Engine():
                 effective_manifest[name] = {**entry, 'language': language}
         manifest = effective_manifest
 
-        plugin_loader.unregister_tags(self._custom_node_file_tags)
+        # Registrations are built first and swapped in at the end; only
+        # tags that really went away are removed. This used to unregister
+        # EVERY custom node first and re-register them one by one --
+        # recompiling each C++ node in between, which takes seconds -- so
+        # a task arriving meanwhile (Run now right after the robot came
+        # online, an auto-launch task, anything after a reconnect) failed
+        # with "<greet_example_cpp> isn't a node this robot knows".
+        # Confirmed live on a real robot.
+        previous_tags = set(self._custom_node_file_tags)
+        pending = {}
         registered_tags = set()
 
         python_paths = [
@@ -724,7 +959,7 @@ class Engine():
                     sync_failures.append({"name": name, "language": "javascript", "reason": "no xml_tag configured"})
                     continue
                 output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
-                NODE_REGISTRY[xml_tag] = runners.make_javascript_node_factory(
+                pending[xml_tag] = runners.make_javascript_node_factory(
                     os.path.join(js_dir, name + '.js'), js_runtime_dir, output_keys,
                 )
                 registered_tags.add(xml_tag)
@@ -742,7 +977,7 @@ class Engine():
             def _bash_builder(nm, attrs, blackboard, children, ros_node, script_path=script_path):
                 return runners.BashProcessNode(nm, attrs, blackboard, script_path=script_path, ros_node=ros_node)
 
-            NODE_REGISTRY[xml_tag] = _bash_builder
+            pending[xml_tag] = _bash_builder
             registered_tags.add(xml_tag)
 
         cpp_entries = [(name, entry) for name, entry in manifest.items() if entry.get('language') == 'cpp']
@@ -765,9 +1000,11 @@ class Engine():
                 if executable_path is None:
                     sync_failures.append({"name": name, "language": "cpp", "reason": reason or "compile failed"})
                     continue
-                NODE_REGISTRY[xml_tag] = runners.make_cpp_node_factory(executable_path, output_keys)
+                pending[xml_tag] = runners.make_cpp_node_factory(executable_path, output_keys)
                 registered_tags.add(xml_tag)
 
+        NODE_REGISTRY.update(pending)
+        plugin_loader.unregister_tags(previous_tags - registered_tags)
         self._custom_node_file_tags = registered_tags
         print(f"[bt_engine] loaded custom node file tags: {sorted(registered_tags)}")
         return sync_failures
@@ -853,17 +1090,43 @@ class Engine():
         from .bt_engine import task_sync
         if self.bt_executor is None:
             print("[run_task_from_topic] no live bt_executor -- ignoring")
+            self._task_finished(run_task.result_message(task_id, None, "no_executor", NO_EXECUTOR_ERROR))
             return
         custom_tasks = task_sync.load_custom_tasks(self.files["xparo_custom_behaviors_folder_path"])
         val = task_sync.build_run_task_val(task_id, override_params, custom_tasks, self.files)
         if val is None:
             print(f"[run_task_from_topic] task_id {task_id!r} not in the local sync cache -- "
                   f"either it doesn't exist, or this robot hasn't synced since it was created")
+            self._task_finished(run_task.result_message(
+                task_id, None, "unknown_task",
+                f"Task {task_id!r} isn't in this robot's synced task list -- it doesn't exist, or the robot "
+                f"hasn't connected to the dashboard since the task was created.",
+                trigger="ros_topic",
+            ))
             return
+        self._start_task_thread(val)
+
+    def _start_task_thread(self, val):
+        """One thread per task run (RUN_COMMAND's pattern). SubTrees the
+        dispatch didn't include are read from this robot's synced trees.
+
+        send_response (-> TASK_RESULT) goes through _send_important_dict,
+        not the plain _send_dict on_started uses -- a task's FINAL result
+        must survive a connection outage that happens to line up with the
+        moment it finishes (2026-09-28 stress test finding F5, confirmed
+        live); "it started" is a live nicety only, not worth resurrecting
+        and delivering late/out of order after a long reconnect gap.
+        """
+        from .bt_engine import task_sync
         threading.Thread(
             target=run_task.handle_run_task,
-            args=(self.bt_executor, val, self._send_dict),
-            kwargs={"add_task_history": self.add_task_history, "xparo_stage": self.xparo_stage},
+            args=(self.bt_executor, val, self._task_finished),
+            kwargs={
+                "add_task_history": self.add_task_history,
+                "xparo_stage": self.xparo_stage,
+                "subtree_resolver": lambda name: task_sync.resolve_tree_xml(name, self.files),
+                "on_started": self._task_started,
+            },
             daemon=True,
         ).start()
 
@@ -967,7 +1230,21 @@ class Engine():
                 os.makedirs(custom_aiml_dir, exist_ok=True)
                 aiml_sync_state = self._read_sync_state(custom_aiml_dir)
                 for kk,vv in val.items():
-                    pth = os.path.join(custom_aiml_dir,kk+'.xml')
+                    # kk is a tree name a project member typed on the
+                    # dashboard -- Django validates it (apps/analytics/
+                    # models.py's validate_custom_file_name) before ever
+                    # saving/relaying it, but this robot doesn't trust that
+                    # alone: confirmed live that without this check, a name
+                    # like "../../etc/whatever" writes straight through to
+                    # that traversed path, past the package root, with
+                    # fully attacker-controlled content. Skip (not abort
+                    # the whole sync) so the rest of a legitimate batch
+                    # still lands.
+                    safe_pth = remote_ops.safe_path_in(custom_aiml_dir, kk + '.xml')
+                    if safe_pth is None:
+                        print(f"[custom_aiml sync] refusing unsafe tree name {kk!r} (path traversal attempt)")
+                        continue
+                    pth = str(safe_pth)
                     content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
 {vv}
@@ -995,7 +1272,13 @@ class Engine():
                 os.makedirs(custom_maps_dir, exist_ok=True)
                 maps_sync_state = self._read_sync_state(custom_maps_dir)
                 for kk,vv in val.items():
-                    pth = os.path.join(custom_maps_dir,kk+'.env')
+                    # Same guard as custom_aiml just above, same confirmed
+                    # bug it closes -- see that block's comment.
+                    safe_pth = remote_ops.safe_path_in(custom_maps_dir, kk + '.env')
+                    if safe_pth is None:
+                        print(f"[custom_maps sync] refusing unsafe env name {kk!r} (path traversal attempt)")
+                        continue
+                    pth = str(safe_pth)
                     content =  f'''{vv}'''
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
@@ -1007,7 +1290,14 @@ class Engine():
                 self._write_sync_state(custom_maps_dir, maps_sync_state)
             elif k=="custom_Sets" or k=="custom_sets":
                 for kk,vv in val.items():
-                    pth = os.path.join(self.files["xparo_custom_files_folder_path"],kk)
+                    # Unlike custom_aiml/custom_maps just above, kk here
+                    # has no forced extension at all -- full filename
+                    # control -- so the same guard matters even more.
+                    safe_pth = remote_ops.safe_path_in(self.files["xparo_custom_files_folder_path"], kk)
+                    if safe_pth is None:
+                        print(f"[custom_Sets sync] refusing unsafe file name {kk!r} (path traversal attempt)")
+                        continue
+                    pth = str(safe_pth)
                     content =  f'''{vv}'''
                     self.local_database.load_or_create_file(pth,content)
                     with open(pth, 'w') as file:
@@ -1035,6 +1325,15 @@ class Engine():
                 # docstring for what does/doesn't apply live vs. on next
                 # launch.
                 self.sync_rosbag_config(val)
+            elif k=="ads_schedule":
+                # Ads Center (apps/ads): the ads this robot's owner approved
+                # -- the reply to GET_ads_schedule, or pushed on any change.
+                if self.ad_manager is not None:
+                    self.ad_manager.update_schedule(val)
+            elif k=="ads_plays_ack":
+                # Which uploaded plays (ADS_PLAYS) the server stored.
+                if self.ad_manager is not None:
+                    self.ad_manager.on_ack(val)
             elif k=="custom_tasks":
                 # val is DataAnalysis._get_custom_tasks()'s shape
                 # ({task_id: {behaviour_tree_name, blackboard_mapping,
@@ -1119,7 +1418,9 @@ class Engine():
             elif k=="FILE_REQ":
                 self.file_transfer.handle_file_req(val, self._send_dict)
             elif k=="FILE_CHUNK":
-                self.file_transfer.handle_file_chunk(val)
+                # send_response lets a size-limit violation (finding F7)
+                # actually reach the sender instead of failing silently.
+                self.file_transfer.handle_file_chunk(val, self._send_dict)
             elif k=="FILE_COMPLETE":
                 self.file_transfer.handle_file_complete(self._send_dict)
             # ---- Fleet-management popups ported from the AUV GCS (see
@@ -1158,20 +1459,18 @@ class Engine():
                 action = {"START_ROSBAG": "start", "STOP_ROSBAG": "stop", "SAVE_ROSBAG": "save"}[k]
                 remote_ops.handle_rosbag_action(self._get_rosbag_control(), action, self._send_dict)
             elif k=="WATCH_ERROR_LOGS":
-                watcher = self._get_rosout_watcher()
-                if watcher is not None:
-                    watcher._live_push = lambda entry: self._send_dict({"ERROR_LOG_ENTRY": entry})
-                    watcher.watch_enabled = True
-                    # Show what's already been seen since boot immediately,
-                    # not just future events -- matches the old feature's
-                    # own "opening the popup shows something right away"
-                    # expectation.
-                    for entry in watcher.recent_entries():
-                        self._send_dict({"ERROR_LOG_ENTRY": entry})
+                # Health & Errors popup is open with "Watch live" on: push
+                # the component board every flush (see flush_health). Ends
+                # on UNWATCH, or by itself after HEALTH_WATCH_SEC in case
+                # the browser went away without saying so.
+                self._health_watch_until = time.monotonic() + HEALTH_WATCH_SEC
+                self._refresh_self_diagnostics()
+                aggregator = self._get_diagnostics_aggregator()
+                if aggregator is not None:
+                    self._send_dict({"DIAGNOSTICS_SNAPSHOT": aggregator.snapshot()})
+                self.flush_health()
             elif k=="UNWATCH_ERROR_LOGS":
-                watcher = self._get_rosout_watcher()
-                if watcher is not None:
-                    watcher.watch_enabled = False
+                self._health_watch_until = 0.0
             elif k=="GET_LIVE_STATUS":
                 threading.Thread(
                     target=remote_ops.handle_get_live_status,
@@ -1183,6 +1482,40 @@ class Engine():
                     ),
                     daemon=True,
                 ).start()
+            # ---- Wi-Fi / Bluetooth popups -- see connectivity.py. Each
+            # runs in its own thread: a rescan, a Bluetooth scan or a
+            # network switch all block for seconds.
+            elif k=="GET_WIFI_NETWORKS":
+                threading.Thread(
+                    target=connectivity.handle_get_wifi_networks,
+                    args=(bool((val or {}).get("rescan")), self._send_dict),
+                    daemon=True,
+                ).start()
+            elif k=="WIFI_CONNECT":
+                # The result is sent with _send_important_dict: switching
+                # networks can drop this very connection, and the result
+                # must still arrive once the robot is back.
+                threading.Thread(
+                    target=connectivity.handle_wifi_connect,
+                    args=(val, self._send_important_dict),
+                    kwargs={
+                        "is_server_reachable": self._xparo_server_reachable,
+                        "on_network_changed": self._on_network_changed,
+                    },
+                    daemon=True,
+                ).start()
+            elif k=="WIFI_FORGET":
+                threading.Thread(target=connectivity.handle_wifi_forget, args=(val, self._send_dict), daemon=True).start()
+            elif k=="WIFI_RADIO":
+                threading.Thread(target=connectivity.handle_wifi_radio, args=(val, self._send_dict), daemon=True).start()
+            elif k=="GET_BLUETOOTH_DEVICES":
+                threading.Thread(
+                    target=connectivity.handle_get_bluetooth_devices,
+                    args=(bool((val or {}).get("scan")), self._send_dict),
+                    daemon=True,
+                ).start()
+            elif k=="BLUETOOTH_ACTION":
+                threading.Thread(target=connectivity.handle_bluetooth_action, args=(val, self._send_dict), daemon=True).start()
             elif k=="GET_DIAGNOSTICS_SNAPSHOT":
                 self._refresh_self_diagnostics()
                 aggregator = self._get_diagnostics_aggregator()
@@ -1195,16 +1528,28 @@ class Engine():
                 }})
             elif k=="RUN_TASK":
                 # bt_executor is None when this Engine isn't owned by a
-                # live Xparo node (standalone use, or every test in this
-                # repo) -- same "safe no-op, no crash" posture TELEOP's
-                # default joy_publish already has for the same reason.
+                # live Xparo node (standalone use, or most tests in this
+                # repo). It used to drop the task silently, leaving the
+                # dashboard waiting; now it says why, and marks it as not
+                # worth retrying (restart_on_failure would just loop).
                 if self.bt_executor is not None:
-                    threading.Thread(
-                        target=run_task.handle_run_task,
-                        args=(self.bt_executor, val, self._send_dict),
-                        kwargs={"add_task_history": self.add_task_history, "xparo_stage": self.xparo_stage},
-                        daemon=True,
-                    ).start()
+                    self._start_task_thread(val)
+                else:
+                    self._task_finished(run_task.result_message(
+                        (val or {}).get("task_id"), (val or {}).get("run_id"), "no_executor", NO_EXECUTOR_ERROR,
+                    ))
+            elif k=="CANCEL_TASK":
+                val = val or {}
+                cancelled = run_task.cancel_task(
+                    task_id=val.get("task_id"), run_id=val.get("run_id"),
+                    reason=val.get("reason") or "cancelled from the dashboard",
+                )
+                self._send_dict({"TASK_CANCEL_ACK": {
+                    "task_id": val.get("task_id"), "run_ids": cancelled, "found": bool(cancelled),
+                    "message": ("Stopping..." if cancelled else "That task isn't running on this robot."),
+                }})
+            elif k=="GET_RUNNING_TASKS":
+                self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
             else:
                 self.call_message(message)
 
@@ -1644,6 +1989,30 @@ class Engine():
     def send_initial_data(self):
         # self.private_send(json.dumps({"initisilaze_api":{}}))
         self.local_database.dashboard_receive({"needed_robot_data":{"sent":True}},self.private_send)
+        # This is the transport's on_connected callback (wired at
+        # construction, below) -- fires once a connection is confirmed
+        # usable, on first connect AND every reconnect. Flushing here is
+        # what actually delivers a TASK_RESULT/history record that
+        # _send_important_dict had to queue because the connection was
+        # down at the moment a task finished (see that method's own
+        # docstring, finding F5).
+        self._flush_pending_important_sends()
+        self._health_full_report_due = True
+        if self.ad_manager is not None:
+            self.ad_manager.on_connected()
+
+    def setup_ads(self, display="off", node=None):
+        """Start showing this robot's Ads Center ads. display is the
+        xparo_ads_display launch argument: "native" (xparo's own player),
+        "xpshell" (XP-shell's player, over ROS 2 -- needs `node`) or "off".
+        Call before connect() so the first connection asks for the schedule."""
+        from .ads import AdManager
+        from .ads.backends import make_backend
+        folder = os.path.join(self.tmp_folder, "xparo", self.project_id, "ads")
+        self.ad_manager = AdManager(folder, send=self._try_send_dict, backend=make_backend(display, node),
+                                    base_url=lambda: getattr(self.transport, 'website_base_url', None))
+        self.ad_manager.start()
+        return self.ad_manager
 
     ##################################
     ###### function override #########

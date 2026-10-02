@@ -161,3 +161,38 @@ class TestCustomNodeFilesExamples:
         # per-project name-uniqueness constraint.
         assert "GreetExample" not in NODE_REGISTRY
         NODE_REGISTRY.pop("Overridden", None)
+
+
+class TestResyncKeepsNodesAvailable:
+    """Confirmed live on a real robot: every (re)connect re-syncs custom
+    nodes, and that used to unregister them all before re-registering --
+    recompiling each C++ node in between -- so a task arriving meanwhile
+    failed with "<greet_example_cpp> isn't a node this robot knows"."""
+
+    def test_nothing_already_registered_disappears_while_a_resync_compiles(self, tmp_path):
+        from unittest.mock import patch
+        from xparo.bt_engine import runners
+        engine = _make_engine_with_real_examples(tmp_path)
+        assert engine.sync_custom_node_files(None) == []
+
+        missing_during_compile = []
+        real_compile = runners.compile_cpp_node
+
+        def watching_compile(*args, **kwargs):
+            missing_during_compile.extend(t for t in _EXAMPLE_TAGS if t not in NODE_REGISTRY)
+            return real_compile(*args, **kwargs)
+
+        with patch.object(runners, 'compile_cpp_node', side_effect=watching_compile):
+            assert engine.sync_custom_node_files(None) == []
+
+        assert missing_during_compile == []
+        for tag in _EXAMPLE_TAGS:
+            assert tag in NODE_REGISTRY
+
+    def test_a_node_that_was_removed_is_unregistered_after_the_resync(self, tmp_path):
+        engine = _make_engine_with_real_examples(tmp_path)
+        engine.sync_custom_node_files(None)
+        engine._custom_node_file_tags = set(engine._custom_node_file_tags) | {"GoneNode"}
+        NODE_REGISTRY["GoneNode"] = NODE_REGISTRY["GreetExample"]
+        engine.sync_custom_node_files(None)
+        assert "GoneNode" not in NODE_REGISTRY

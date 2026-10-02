@@ -14,6 +14,7 @@ import ipaddress
 import signal
 from threading import Thread
 from .blackbox_manager import BlackboxOrchestrator
+from .connectivity import detect_connectivity
 
 
 class XP_Database():
@@ -256,6 +257,9 @@ class XP_Database():
         return_dict['used_disk'] = f"{disk_info.used / (1024 ** 3):.2f} GB"
         return_dict['free_disk'] = f"{disk_info.free / (1024 ** 3):.2f} GB"
         return_dict['device_id'] = self.unique_id
+        # The id(s) this machine had before -- lets the server find and
+        # keep its existing robot row instead of creating a second one.
+        return_dict['previous_device_ids'] = self.get_previous_device_ids()
         return_dict['xparo_git_commit'] = self.get_xparo_git_commit()
         return_dict['ros_distro'] = os.environ.get('ROS_DISTRO')
         # Network/Location data (Adding Public IP)
@@ -273,7 +277,11 @@ class XP_Database():
         # Compile 'data' field with peripherals
         return_dict['data'] = {
             "peripherals": self.scan_hardware_peripherals(),
-            "public_ip": return_dict["public_ip"] 
+            "public_ip": return_dict["public_ip"],
+            # Wi-Fi/Bluetooth support + current network -- the dashboard
+            # disables its Wi-Fi/Bluetooth buttons (with this reason) for a
+            # robot that can't be controlled that way.
+            "connectivity": detect_connectivity(),
         }
 
         # No command_for override, unlike ROBOT_HEARTBEAT just below this --
@@ -317,11 +325,28 @@ class XP_Database():
 
     def get_device_uuid(self):
         # Get MAC address (which is usually stable unless hardware changes)
+        # Finding F1 (HIGH): this shifted by 2 bits per byte instead of 8
+        # (range(0,2*6,2) instead of range(0,8*6,8)), so only ~18 of the
+        # 48 MAC bits actually varied the resulting string -- confirmed
+        # live, two different real MACs produced the same device_uuid.
+        # Each byte must be shifted by a full 8 bits to extract it cleanly.
         mac = ":".join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff)
-                        for elements in range(0,2*6,2)][::-1])
+                        for elements in range(0,8*6,8)][::-1])
         device_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, mac))  # Generate UUID based on MAC address
         return device_uuid
     
+    def get_previous_device_ids(self):
+        """Device id(s) older xparo versions computed for this same machine.
+        Finding F1 fixed get_device_uuid's MAC shift (2 bits per byte ->
+        8), which changed the id of every robot that connects without a
+        saved credential -- each then registered as a brand-new robot, its
+        history and task targets left on the old row. Sent alongside
+        device_id so the server can recognise it (together with the MAC)."""
+        node = uuid.getnode()
+        legacy_mac = ":".join(['{:02x}'.format((node >> shift) & 0xff) for shift in range(0, 2*6, 2)][::-1])
+        legacy_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, legacy_mac))
+        return [legacy_id] if legacy_id != self.unique_id else []
+
     def get_display_resolution(self):
         """Attempts to get actual physical display resolution from the frame buffer."""
         try:

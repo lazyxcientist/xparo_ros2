@@ -6,6 +6,7 @@ today -- was inline in xparo.py before the transports/ split (see base.py's
 Transport ABC docstring for why the split exists).
 """
 import json
+import socket
 import threading
 import time
 
@@ -147,8 +148,12 @@ class DjangoWsTransport(Transport):
                 # ANY disconnect (clean idle close included, not just a
                 # failed send) -- the single reconnect mechanism now; see
                 # send()'s except block.
+                # daemon: this loop must never keep the process alive
+                # after the node shuts down (Ctrl+C / ros2 launch stop) --
+                # as a plain thread it did, still connected and
+                # heartbeating, until something SIGKILLed it.
                 threading.Thread(target=self.ws.run_forever,
-                                  kwargs={"reconnect": RECONNECT_DELAY_SECONDS}).start()
+                                  kwargs={"reconnect": RECONNECT_DELAY_SECONDS}, daemon=True).start()
                 if self.connection_type=="hybrid":
                     threading.Thread(target=self._hybrid_watchdog_loop, daemon=True).start()
             else:
@@ -158,7 +163,7 @@ class DjangoWsTransport(Transport):
             if response.status_code == 201:
                 data = response.json()
                 self.on_message('self.ws',data)
-                threading.Thread(target=self.start_reset_framework).start()
+                threading.Thread(target=self.start_reset_framework, daemon=True).start()
             else:
                 print("no response")
         elif self.connection_type=="offline":
@@ -177,6 +182,21 @@ class DjangoWsTransport(Transport):
         if getattr(self, "ws", None) is not None:
             self.ws.close()
         self.websocket_connected = False
+
+    def force_reconnect(self):
+        """Drops the current websocket so run_forever(reconnect=...) opens a
+        fresh one on whatever network the robot is on now. Used after a
+        Wi-Fi switch (connectivity.py): the old socket is bound to the old
+        network's address and is dead, but with no keepalive ping it would
+        keep looking connected until TCP gave up on it, minutes later.
+        Unlike close(), this leaves the retry loop running."""
+        raw_socket = getattr(getattr(getattr(self, "ws", None), "sock", None), "sock", None)
+        if raw_socket is None:
+            return
+        try:
+            raw_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # already gone -- the retry loop is on it either way
 
     def _effective_transport(self):
         """connection_type=="hybrid" isn't itself a valid transport -- it's

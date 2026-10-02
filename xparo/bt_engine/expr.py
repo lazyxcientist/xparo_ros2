@@ -65,31 +65,98 @@ def evaluate(expression, blackboard):
     return _eval_node(node, blackboard)
 
 
+def _number(value):
+    """A numeric string ("5", "2.5") as a number -- values set from XML
+    attributes (SetBlackboard, task params) arrive as text, and BT.CPP
+    compares them as numbers."""
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return value
+    return value
+
+
+def _coerce_pair(left, right):
+    left_num = isinstance(left, (int, float)) and not isinstance(left, bool)
+    right_num = isinstance(right, (int, float)) and not isinstance(right, bool)
+    if left_num and isinstance(right, str):
+        return left, _number(right)
+    if right_num and isinstance(left, str):
+        return _number(left), right
+    return left, right
+
+
+def truthy(value):
+    """BT.CPP-style truth: the text "false"/"0"/"" is false, as are the
+    usual Python falsy values."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no", "off")
+    return bool(value)
+
+
 def _eval_node(node, blackboard):
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name):
         if node.id not in blackboard:
+            if node.id in ("true", "false"):
+                return node.id == "true"
             raise ExpressionError(f"undefined variable {node.id!r}")
         return blackboard[node.id]
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
-        return _BIN_OPS[type(node.op)](
-            _eval_node(node.left, blackboard), _eval_node(node.right, blackboard)
-        )
+        left, right = _coerce_pair(_eval_node(node.left, blackboard), _eval_node(node.right, blackboard))
+        try:
+            return _BIN_OPS[type(node.op)](left, right)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+            raise ExpressionError(f"can't compute {left!r} {_OP_TEXT[type(node.op)]} {right!r}: {e}") from e
     if isinstance(node, ast.UnaryOp):
         if isinstance(node.op, ast.Not):
-            return not _eval_node(node.operand, blackboard)
+            return not truthy(_eval_node(node.operand, blackboard))
         if isinstance(node.op, ast.USub):
-            return -_eval_node(node.operand, blackboard)
+            value = _number(_eval_node(node.operand, blackboard))
+            try:
+                return -value
+            except TypeError as e:
+                raise ExpressionError(f"can't negate {value!r}") from e
         raise ExpressionError(f"unsupported unary operator: {ast.dump(node.op)}")
     if isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]) in _CMP_OPS:
-        return _CMP_OPS[type(node.ops[0])](
-            _eval_node(node.left, blackboard), _eval_node(node.comparators[0], blackboard)
-        )
+        left, right = _coerce_pair(_eval_node(node.left, blackboard), _eval_node(node.comparators[0], blackboard))
+        try:
+            return _CMP_OPS[type(node.ops[0])](left, right)
+        except TypeError as e:
+            raise ExpressionError(f"can't compare {left!r} with {right!r}") from e
     if isinstance(node, ast.BoolOp):
-        values = [_eval_node(v, blackboard) for v in node.values]
-        return all(values) if isinstance(node.op, ast.And) else any(values)
+        # Short-circuits like BT.CPP: in `ready && battery > 20`, battery
+        # isn't looked at (or required) when ready is false.
+        is_and = isinstance(node.op, ast.And)
+        for value_node in node.values:
+            value = truthy(_eval_node(value_node, blackboard))
+            if is_and and not value:
+                return False
+            if not is_and and value:
+                return True
+        return is_and
     raise ExpressionError(f"unsupported expression element: {ast.dump(node)}")
+
+
+_OP_TEXT = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}
+
+
+_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(:=|\+=|-=|\*=|/=|=(?!=))\s*(.+?)\s*$", re.S)
+_COMPOUND = {"+=": operator.add, "-=": operator.sub, "*=": operator.mul, "/=": operator.truediv}
+
+
+def parse_statement(statement):
+    """'name := expr' (also BT.CPP's 'name = expr', '+=', '-=', '*=',
+    '/=') -> (name, operator, expression source)."""
+    match = _ASSIGN_RE.match(statement)
+    if not match:
+        raise ExpressionError(f"expected 'name := expr' in Script code, got {statement!r}")
+    return match.group(1), match.group(2), match.group(3)
 
 
 def run_script(code, blackboard):
@@ -103,13 +170,17 @@ def run_script(code, blackboard):
         statement = statement.strip()
         if not statement:
             continue
-        if ":=" not in statement:
-            raise ExpressionError(f"expected 'name := expr' in Script code, got {statement!r}")
-        name, _, expr_src = statement.partition(":=")
-        name = name.strip()
-        if not name.isidentifier():
-            raise ExpressionError(f"invalid assignment target {name!r}")
-        blackboard[name] = evaluate(expr_src.strip(), blackboard)
+        name, op, expr_src = parse_statement(statement)
+        value = evaluate(expr_src, blackboard)
+        if op in _COMPOUND:
+            if name not in blackboard:
+                raise ExpressionError(f"undefined variable {name!r} (in {statement!r})")
+            current, value = _coerce_pair(blackboard[name], value)
+            try:
+                value = _COMPOUND[op](current, value)
+            except (TypeError, ValueError, ZeroDivisionError) as e:
+                raise ExpressionError(f"can't compute {statement!r}: {e}") from e
+        blackboard[name] = value
         assigned.add(name)
     return assigned
 
@@ -124,6 +195,6 @@ def evaluate_condition(expression, blackboard):
     them. Crashing a whole tree tick over an unset optional feature flag
     would be worse than treating it as off."""
     try:
-        return bool(evaluate(expression, blackboard))
+        return truthy(evaluate(expression, blackboard))
     except ExpressionError:
         return False

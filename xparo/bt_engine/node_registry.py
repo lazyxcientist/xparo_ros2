@@ -18,6 +18,11 @@ import py_trees
 
 NODE_REGISTRY = {}
 
+# tag -> (min_children, max_children or None). Filled in by builtins.py for
+# every node it knows; a tag missing here (a plugin or inline custom node)
+# simply isn't child-count checked before a run.
+NODE_ARITY = {}
+
 
 def register(tag):
     def decorator(builder):
@@ -60,21 +65,17 @@ register_class("ReactiveFallback", py_trees.composites.Selector, memory=False)
 @register("Parallel")
 def _build_parallel(name, attrs, blackboard, children, ros_node):
     from .composites import CountingParallel
-    success_count = int(attrs.get("success_count", len(children)))
-    failure_count = int(attrs.get("failure_count", 1))
+    from .builtins import int_value, count_from
+    # BT.CPP counts: success_count defaults to -1 (all children) and a
+    # negative value means N + value + 1, so "-1" = all, "-2" = all but one.
+    success_count = count_from(int_value(attrs, blackboard, "success_count", -1), len(children))
+    failure_count = count_from(int_value(attrs, blackboard, "failure_count", 1), len(children))
     return CountingParallel(name=name, success_count=success_count, failure_count=failure_count, children=children)
 
 
-@register("RetryUntilSuccessful")
-def _build_retry(name, attrs, blackboard, children, ros_node):
-    if len(children) != 1:
-        raise ValueError(f"RetryUntilSuccessful {name!r} needs exactly one child, got {len(children)}")
-    num_attempts = int(attrs.get("num_attempts", 1))
-    # py_trees 2.5 already ships this exact "retry N times, then propagate
-    # FAILURE; SUCCESS short-circuits immediately" behaviour as
-    # decorators.Retry -- confirmed by reading its source, not assumed.
-    # Only the tag name differs from BT.CPP's; no need to hand-roll one.
-    return py_trees.decorators.Retry(name=name, child=children[0], num_failures=num_attempts)
+# RetryUntilSuccessful lives in builtins.py now: py_trees' own Retry (used
+# here before) can't do BT.CPP's num_attempts="-1" (retry forever) -- it
+# failed on the very first failure instead.
 
 
 @register("Script")
@@ -112,3 +113,9 @@ _register_stub("SpeakText", "speak_text", "SpeakTextNode")
 _register_stub("NotifyPatient", "notify_patient", "NotifyPatientNode")
 _register_stub("LoadNextDelivery", "load_next_delivery", "LoadNextDeliveryNode")
 _register_stub("NavigateTo", "navigate_to", "NavigateToNode")
+
+
+# Every other BT.CPP v4 built-in (Inverter, Repeat, Timeout, IfThenElse,
+# Switch, SetBlackboard, ...). Imported last: builtins.py registers into
+# the names defined above.
+from . import builtins  # noqa: E402,F401

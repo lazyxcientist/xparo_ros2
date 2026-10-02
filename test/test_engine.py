@@ -4,6 +4,7 @@ post-construction attributes that arrived too late to matter), and
 REST_API_TOKEN is actually routed to the handler that already existed for
 it in database.py but was never reachable.
 """
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +14,47 @@ def _make_engine(**kwargs):
     from xparo.engine import Engine
     kwargs.setdefault("connection_type", "offline")
     return Engine("secret", "proj-engine-test", **kwargs)
+
+
+# 2026-09-29 stress test finding F2 (MEDIUM): tmp_folder used to be the
+# bare relative path "." -- xparo_database_path (log_pointers.json, the
+# send_later outbox) and the default BAG_DIR ended up wherever the process
+# happened to be launched from, so the same robot could silently read/write
+# a different location on every restart depending on the launching shell's
+# cwd. Both must now be absolute and independent of cwd.
+def test_database_path_and_default_bag_dir_are_absolute_regardless_of_cwd():
+    import os
+
+    original_cwd = os.getcwd()
+    try:
+        os.chdir("/tmp")
+        engine = _make_engine()
+    finally:
+        os.chdir(original_cwd)
+
+    assert os.path.isabs(engine.local_database.xparo_database_path)
+    assert os.path.isabs(engine.BAG_DIR)
+    assert not engine.local_database.xparo_database_path.startswith("/tmp")
+    assert not engine.BAG_DIR.startswith("/tmp")
+
+
+def test_database_path_is_the_same_regardless_of_which_cwd_launched_it():
+    """The exact confirmed bug: launching from two different working
+    directories used to produce two disjoint "./xparo/<project_id>/"
+    trees for the identical robot/project."""
+    import os
+
+    original_cwd = os.getcwd()
+    try:
+        os.chdir("/tmp")
+        engine_a = _make_engine()
+        os.chdir(os.path.expanduser("~"))
+        engine_b = _make_engine()
+    finally:
+        os.chdir(original_cwd)
+
+    assert engine_a.local_database.xparo_database_path == engine_b.local_database.xparo_database_path
+    assert engine_a.BAG_DIR == engine_b.BAG_DIR
 
 
 def test_eval_key_is_not_specially_handled():
@@ -346,59 +388,76 @@ def test_start_stop_save_rosbag_dispatch_to_the_live_control():
     assert actions == ["start", "save", "stop"]
 
 
-def _make_rosout_watcher(on_new_error=None):
-    """Real RosoutWatcher against a trivial subscription-recording stub
-    node (mirrors test_diagnostics_aggregator.py's own FakeNode) -- real
-    execution over a hand-rolled fake watcher."""
-    from xparo.rosout_watcher import RosoutWatcher
-
-    class _StubNode:
-        def create_subscription(self, *a, **k):
-            return MagicMock()
-
-    return RosoutWatcher(_StubNode(), on_new_error=on_new_error)
+def _health_node(tracker=None, aggregator=None, rosbag_control=None):
+    """A fake Xparo node carrying a real ProblemTracker/aggregator."""
+    from xparo.health import ProblemTracker
+    tracker = tracker or ProblemTracker()
+    aggregator = aggregator or _make_diagnostics_aggregator()
+    node = _FakeBtNode(rosbag_control=rosbag_control, diagnostics_aggregator=aggregator)
+    node.problem_tracker = tracker
+    return node, tracker, aggregator
 
 
-def test_watch_error_logs_enables_the_watcher_and_wires_live_push():
+def test_watch_error_logs_sends_the_board_now_and_on_every_flush_until_unwatched():
     engine = _make_engine()
-    watcher = _make_rosout_watcher()
-    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
-    assert watcher.watch_enabled is False
-
-    engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})
-
-    assert watcher.watch_enabled is True
-    assert watcher._live_push is not None
-
-
-def test_watch_error_logs_replays_whatever_was_already_seen_since_boot():
-    """Opening the popup shows recent history immediately, not just
-    future events -- matches the old (file-tailing) feature's own
-    expectation, now sourced from RosoutWatcher's own buffer."""
-    from rcl_interfaces.msg import Log
-    engine = _make_engine()
-    watcher = _make_rosout_watcher()
-    watcher._on_log(Log(name='some_node', msg='already happened', level=Log.ERROR))
-    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
+    node, tracker, aggregator = _health_node()
+    engine.bt_executor = _FakeBtExecutor(node)
+    engine.transport.websocket_connected = True
     sent = []
-    engine.transport.send = lambda message, command_for=None: sent.append(message)
+    engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
 
     engine.on_ws_message('ws', {"WATCH_ERROR_LOGS": {}})
+    assert [m for m in sent if "DIAGNOSTICS_SNAPSHOT" in m]
+    assert "xparo: task engine" in sent[0]["DIAGNOSTICS_SNAPSHOT"]["components"]
 
-    import json
-    messages = [json.loads(m)["ERROR_LOG_ENTRY"]["message"] for m in sent]
-    assert "already happened" in messages
-
-
-def test_unwatch_error_logs_disables_the_watcher():
-    engine = _make_engine()
-    watcher = _make_rosout_watcher()
-    watcher.watch_enabled = True
-    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(rosout_watcher=watcher))
+    sent.clear()
+    engine.flush_health()
+    assert [m for m in sent if "DIAGNOSTICS_SNAPSHOT" in m]
 
     engine.on_ws_message('ws', {"UNWATCH_ERROR_LOGS": {}})
+    sent.clear()
+    engine.flush_health()
+    assert not [m for m in sent if "DIAGNOSTICS_SNAPSHOT" in m]
 
-    assert watcher.watch_enabled is False
+
+def test_flush_health_batches_new_and_repeated_problems_with_counts():
+    engine = _make_engine()
+    node, tracker, _ = _health_node()
+    engine.bt_executor = _FakeBtExecutor(node)
+    engine.transport.websocket_connected = True
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
+    for _ in range(3):
+        tracker.record_log('nav2', 'error', 'costmap failed')
+
+    engine.flush_health()
+    report = [m["PROBLEMS_REPORT"] for m in sent if "PROBLEMS_REPORT" in m]
+    assert len(report) == 1
+    assert report[0]["entries"] == [{"source": "log", "name": "nav2", "level": "error", "message": "costmap failed",
+                                     "count_delta": 3, "active": None, "hardware_id": ""}]
+    sent.clear()
+    engine.flush_health()
+    assert not [m for m in sent if "PROBLEMS_REPORT" in m]  # nothing new
+
+
+def test_flush_health_holds_problems_while_disconnected():
+    engine = _make_engine(connection_type="websocket")
+    node, tracker, _ = _health_node()
+    engine.bt_executor = _FakeBtExecutor(node)
+    engine.transport.websocket_connected = False
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+    tracker.record_log('nav2', 'error', 'costmap failed')
+    engine.flush_health()
+    assert sent == []
+    engine.transport.websocket_connected = True
+    engine.flush_health()
+    assert json.loads(sent[0])["PROBLEMS_REPORT"]["entries"][0]["count_delta"] == 1
+
+
+def test_unwatch_error_logs_is_safe_without_a_node():
+    engine = _make_engine()
+    engine.on_ws_message('ws', {"UNWATCH_ERROR_LOGS": {}})
 
 
 def test_watch_error_logs_with_no_bt_executor_is_a_safe_noop():
@@ -466,6 +525,22 @@ def test_persist_credential_writes_the_project_id_alongside_the_value(tmp_path):
     with open(engine.xparo_credential_path) as f:
         stored = json_module.load(f)
     assert stored == {"value": "some-secret", "project_id": "proj-engine-test"}
+
+
+def test_persist_credential_restricts_file_permissions_to_owner_only(tmp_path):
+    """Finding F3 (LOW): confirmed live -- credential.json (this robot's
+    live auth secret) was written with default open() permissions (0644,
+    world-readable), unlike an SSH key or any other on-disk credential."""
+    import os
+    import stat
+
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+
+    engine._persist_credential("some-secret")
+
+    mode = stat.S_IMODE(os.stat(engine.xparo_credential_path).st_mode)
+    assert mode == 0o600
 
 
 def test_persisted_credential_wires_the_fallback_callback_into_the_transport():
@@ -579,13 +654,14 @@ def test_get_xparo_version_reports_commit_and_distro():
     assert result == {"xparo_git_commit": "abc123", "ros_distro": "jazzy"}
 
 
-def test_refresh_self_diagnostics_records_rosbag_and_disk_status():
+def test_refresh_self_diagnostics_records_xparos_own_statuses():
     engine = _make_engine()
     aggregator = _make_diagnostics_aggregator()
 
     class _FakeRosbagControl:
         state = "writing"
         recorder_alive = True
+        owns_launch_process = True
 
     engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
         rosbag_control=_FakeRosbagControl(), diagnostics_aggregator=aggregator,
@@ -593,27 +669,54 @@ def test_refresh_self_diagnostics_records_rosbag_and_disk_status():
 
     engine._refresh_self_diagnostics()
 
-    snapshot = aggregator.snapshot()
-    assert snapshot["components"]["xparo.rosbag_recorder"]["level"] == "ok"
-    assert "state=writing" in snapshot["components"]["xparo.rosbag_recorder"]["message"]
-    assert "xparo.disk_usage" in snapshot["components"]
+    components = aggregator.snapshot()["components"]
+    assert components["xparo: rosbag recorder"] == {**components["xparo: rosbag recorder"], "level": "ok", "message": "recording"}
+    assert "xparo: disk usage" in components
+    assert components["xparo: task engine"]["message"] == "idle"
+    assert "xparo: dashboard connection" in components
 
 
-def test_refresh_self_diagnostics_flags_a_dead_recorder_as_an_error():
+def test_refresh_self_diagnostics_no_recorder_is_only_an_error_when_this_launch_started_one():
+    """Reported bug: every robot without a recorder (record_bags:=false,
+    the default) showed an overall "error" diagnostics level."""
+    for owns, expected in ((False, "ok"), (True, "error")):
+        engine = _make_engine()
+        aggregator = _make_diagnostics_aggregator()
+
+        class _FakeDeadRosbagControl:
+            state = "unknown"
+            recorder_alive = False
+            owns_launch_process = owns
+
+        engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
+            rosbag_control=_FakeDeadRosbagControl(), diagnostics_aggregator=aggregator,
+        ))
+        engine._refresh_self_diagnostics()
+        assert aggregator.snapshot()["components"]["xparo: rosbag recorder"]["level"] == expected
+
+
+def test_task_events_reach_the_hook_and_the_task_engine_status():
     engine = _make_engine()
-    aggregator = _make_diagnostics_aggregator()
+    events = []
+    engine.on_task_event = lambda kind, info: events.append((kind, info.get("task_title")))
+    engine.transport.send = lambda message, command_for=None: None
+    engine._task_started({"TASK_STARTED": {"task_id": "t1", "run_id": "r1", "task_title": "Deliver"}})
+    running = dict((n, (lvl, msg)) for n, lvl, msg in engine.self_health_statuses())
+    assert running["xparo: task engine"] == ("ok", "running: Deliver")
 
-    class _FakeDeadRosbagControl:
-        state = "unknown"
-        recorder_alive = False
+    engine._task_finished({"TASK_RESULT": {"task_id": "t1", "run_id": "r1", "success": False,
+                                           "task_title": "Deliver", "explanation": "stuck"}})
+    assert events == [("started", "Deliver"), ("finished", "Deliver")]
+    after = dict((n, (lvl, msg)) for n, lvl, msg in engine.self_health_statuses())
+    assert after["xparo: task engine"][0] == "warn" and "stuck" in after["xparo: task engine"][1]
 
-    engine.bt_executor = _FakeBtExecutor(_FakeBtNode(
-        rosbag_control=_FakeDeadRosbagControl(), diagnostics_aggregator=aggregator,
-    ))
 
-    engine._refresh_self_diagnostics()
-
-    assert aggregator.snapshot()["components"]["xparo.rosbag_recorder"]["level"] == "error"
+def test_task_result_goes_through_the_retrying_send():
+    engine = _make_engine()
+    calls = []
+    engine._send_important_dict = lambda payload: calls.append(payload)
+    engine._task_finished({"TASK_RESULT": {"task_id": "t1", "run_id": "r1", "success": True}})
+    assert calls and "TASK_RESULT" in calls[0]
 
 
 def test_refresh_self_diagnostics_with_no_bt_executor_is_a_safe_noop():
@@ -657,3 +760,103 @@ def test_fall_back_to_raw_secret_tolerates_an_already_missing_file(tmp_path):
 
     with patch('xparo.engine.DjangoWsTransport'):
         engine._fall_back_to_raw_secret()  # must not raise
+
+
+# ------------------------------------------------------------------
+# Wi-Fi / Bluetooth popups (connectivity.py)
+# ------------------------------------------------------------------
+def _wait_for(predicate, attempts=100):
+    import time
+    for _ in range(attempts):
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_get_wifi_networks_dispatches_with_rescan_flag():
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+    with patch('xparo.connectivity.get_wifi_state', side_effect=lambda rescan=False: {"available": True, "rescan": rescan}):
+        engine.on_ws_message('ws', {"GET_WIFI_NETWORKS": {"rescan": True}})
+        assert _wait_for(lambda: sent)
+    assert json.loads(sent[0])["WIFI_NETWORKS"] == {"available": True, "rescan": True}
+
+
+def test_wifi_connect_result_uses_the_queued_important_send_and_reconnect_hook():
+    """Switching networks can drop this very connection, so the result
+    must be queued for retry, not fire-and-forget."""
+    engine = _make_engine()
+    captured = {}
+
+    def fake_handle(req, send_response, is_server_reachable=None, on_network_changed=None):
+        captured.update(req=req, send=send_response, reachable=is_server_reachable, changed=on_network_changed)
+
+    with patch('xparo.connectivity.handle_wifi_connect', side_effect=fake_handle):
+        engine.on_ws_message('ws', {"WIFI_CONNECT": {"ssid": "Lab", "request_id": "r1"}})
+        assert _wait_for(lambda: captured)
+    assert captured["req"] == {"ssid": "Lab", "request_id": "r1"}
+    assert captured["send"] == engine._send_important_dict
+    assert captured["reachable"] == engine._xparo_server_reachable
+    assert captured["changed"] == engine._on_network_changed
+
+
+def test_on_network_changed_forces_a_transport_reconnect():
+    engine = _make_engine()
+    engine.transport.force_reconnect = MagicMock()
+    engine._on_network_changed()
+    engine.transport.force_reconnect.assert_called_once_with()
+
+
+def test_server_reachability_checks_the_transports_own_server():
+    engine = _make_engine()
+    with patch('xparo.connectivity.http_reachable', return_value=False) as reach:
+        assert engine._xparo_server_reachable() is False
+    reach.assert_called_once_with(engine.transport.website_base_url + '/')
+
+
+def test_bluetooth_action_dispatches_to_connectivity():
+    engine = _make_engine()
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(message)
+    with patch('xparo.connectivity.detect_bluetooth', return_value={"available": False, "reason": "No Bluetooth adapter found on this robot."}):
+        engine.on_ws_message('ws', {"BLUETOOTH_ACTION": {"action": "power_on", "request_id": "b1"}})
+        assert _wait_for(lambda: sent)
+    result = json.loads(sent[0])["BLUETOOTH_ACTION_RESULT"]
+    assert result["request_id"] == "b1" and result["success"] is False
+    assert result["message"] == "No Bluetooth adapter found on this robot."
+
+
+def test_robot_info_reports_connectivity():
+    engine = _make_engine()
+    sent = []
+    fake = {"wifi": {"available": False, "reason": "No Wi-Fi hardware found on this robot."},
+            "bluetooth": {"available": True, "reason": "", "powered": True, "name": "bot"}}
+    with patch('xparo.database.detect_connectivity', return_value=fake), \
+         patch('xparo.database.requests.get', side_effect=__import__('requests').RequestException("offline")), \
+         patch.object(engine.local_database, 'get_best_ip', return_value=("10.0.0.5", "lan")), \
+         patch.object(engine.local_database, 'trigger_log_update'):
+        engine.local_database.send_robot_info(sent.append)
+    info = json.loads(sent[0])["ADD_robots_info"]
+    assert info["data"]["connectivity"] == fake
+
+
+def test_first_health_report_after_each_connect_is_a_full_one():
+    engine = _make_engine()
+    node, tracker, _ = _health_node()
+    engine.bt_executor = _FakeBtExecutor(node)
+    engine.transport.websocket_connected = True
+    sent = []
+    engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
+    engine.flush_health()
+    reports = [m["PROBLEMS_REPORT"] for m in sent if "PROBLEMS_REPORT" in m]
+    assert reports and reports[0]["full"] is True and reports[0]["entries"] == []
+    sent.clear()
+    engine.flush_health()
+    assert not [m for m in sent if "PROBLEMS_REPORT" in m]
+    engine.local_database.dashboard_receive = lambda *a, **k: None
+    engine.send_initial_data()
+    sent.clear()
+    engine.flush_health()
+    assert [m["PROBLEMS_REPORT"]["full"] for m in sent if "PROBLEMS_REPORT" in m] == [True]

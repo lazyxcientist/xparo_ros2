@@ -165,4 +165,10 @@ def build_run_task_val(task_id, override_params, custom_tasks, files):
         # most permissive robots, not treated as production-ready. See
         # run_task.py's handle_run_task for the same reasoning in detail.
         "stage": task.get("stage") or "development",
+        # Newer dashboards also sync these; older caches simply lack them
+        # (handle_run_task then uses its default time limit).
+        "timeout_s": task.get("timeout"),
+        "task_title": task.get("title") or "",
+        "tree_name": task.get("behaviour_tree_name", ""),
+        "trigger": "ros_topic",
     }

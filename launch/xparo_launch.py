@@ -142,6 +142,9 @@ def generate_launch_description():
     # config/tethered_channels.yaml with this deployment's actual
     # host/port pairs. Empty default falls back to loopback test values.
     tethered_channels_config_path =     LaunchConfiguration('tethered_channels_config_path',         default="")
+    # Ads Center: "native" (xparo's own always-on-top player), "xpshell"
+    # (XP-shell's Kivy player over ROS 2) or "off". See xparo/ads/backends/.
+    xparo_ads_display =                 LaunchConfiguration('xparo_ads_display',                     default="native")
 
 
     ####################################
@@ -169,6 +172,7 @@ def generate_launch_description():
             DeclareLaunchArgument('BAG_DIR',                            default_value=bag_dir,                          description='where rosbag sessions are written; shared with the rosbag2 recorder process.'),
             DeclareLaunchArgument('xparo_transport',                    default_value=xparo_transport,                  description='"django_ws" or "tethered_tcp"'),
             DeclareLaunchArgument('tethered_channels_config_path',      default_value=tethered_channels_config_path,    description='path to a tethered_channels.yaml, only used when xparo_transport=="tethered_tcp"'),
+            DeclareLaunchArgument('xparo_ads_display',                  default_value=xparo_ads_display,                description='who shows Ads Center ads: "native" (xparo\'s own player), "xpshell" (XP-shell over ROS 2) or "off"'),
 
 
 
@@ -195,6 +199,7 @@ def generate_launch_description():
                             'BAG_DIR':                               bag_dir,
                             'xparo_transport':                      xparo_transport,
                             'tethered_channels_config_path':        tethered_channels_config_path,
+                            'xparo_ads_display':                    xparo_ads_display,
 
                             }],
                 output='screen'),

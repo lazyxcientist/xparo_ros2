@@ -300,11 +300,39 @@ class TestExecutor:
         assert mock_engine.add_live_update.call_count >= 1
         events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
         for event in events:
-            assert set(event.keys()) == {"node_name", "node_type", "uid", "prev", "curr", "timestamp", "datetime"}
+            assert set(event.keys()) == {"run_id", "node_name", "node_type", "uid", "prev", "curr", "timestamp", "datetime"}
         # The root Sequence's own final event must be SUCCESS -- the whole
         # point of the live-update feed is that curr reflects reality.
         root_events = [e for e in events if e["node_name"] == "Sequence"]
         assert root_events[-1]["curr"] == "SUCCESS"
+
+    def test_run_id_is_none_for_the_untraced_run_path(self):
+        """run() (no trace) is the dashboard's own "preview" path, not a
+        dispatched task -- it has no run_id to give, and must not
+        fabricate one."""
+        mock_engine = MagicMock()
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=mock_engine)
+
+        executor.run('<LoadNextDelivery />', tick_rate_hz=0)
+
+        events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
+        assert events
+        for event in events:
+            assert event["run_id"] is None
+
+    def test_run_with_trace_stamps_every_live_update_with_its_run_id(self):
+        """Finding F8 (MEDIUM): confirmed live -- concurrent runs produced
+        indistinguishable live node-status updates since run_id was never
+        threaded through to _emit_live_update at all."""
+        mock_engine = MagicMock()
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=mock_engine)
+
+        executor.run_with_trace('<Sequence><LoadNextDelivery /></Sequence>', tick_rate_hz=0, run_id="run-xyz-789")
+
+        events = [call.args[0] for call in mock_engine.add_live_update.call_args_list]
+        assert events
+        for event in events:
+            assert event["run_id"] == "run-xyz-789"
 
     def test_node_type_reports_the_registration_tag_distinct_from_an_explicit_name(self):
         """Mirrors this project's own prior C++ RosTopicLogger exactly

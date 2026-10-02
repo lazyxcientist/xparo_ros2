@@ -37,8 +37,11 @@ class DiagnosticsAggregator:
     (not silently disappears) until something publishes for it again.
     """
 
-    def __init__(self, node):
+    def __init__(self, node, tracker=None):
         self.node = node
+        # health.ProblemTracker -- gets every status so problems are
+        # counted/deduplicated for the Health & Errors popup.
+        self.tracker = tracker
         self._latest = {}  # name -> {"level": str, "message": str, "last_seen": float}
         self._subscription = node.create_subscription(
             DiagnosticArray, '/diagnostics', self._on_diagnostics, 10,
@@ -47,18 +50,34 @@ class DiagnosticsAggregator:
     def _on_diagnostics(self, msg):
         now = time.time()
         for status in msg.status:
+            level = _LEVEL_NAMES.get(status.level, 'error')
             self._latest[status.name] = {
-                "level": _LEVEL_NAMES.get(status.level, 'error'),
+                "level": level,
                 "message": status.message,
                 "last_seen": now,
+                "hardware_id": status.hardware_id,
             }
+            if self.tracker is not None:
+                self.tracker.record_diagnostic(status.name, level, status.message, status.hardware_id)
 
     def record_self_status(self, name, level, message=''):
-        """xparo's own self-reported entries -- bypasses the /diagnostics
-        topic entirely (no publisher needed for something only this same
-        process ever reads back), same storage/staleness handling either
-        way."""
+        """xparo's own self-reported entries, for when nothing publishes
+        them on /diagnostics (Engine outside a live node) -- same storage/
+        staleness handling either way."""
         self._latest[name] = {"level": level, "message": message, "last_seen": time.time()}
+        if self.tracker is not None:
+            self.tracker.record_diagnostic(name, level, message)
+
+    def check_stale(self):
+        """A component that stopped publishing is a problem too -- counted
+        once when it goes quiet (called periodically by xparo_ros.py)."""
+        if self.tracker is None:
+            return
+        now = time.time()
+        for name, entry in self._latest.items():
+            if (now - entry["last_seen"]) > STALE_TIMEOUT_SEC:
+                self.tracker.record_diagnostic(
+                    name, 'stale', f"no status for over {STALE_TIMEOUT_SEC:.0f}s", entry.get("hardware_id", ''))
 
     def snapshot(self):
         """{"components": {name: {level, message, stale}}, "overall_level": str}."""
@@ -68,7 +87,8 @@ class DiagnosticsAggregator:
         for name, entry in self._latest.items():
             stale = (now - entry["last_seen"]) > STALE_TIMEOUT_SEC
             level = 'stale' if stale else entry["level"]
-            components[name] = {"level": level, "message": entry["message"], "stale": stale}
+            components[name] = {"level": level, "message": entry["message"], "stale": stale,
+                                 "last_seen": entry["last_seen"]}
             if _LEVEL_RANK[level] > _LEVEL_RANK[overall]:
                 overall = level
         return {"components": components, "overall_level": overall}
