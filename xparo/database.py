@@ -15,6 +15,7 @@ import signal
 from threading import Thread
 from .blackbox_manager import BlackboxOrchestrator
 from .connectivity import detect_connectivity
+from .ota import summary as ota_summary
 
 
 class XP_Database():
@@ -282,6 +283,9 @@ class XP_Database():
             # disables its Wi-Fi/Bluetooth buttons (with this reason) for a
             # robot that can't be controlled that way.
             "connectivity": detect_connectivity(),
+            # Whether this install can update itself (git checkout in a
+            # colcon workspace) and what it's on -- the dashboard's OTA button.
+            "ota": ota_summary(),
         }
 
         # No command_for override, unlike ROBOT_HEARTBEAT just below this --

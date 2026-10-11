@@ -1,7 +1,4 @@
 # XPARO
-this version is currently tested and suported with ros2 humble 
-
-you can modify https://github.com/lazyxcientist/xparo_ros/xparo_ros/xpar.py to make supported with other ros distro easily
 
 ```
     ██╗░░██╗██████╗░░█████╗░██████╗░░█████╗░
@@ -13,100 +10,60 @@ you can modify https://github.com/lazyxcientist/xparo_ros/xparo_ros/xpar.py to m
         Live   your   DREAMS   parrallely
 ```
 
+The ROS 2 package that connects a robot to [XPARO](https://xparo.in): it
+keeps the robot online on your project's dashboard, runs the behaviour trees
+and tasks you build there, and gives the dashboard remote tools (terminal,
+teleop, files, Wi-Fi, ROS bag recording, health).
 
+**Full documentation: <https://xparo.in/docs/>**
 
-website: https://xparo-website.me/
+Tested on **Ubuntu 24.04 with ROS 2 Jazzy**.
 
-github: https://github.com/lazyxcientist/xparo_ros
+## Quick start
 
-email:   xpassistantpersonal@gmail.com
+1. Sign in at <https://xparo.in/dashboard> and press **New project**.
+2. Open the project. In the **Secret Key Manager** on its **Dashboard** page,
+   copy the **Project Key** (your project ID), then **Generate** a secret key
+   and copy it (it is shown only once).
+3. On the robot:
 
-Looking to exercise everything this package's API can do (remote
-exec, teleop, file transfer, rosbag, credentials, ...) against a real
-running robot? See [TESTING.md](TESTING.md). For the automated `pytest`
-suite, see [test/README.md](test/README.md).
-
-
-
-<br>
-
--------------
-## getting started with X.P.A.R.O
--------------
-
-step 1 : go to https://xparo-website.me/dashboard_app and create an new project by clicking on "add new" button.
-
-step 2 : now go to your project 
-
-step 3 : copy the project_id (or secret_key if any) of your project. 
-
-step 4 : copy the code given below and paste your keys there.
-
-
-
-
-
--------------
-## how to use xparo with ros2
--------------
-
-#### baisc setup
 ```bash
-cd your_workspace/src  # move to src , where all packages are placed
-git clone https://github.com/lazyxcientist/xparo_ros.git
-```
+sudo apt install -y git python3-websocket python3-psutil python3-yaml python3-requests ros-jazzy-py-trees
 
+mkdir -p ~/xparo_ws/src && cd ~/xparo_ws/src
+git clone https://github.com/lazyxcientist/xparo_ros2.git
+cd ~/xparo_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select xparo
 
-
-#### build package
-```bash
-cd your_workspace  # move to workspace
-rosdep install --from-paths src --ignore-src -r -y
-colcon build    # build the workspace
 source install/setup.bash
+ros2 launch xparo xparo_launch.py \
+  xparo_project_id:=<your-project-id> \
+  xparo_secret_key:=<your-secret-key> \
+  xparo_stage:=development
 ```
 
-#### run the ros2_node
-```bash
-ros2 run xparo xparo
-```
+The robot appears on the dashboard's **Robots Fleet** page as online. On its
+first connection it receives its own credential and saves it, so later starts
+don't depend on the secret key.
 
+`xparo_stage:=development` lets the robot run tasks still in development
+(every new task starts there). Leave it out on robots that should only run
+production tasks.
 
-install requiremnts = [requirements.txt](./requirements.txt)
+## Learn more
 
-topic list  
+| | |
+|---|---|
+| [Install and run](https://xparo.in/docs/robot/install.html) | Step by step, with the messages you should see |
+| [Configuration](https://xparo.in/docs/robot/configuration.html) | Every launch parameter, with a command builder |
+| [ROS 2 topics](https://xparo.in/docs/robot/topics.html) | `/xparo/ask`, `/xparo/run_task`, `/joy`, ... |
+| [Behaviour trees](https://xparo.in/docs/robot/behaviour-trees.html) | Nodes, expressions and run results |
+| [Custom nodes](https://xparo.in/docs/robot/custom-nodes.html) | Python, C++, JavaScript and Bash nodes |
+| [Troubleshooting](https://xparo.in/docs/robot/troubleshooting.html) | When the robot doesn't show up |
 
-- /xparo/ask
-- /xparo/dashboard/receive
-- /xparo/dashboard/send
-- /xparo/for_custom_llm
-- /xparo/response
+For developers of this package: [TESTING.md](TESTING.md) exercises the remote
+features against a running robot, and [test/README.md](test/README.md)
+describes the `pytest` suite.
 
-
-send command 
-
-    ros2 topic pub /xparo/ask std_msgs/msg/String "data: 'your question here'" 
-
-
-
-check the output
-
-    ros2 topic echo /xparo/response 
-
-------------------
-## parameters
-
-`xparo_secret_key = your key here`
-
-`xparo_project_id = your project key here`
-
-`xparo_connection_type = hybrid`
-
-`xparo_custom_aiml_path = /src/core/aiml`
-
-`xparo_custom_sets_path = /src/core/aiml_sets`
-
-`xparo_custom_maps_path = /src/core/aiml_maps`
-
-
-
+Contact: xpassistantpersonal@gmail.com

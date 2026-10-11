@@ -42,6 +42,14 @@ class Ros2Backend(DisplayBackend):
         self._publisher = self.node.create_publisher(String, SCHEDULE_TOPIC, latched)
         self.node.create_subscription(String, PLAYS_TOPIC, self._on_play, 50)
 
+    @property
+    def available(self):
+        """XP-shell is listening for the schedule (its ad player is running)."""
+        try:
+            return self._publisher is not None and self._publisher.get_subscription_count() > 0
+        except Exception:
+            return False
+
     def schedule_changed(self, items):
         if self._publisher is None:
             return

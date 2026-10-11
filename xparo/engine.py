@@ -9,6 +9,7 @@ from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
 from . import connectivity
+from . import ota
 from .bt_engine import run_task
 from .bt_engine import plugin_loader
 from .bt_engine import runners
@@ -133,6 +134,11 @@ class Engine():
         # on_task_event(kind, info), kind "started"|"finished" -- set by
         # xparo_ros.py to log and publish /xparo/task_result.
         self.on_task_event = None
+        # restart_process() -- set by xparo_ros.py: restarts the node in
+        # place after an OTA update. None (standalone Engine) means the
+        # update finishes with "restart xparo to use it".
+        self.restart_process = None
+        self._ota_marker_path = os.path.join(self.tmp_folder, "xparo", project_id, "ota_pending.json")
 
         self.xparo_behavior_path = os.path.join(self.xparo_folder,'config','default.xml')
         self.xparo_file_path = os.path.join(self.xparo_folder,'config','default.txt')
@@ -1118,6 +1124,17 @@ class Engine():
         and delivering late/out of order after a long reconnect gap.
         """
         from .bt_engine import task_sync
+        if ota.update_in_progress():
+            # Mid-update the source is changing under this process and it
+            # restarts when the build is done -- don't start a run that the
+            # restart would cut off.
+            val = val or {}
+            self._task_finished(run_task.result_message(
+                val.get("task_id"), val.get("run_id"), "updating",
+                "The robot is installing a software update and will restart in a moment. Run the task again "
+                "once it's back online.", task_title=val.get("task_title") or "",
+            ))
+            return
         threading.Thread(
             target=run_task.handle_run_task,
             args=(self.bt_executor, val, self._task_finished),
@@ -1334,6 +1351,10 @@ class Engine():
                 # Which uploaded plays (ADS_PLAYS) the server stored.
                 if self.ad_manager is not None:
                     self.ad_manager.on_ack(val)
+            elif k=="ads_proof_ack":
+                # The server's answer to one screenshot (ADS_PROOF).
+                if self.ad_manager is not None:
+                    self.ad_manager.on_proof_ack(val)
             elif k=="custom_tasks":
                 # val is DataAnalysis._get_custom_tasks()'s shape
                 # ({task_id: {behaviour_tree_name, blackboard_mapping,
@@ -1512,6 +1533,19 @@ class Engine():
                 threading.Thread(
                     target=connectivity.handle_get_bluetooth_devices,
                     args=(bool((val or {}).get("scan")), self._send_dict),
+                    daemon=True,
+                ).start()
+            # ---- Software updates (ota.py) -- threads: a fetch, a build
+            # and dependency installs all take a while.
+            elif k=="GET_OTA_STATUS":
+                threading.Thread(
+                    target=ota.handle_get_status, args=(bool((val or {}).get("fetch")), self._send_dict), daemon=True,
+                ).start()
+            elif k=="OTA_UPDATE":
+                threading.Thread(
+                    target=ota.handle_update, args=(val, self._send_dict, self._send_important_dict),
+                    kwargs={"restart": self.restart_process, "running_tasks": run_task.active_runs,
+                            "marker_path": self._ota_marker_path},
                     daemon=True,
                 ).start()
             elif k=="BLUETOOTH_ACTION":
@@ -1997,6 +2031,8 @@ class Engine():
         # down at the moment a task finished (see that method's own
         # docstring, finding F5).
         self._flush_pending_important_sends()
+        # After an OTA update restarted xparo: confirm it from the new process.
+        ota.report_after_restart(self._ota_marker_path, self._send_important_dict)
         self._health_full_report_due = True
         if self.ad_manager is not None:
             self.ad_manager.on_connected()

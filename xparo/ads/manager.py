@@ -5,18 +5,37 @@
                                 (backend.play), one at a time per placement
     backend finishes         -> exactly one play-log row per play
     upload loop              -> ADS_PLAYS batches; ads_plays_ack marks them done
+                                then ADS_PROOF screenshots; ads_proof_ack
+    status loop, every minute -> ADS_STATUS: is the player up, what's on screen,
+                                can it take screenshots (the advertiser's uptime)
+
+Display modes (the entry's "mode", set when the ad was booked):
+    repeat  plays back to back through its slot window (the default)
+    full    stays on screen until the slot window ends ("loop" for video/audio)
+    once    plays a single time at the start of each slot ("slot"), never again
+            in that slot -- even after a restart (the play log remembers)
+    timed   like once, but closes itself after "duration" (the owner's timeout)
+"close_button": false hides the viewer's close (X) button.
+
+Proof of play: when a schedule entry has "proof": true, the first play of
+that ad in each clock hour gets a screenshot of the whole screen a couple of
+seconds in (capture.ScreenCapture -- the display, never the camera). It is
+stored with the play's log row and sent once the play itself is stored.
 
 A backend that plays the whole schedule itself (XP-shell through ROS2,
 backends/ros2.py) gets the schedule instead of individual plays, and hands
-its play records back through record_external_play().
+its play records back through record_external_play(); no screenshots then.
 """
+import base64
 import datetime
 import logging
 import os
 import threading
 import time
+import uuid
 
 from . import scheduler
+from .capture import ScreenCapture
 from .playlog import PlayLog
 from .store import ScheduleStore
 
@@ -29,6 +48,13 @@ DEFAULT_AD_SECONDS = 15
 # If a backend never reports back (a crashed player), free the slot and log it.
 WATCHDOG_EXTRA_SECONDS = 60
 STATUSES = ("completed", "dismissed", "interrupted", "error")
+STATUS_EVERY_SECONDS = 60.0
+# A viewer closed a "repeat" or "full slot" ad: give the screen back for a while before it returns.
+DISMISS_COOLDOWN_SECONDS = 30.0
+MIN_FULL_SECONDS = 5.0
+PROOF_DELAY_SECONDS = 2.0
+# Answers after which a screenshot is dropped rather than sent again.
+PROOF_RETRY_REASONS = ("play not found",)
 
 
 def utc_offset_minutes():
@@ -40,13 +66,19 @@ def _now_iso(dt):
 
 
 class AdManager:
-    def __init__(self, folder, send, backend, base_url=None, now=datetime.datetime.now):
+    def __init__(self, folder, send, backend, base_url=None, now=datetime.datetime.now, capture=None):
         """folder: where the schedule, ad files and play log live.
         send(dict) -> bool: send a message to the server (True if it went out).
-        backend: a backends.* display backend."""
+        backend: a backends.* display backend.
+        capture: a capture.ScreenCapture (screenshots for proof of play)."""
         os.makedirs(folder, exist_ok=True)
         self.store = ScheduleStore(folder, base_url)
         self.log = PlayLog(os.path.join(folder, "plays.db"))
+        self.proof_folder = os.path.join(folder, "proofs")
+        self.capture = capture if capture is not None else ScreenCapture()
+        self._proof_hours = set()  # (ad id, "YYYY-MM-DDTHH") already captured
+        self._slots_done = set()   # (ad id, slot) of once/timed ads already shown
+        self._slots_checked = set()
         self.send = send
         self.backend = backend
         self.now = now
@@ -63,7 +95,8 @@ class AdManager:
         self.backend.start(self)
         if not self.backend.plays_itself:
             self.backend.schedule_changed(self.items)
-        for target, name in ((self._tick_loop, "xparo-ads-tick"), (self._upload_loop, "xparo-ads-upload")):
+        for target, name in ((self._tick_loop, "xparo-ads-tick"), (self._upload_loop, "xparo-ads-upload"),
+                             (self._status_loop, "xparo-ads-status")):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -111,6 +144,17 @@ class AdManager:
                 live = {item.get("id") for item in self.items}
                 self.backend.stop_missing(live)
 
+    def on_proof_ack(self, ack):
+        """The server's answer to one ADS_PROOF: the file is done with unless it asks to retry."""
+        if not isinstance(ack, dict) or not isinstance(ack.get("local_id"), int):
+            return
+        if not ack.get("ok") and ack.get("reason") in PROOF_RETRY_REASONS:
+            self.log.proof_unsent(ack["local_id"])
+            return
+        if not ack.get("ok"):
+            log.warning("server refused ad screenshot %s: %s", ack["local_id"], ack.get("reason"))
+        self.log.proof_done(ack["local_id"])
+
     def on_ack(self, ack):
         if not isinstance(ack, dict):
             return
@@ -138,21 +182,90 @@ class AdManager:
                     continue
                 if time.monotonic() < slot.get("idle_until", 0):
                     continue
-                item = queue[slot["index"] % len(queue)]
-                slot["index"] = (slot["index"] + 1) % len(queue)
+                due = [i for i in queue if not self._slot_done(i)]
+                if not due:
+                    continue
+                item = due[slot["index"] % len(due)]
+                slot["index"] = (slot["index"] + 1) % len(due)
                 self._start(placement, slot, item, now)
+
+    def _slot_key(self, item):
+        return (item.get("id"), item.get("slot") or "")
+
+    def _slot_done(self, item):
+        """A once/timed ad already shown in this slot (asked of the play log once per slot)."""
+        if item.get("mode") not in ("once", "timed"):
+            return False
+        key = self._slot_key(item)
+        if key in self._slots_done:
+            return True
+        if key not in self._slots_checked:
+            self._slots_checked.add(key)
+            if item.get("slot_start") and self.log.played_since(item.get("id"), item["slot_start"]):
+                self._slots_done.add(key)
+                return True
+        return False
+
+    def _play_seconds(self, item, now):
+        """How long this showing lasts: the ad's length, the owner's timeout, or the rest of the slot."""
+        mode = item.get("mode")
+        if mode == "full" and item.get("slot_end"):
+            try:
+                end = datetime.datetime.fromisoformat(item["slot_end"])
+                return max(MIN_FULL_SECONDS, (end - now).total_seconds() - 1)
+            except ValueError:
+                pass
+        return float(item.get("duration") or DEFAULT_AD_SECONDS)
 
     def _start(self, placement, slot, item, now):
         token = object()
-        duration = float(item.get("duration") or DEFAULT_AD_SECONDS)
-        slot.update(busy=True, token=token, item=item, started=now,
+        duration = self._play_seconds(item, now)
+        if item.get("mode") in ("once", "timed"):
+            self._slots_done.add(self._slot_key(item))
+        play_item = dict(item, duration=duration)
+        slot.update(busy=True, token=token, item=item, started=now, proof=None,
                     deadline=time.monotonic() + duration + WATCHDOG_EXTRA_SECONDS)
         try:
-            self.backend.play(item, placement,
+            self.backend.play(play_item, placement,
                               lambda status, error=None, _p=placement, _t=token: self._finish(_p, _t, status, error))
         except Exception as exc:  # a broken ad must never stop the others
             log.exception("could not start ad %s", item.get("id"))
             self._finish(placement, token, "error", str(exc)[:300])
+            return
+        hour = (item.get("id"), now.strftime("%Y-%m-%dT%H"))
+        if item.get("proof") and hour not in self._proof_hours:
+            timer = threading.Timer(min(PROOF_DELAY_SECONDS, duration / 2), self._take_proof,
+                                    args=(placement, token, hour))
+            timer.daemon = True
+            timer.start()
+
+    def _take_proof(self, placement, token, hour):
+        """A screenshot while this play is still on screen, kept with its log row."""
+        with self._lock:
+            slot = self._slots.get(placement)
+            if not slot or slot.get("token") is not token or not slot["busy"] or hour in self._proof_hours:
+                return
+        path = os.path.join(self.proof_folder, f"{uuid.uuid4().hex}.jpg")
+        captured_at = self.now()
+        try:
+            ok = self.capture.grab(path)
+        except Exception:
+            log.exception("ad screenshot failed")
+            ok = False
+        if not ok:
+            return
+        with self._lock:
+            slot = self._slots.get(placement)
+            if slot and slot.get("token") is token and slot["busy"]:
+                slot["proof"] = (path, _now_iso(captured_at))
+                self._proof_hours.add(hour)
+                if len(self._proof_hours) > 5000:
+                    self._proof_hours = {h for h in self._proof_hours if h[1] >= hour[1][:10]}
+                return
+        try:  # the play ended while we were capturing: the picture proves nothing
+            os.remove(path)
+        except OSError:
+            pass
 
     def _finish(self, placement, token, status, error=None):
         """Exactly one log row per play, however it ends."""
@@ -160,9 +273,12 @@ class AdManager:
             slot = self._slots.get(placement)
             if not slot or slot.get("token") is not token or not slot["busy"]:
                 return
-            item, started = slot["item"], slot["started"]
-            slot.update(busy=False, token=None, item=None, deadline=None,
-                        idle_until=time.monotonic() + GAP_BETWEEN_ADS_SECONDS)
+            item, started, proof = slot["item"], slot["started"], slot.get("proof")
+            pause = GAP_BETWEEN_ADS_SECONDS
+            if status == "dismissed" and item.get("mode", "repeat") in ("repeat", "full"):
+                pause = DISMISS_COOLDOWN_SECONDS
+            slot.update(busy=False, token=None, item=None, deadline=None, proof=None,
+                        idle_until=time.monotonic() + pause)
         ended = self.now()
         self.log.add({
             "ad_id": item.get("id"), "title": item.get("title"), "media_type": item.get("type"),
@@ -170,6 +286,7 @@ class AdManager:
             "play_started_at": _now_iso(started), "play_ended_at": _now_iso(ended),
             "duration_played_sec": round(max(0.0, (ended - started).total_seconds()), 2),
             "error_message": (error or "")[:300] or None,
+            "proof_path": proof[0] if proof else None, "proof_captured_at": proof[1] if proof else None,
         })
         self._upload_wake.set()
 
@@ -199,6 +316,44 @@ class AdManager:
             return 0
         return len(rows)
 
+    def upload_proofs_once(self):
+        """Send the screenshots of plays the server has stored. Returns how many were sent."""
+        sent = 0
+        for row in self.log.proofs_due():
+            try:
+                with open(row["proof_path"], "rb") as f:
+                    image = base64.b64encode(f.read()).decode("ascii")
+            except OSError:
+                self.log.proof_done(row["id"])  # the file is gone; nothing to send
+                continue
+            ok = self.send({"ADS_PROOF": {"local_id": row["id"], "ad_id": row["ad_id"],
+                                          "play_started_at": row["play_started_at"],
+                                          "captured_at": row["proof_captured_at"], "image": image,
+                                          "utc_offset_min": utc_offset_minutes()}})
+            if not ok:
+                self.log.proof_unsent(row["id"])
+                break
+            sent += 1
+        return sent
+
+    def status(self):
+        """ADS_STATUS: is the player able to show ads, what's on screen, can it prove it."""
+        with self._lock:
+            playing = [slot["item"].get("id") for slot in self._slots.values() if slot.get("busy") and slot.get("item")]
+        proof = bool(self.backend.plays_itself and self.backend.available and self.capture.available)
+        return {"available": bool(self.backend.available), "backend": self.backend.name,
+                "playing": [p for p in playing if str(p or "").startswith("xparo-")], "proof": proof,
+                "utc_offset_min": utc_offset_minutes()}
+
+    def status_once(self):
+        return self.send({"ADS_STATUS": self.status()})
+
+    def _safe_status(self):
+        try:
+            self.status_once()
+        except Exception:
+            log.exception("ad status report failed")
+
     # --------------------------------------------------------------- threads
     def _tick_loop(self):
         while not self._stop.wait(TICK_SECONDS):
@@ -215,5 +370,11 @@ class AdManager:
                 return
             try:
                 self.upload_once()
+                self.upload_proofs_once()
             except Exception:
                 log.exception("ad play upload failed")
+
+    def _status_loop(self):
+        while not self._stop.is_set():
+            self._safe_status()
+            self._stop.wait(STATUS_EVERY_SECONDS)

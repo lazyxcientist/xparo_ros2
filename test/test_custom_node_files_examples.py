@@ -163,36 +163,63 @@ class TestCustomNodeFilesExamples:
         NODE_REGISTRY.pop("Overridden", None)
 
 
+
 class TestResyncKeepsNodesAvailable:
     """Confirmed live on a real robot: every (re)connect re-syncs custom
     nodes, and that used to unregister them all before re-registering --
     recompiling each C++ node in between -- so a task arriving meanwhile
-    failed with "<greet_example_cpp> isn't a node this robot knows"."""
+    failed with "<greet_example_cpp> isn't a node this robot knows".
+    Self-contained (own bash + faked-compile C++ node), no example files."""
+
+    TAGS = ["ResyncBashNode", "ResyncCppNode"]
+    PAYLOAD = {
+        "resync_bash": {"language": "bash", "xml_tag": "ResyncBashNode", "node_type": "action",
+                        "source": "#!/usr/bin/env bash\nexit 0\n", "ports": []},
+        "resync_cpp": {"language": "cpp", "xml_tag": "ResyncCppNode", "node_type": "action",
+                       "source": "// never really compiled", "ports": []},
+    }
+
+    @pytest.fixture(autouse=True)
+    def _registry(self):
+        for tag in self.TAGS:
+            NODE_REGISTRY.pop(tag, None)
+        yield
+        for tag in self.TAGS:
+            NODE_REGISTRY.pop(tag, None)
+
+    def _engine(self, tmp_path):
+        from xparo.engine import Engine
+        engine = Engine("secret", "proj-resync-test", connection_type="offline")
+        engine.files["xparo_custom_behaviors_folder_path"] = str(tmp_path)
+        return engine
 
     def test_nothing_already_registered_disappears_while_a_resync_compiles(self, tmp_path):
         from unittest.mock import patch
         from xparo.bt_engine import runners
-        engine = _make_engine_with_real_examples(tmp_path)
-        assert engine.sync_custom_node_files(None) == []
+        engine = self._engine(tmp_path)
+        with patch.object(runners, 'compile_cpp_node', return_value=("/bin/true", None)):
+            assert engine.sync_custom_node_files(self.PAYLOAD) == []
+        assert all(tag in NODE_REGISTRY for tag in self.TAGS)
 
         missing_during_compile = []
-        real_compile = runners.compile_cpp_node
 
         def watching_compile(*args, **kwargs):
-            missing_during_compile.extend(t for t in _EXAMPLE_TAGS if t not in NODE_REGISTRY)
-            return real_compile(*args, **kwargs)
+            missing_during_compile.extend(t for t in self.TAGS if t not in NODE_REGISTRY)
+            return "/bin/true", None
 
         with patch.object(runners, 'compile_cpp_node', side_effect=watching_compile):
-            assert engine.sync_custom_node_files(None) == []
+            assert engine.sync_custom_node_files(self.PAYLOAD) == []
 
         assert missing_during_compile == []
-        for tag in _EXAMPLE_TAGS:
-            assert tag in NODE_REGISTRY
+        assert all(tag in NODE_REGISTRY for tag in self.TAGS)
 
     def test_a_node_that_was_removed_is_unregistered_after_the_resync(self, tmp_path):
-        engine = _make_engine_with_real_examples(tmp_path)
-        engine.sync_custom_node_files(None)
-        engine._custom_node_file_tags = set(engine._custom_node_file_tags) | {"GoneNode"}
-        NODE_REGISTRY["GoneNode"] = NODE_REGISTRY["GreetExample"]
-        engine.sync_custom_node_files(None)
-        assert "GoneNode" not in NODE_REGISTRY
+        from unittest.mock import patch
+        from xparo.bt_engine import runners
+        engine = self._engine(tmp_path)
+        with patch.object(runners, 'compile_cpp_node', return_value=("/bin/true", None)):
+            engine.sync_custom_node_files(self.PAYLOAD)
+            assert "ResyncCppNode" in NODE_REGISTRY
+            engine.sync_custom_node_files({"resync_bash": self.PAYLOAD["resync_bash"]})
+        assert "ResyncBashNode" in NODE_REGISTRY
+        assert "ResyncCppNode" not in NODE_REGISTRY

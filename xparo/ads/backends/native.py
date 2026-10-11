@@ -34,9 +34,12 @@ PLAYER_GRACE_SECONDS = 10  # ffplay's own -t should end it; this catches a hung 
 BADGE_SIZE = (86, 30)
 
 
-def ffplay_command(path, media_type, box, duration, mute=False, ffplay="ffplay"):
-    """The ffplay command line for a video (placed over `box`) or a voice ad (no window)."""
+def ffplay_command(path, media_type, box, duration, mute=False, ffplay="ffplay", loop=False):
+    """The ffplay command line for a video (placed over `box`) or a voice ad (no window).
+    loop: start again at the end until `duration` is up (a "full slot" booking)."""
     cmd = [ffplay, "-hide_banner", "-loglevel", "error", "-autoexit", "-t", f"{float(duration):g}"]
+    if loop:
+        cmd += ["-loop", "0"]
     if media_type == "audio":
         cmd.append("-nodisp")
     else:
@@ -275,7 +278,7 @@ class NativeBackend(DisplayBackend):
                               font=("Helvetica", 16, "bold"), wraplength=box[2] - 30).pack(fill="both", expand=True, padx=14)
                 play.windows.append(win)
             play.proc = self.popen(ffplay_command(path, media_type, box, duration, mute=item.get("mute", False),
-                                                  ffplay=ffplay),
+                                                  ffplay=ffplay, loop=bool(item.get("loop"))),
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             self._watch_player(play, duration)
         else:
@@ -309,12 +312,15 @@ class NativeBackend(DisplayBackend):
                 return
             badge = self._window((x + w - bw - 6, y + 6, bw, bh), bg="#202024")
             self.tk.Label(badge, text="Ad", fg="#e7e5e4", bg="#202024", font=("Helvetica", 11, "bold")).pack(side="left", padx=(8, 2))
-            self.tk.Button(badge, text="✕", command=lambda: play.finish("dismissed"), fg="#ffffff", bg="#202024",
-                           activebackground="#ff7722", bd=0, highlightthickness=0, font=("Helvetica", 12, "bold"),
-                           cursor="hand2").pack(side="right", padx=(2, 6))
+            if closable:
+                self.tk.Button(badge, text="✕", command=lambda: play.finish("dismissed"), fg="#ffffff", bg="#202024",
+                               activebackground="#ff7722", bd=0, highlightthickness=0, font=("Helvetica", 12, "bold"),
+                               cursor="hand2").pack(side="right", padx=(2, 6))
             play.windows.append(badge)
 
-        delay = max(0, min(int(play.item.get("close_delay_sec") or 0), 30))
+        # The listing's choice: no close button means viewers can't dismiss it (the "Ad" label stays).
+        closable = play.item.get("close_button", True) is not False
+        delay = max(0, min(int(play.item.get("close_delay_sec") or 0), 30)) if closable else 0
         if delay:
             play.after(delay * 1000, show)
         else:

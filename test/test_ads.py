@@ -2,10 +2,12 @@
 the play log and its upload, the schedule store, AdManager's exactly-once
 logging, the native player's command lines, the ROS 2 hand-off to
 XP-shell, and the Engine wiring. No display or ROS needed."""
+import base64
 import datetime
 import io
 import json
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -182,7 +184,7 @@ def make_manager(tmp_path, backend, sent=None, ok=True):
     def send(payload):
         sent.append(payload)
         return ok
-    manager = AdManager(str(tmp_path / "ads"), send=send, backend=backend, now=lambda: MON_10AM)
+    manager = AdManager(str(tmp_path / "ads"), send=send, backend=backend, now=lambda: MON_10AM, capture=FakeCapture())
     manager.backend.start(manager)
     return manager, sent
 
@@ -345,3 +347,194 @@ def test_engine_setup_ads_off(tmp_path):
         assert os.path.isdir(os.path.join(str(tmp_path), "xparo", "proj-ads-test", "ads"))
     finally:
         manager.stop()
+
+
+# ------------------------------------------------------------ proof of play
+class FakeCapture:
+    """capture.ScreenCapture stand-in: writes a tiny JPEG, or fails."""
+    def __init__(self, works=True):
+        self.works = works
+        self.grabs = []
+
+    @property
+    def available(self):
+        return self.works
+
+    def grab(self, path):
+        self.grabs.append(path)
+        if not self.works:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0 fake jpeg")
+        return True
+
+
+def proof_manager(tmp_path, capture, sent=None):
+    sent = sent if sent is not None else []
+    player = FakePlayer()
+    manager = AdManager(str(tmp_path / "ads"), send=lambda p: sent.append(p) or True, backend=player,
+                        now=lambda: MON_10AM, capture=capture)
+    manager.backend.start(manager)
+    return manager, player, sent
+
+
+class TestProofOfPlay:
+    def test_first_play_each_hour_gets_a_screenshot_sent_after_the_play_is_stored(self, tmp_path, monkeypatch):
+        import xparo.ads.manager as manager_module
+        monkeypatch.setattr(manager_module, "PROOF_DELAY_SECONDS", 0.01)
+        capture = FakeCapture()
+        manager, player, sent = proof_manager(tmp_path, capture)
+        manager.items = [dict(entry("xparo-a"), proof=True)]
+        manager.tick(MON_10AM)
+        for _ in range(100):                                   # the timer thread takes the screenshot
+            if manager._slots["bottom"].get("proof"):
+                break
+            time.sleep(0.01)
+        path = manager._slots["bottom"]["proof"][0]
+        player.started[0][2]("completed")
+        row = manager.log.recent()[0]
+        assert row["proof_path"] == path and row["proof_captured_at"]
+        assert manager.upload_proofs_once() == 0               # not before the play itself is stored
+        manager.upload_once()
+        manager.on_ack({"ack": [sent[-1]["ADS_PLAYS"]["plays"][0]["local_id"]]})
+        assert manager.upload_proofs_once() == 1
+        proof = sent[-1]["ADS_PROOF"]
+        assert proof["ad_id"] == "xparo-a" and proof["play_started_at"] == row["play_started_at"]
+        assert base64.b64decode(proof["image"]).startswith(b"\xff\xd8")
+        manager.on_proof_ack({"local_id": proof["local_id"], "ok": True})
+        assert not os.path.exists(path)                        # the file is gone once the server has it
+        assert manager.upload_proofs_once() == 0
+        # The second play in the same hour gets no screenshot.
+        manager._slots["bottom"]["idle_until"] = 0
+        manager.tick(MON_10AM)
+        time.sleep(0.05)
+        assert len(capture.grabs) == 1
+
+    def test_no_proof_flag_or_failed_capture_means_no_screenshot(self, tmp_path, monkeypatch):
+        import xparo.ads.manager as manager_module
+        monkeypatch.setattr(manager_module, "PROOF_DELAY_SECONDS", 0.01)
+        manager, player, _ = proof_manager(tmp_path, FakeCapture(works=False))
+        manager.items = [dict(entry("xparo-a"), proof=True)]
+        manager.tick(MON_10AM)
+        time.sleep(0.05)
+        player.started[0][2]("completed")
+        assert manager.log.recent()[0]["proof_path"] is None
+        capture = FakeCapture()
+        manager2, player2, _ = proof_manager(tmp_path / "2", capture)
+        manager2.items = [entry("xparo-a")]                    # the listing turned screenshots off
+        manager2.tick(MON_10AM)
+        time.sleep(0.05)
+        assert capture.grabs == []
+
+    def test_a_screenshot_of_a_refused_play_is_deleted(self, tmp_path):
+        manager, _, _ = proof_manager(tmp_path, FakeCapture())
+        path = str(tmp_path / "shot.jpg")
+        open(path, "wb").write(b"x")
+        local_id = manager.log.add({"ad_id": "xparo-a", "status": "completed", "play_started_at": "2026-10-05T10:00:00",
+                                    "proof_path": path, "proof_captured_at": "2026-10-05T10:00:02"})
+        manager.on_ack({"ack": [], "rejected": [{"local_id": local_id, "reason": "outside the ad dates"}]})
+        assert not os.path.exists(path)
+        assert manager.upload_proofs_once() == 0
+
+    def test_status_reports_player_screen_and_proof_capability(self, tmp_path):
+        manager, player, sent = proof_manager(tmp_path, FakeCapture())
+        manager.items = [entry("xparo-a")]
+        manager.tick(MON_10AM)
+        assert manager.status_once()
+        status = sent[-1]["ADS_STATUS"]
+        assert status["available"] is True and status["backend"] == "fake" and status["proof"] is True
+        assert status["playing"] == ["xparo-a"]
+        delegate = AdManager(str(tmp_path / "d"), send=lambda p: True, backend=FakeDelegate(), capture=FakeCapture())
+        assert delegate.status()["proof"] is False             # XP-shell plays it: no screenshots
+
+    def test_old_play_logs_gain_the_proof_columns(self, tmp_path):
+        import sqlite3
+        db = str(tmp_path / "old.db")
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE plays (id INTEGER PRIMARY KEY AUTOINCREMENT, ad_id TEXT, title TEXT, media_type TEXT,"
+                         " placement TEXT, status TEXT, play_started_at TEXT, play_ended_at TEXT, duration_played_sec REAL,"
+                         " error_message TEXT, uploaded INTEGER DEFAULT 0, sent_at REAL)")
+            conn.execute("INSERT INTO plays (ad_id, status) VALUES ('xparo-a', 'completed')")
+        log = PlayLog(db)
+        assert log.recent()[0]["proof_state"] == 0
+
+
+def test_jpeg_bytes_shrinks_to_the_proof_size():
+    from PIL import Image
+    from xparo.ads.capture import MAX_WIDTH, jpeg_bytes
+    data = jpeg_bytes(Image.new("RGB", (1920, 1080), (200, 30, 30)))
+    image = Image.open(io.BytesIO(data))
+    assert image.format == "JPEG" and image.width == MAX_WIDTH
+
+
+# ------------------------------------------------------------ booked slots
+def slot_entry(mode, ad_id="xparo-a", start="10:00", end="10:14", **overrides):
+    return entry(ad_id, mode=mode, start_time=start, end_time=end, valid_from="2026-10-05", valid_until="2026-10-05",
+                 slot=f"2026-10-05T{start}", slot_start=f"2026-10-05T{start}:00",
+                 slot_end=f"2026-10-05T{end[:3]}{int(end[3:]) + 1:02d}:00", **overrides)
+
+
+class TestDisplayModes:
+    def test_once_plays_a_single_time_per_slot_even_after_a_restart(self, tmp_path):
+        player = FakePlayer()
+        manager, _ = make_manager(tmp_path, player)
+        manager.items = [slot_entry("once")]
+        manager.tick(MON_10AM)
+        player.started[0][2]("completed")
+        manager._slots["bottom"]["idle_until"] = 0
+        manager.tick(MON_10AM + datetime.timedelta(minutes=1))
+        assert len(player.started) == 1                         # not again in this slot
+        # a fresh manager (robot restarted) reads its play log and still doesn't replay it
+        player2 = FakePlayer()
+        manager2, _ = make_manager(tmp_path, player2)
+        manager2.items = [slot_entry("once")]
+        manager2.tick(MON_10AM + datetime.timedelta(minutes=2))
+        assert player2.started == []
+        # the next slot is a new one
+        manager2.items = [slot_entry("once", start="10:15", end="10:29")]
+        manager2.tick(MON_10AM + datetime.timedelta(minutes=16))
+        assert len(player2.started) == 1
+
+    def test_full_slot_lasts_until_the_window_ends_and_loops(self, tmp_path):
+        class Recording(FakePlayer):
+            def play(self, item, placement, on_finished):
+                self.items = getattr(self, "items", []) + [item]
+                super().play(item, placement, on_finished)
+        player = Recording()
+        manager, _ = make_manager(tmp_path, player)
+        manager.items = [slot_entry("full", end="10:29", type="video", loop=True)]
+        manager.tick(MON_10AM + datetime.timedelta(minutes=5))
+        assert player.items[0]["duration"] == pytest.approx(25 * 60 - 1)  # the rest of 10:05-10:30, less 1 s
+        assert player.items[0]["loop"] is True
+
+    def test_timed_uses_the_owners_timeout(self, tmp_path):
+        class Recording(FakePlayer):
+            def play(self, item, placement, on_finished):
+                self.items = getattr(self, "items", []) + [item]
+                super().play(item, placement, on_finished)
+        player = Recording()
+        manager, _ = make_manager(tmp_path, player)
+        manager.items = [slot_entry("timed", duration=8)]
+        manager.tick(MON_10AM)
+        assert player.items[0]["duration"] == 8
+        player.started[0][2]("completed")
+        manager._slots["bottom"]["idle_until"] = 0
+        manager.tick(MON_10AM + datetime.timedelta(minutes=1))
+        assert len(player.started) == 1                         # once per slot, like "once"
+
+    def test_a_viewer_closing_a_repeat_ad_pauses_it(self, tmp_path):
+        player = FakePlayer()
+        manager, _ = make_manager(tmp_path, player)
+        manager.items = [slot_entry("repeat")]
+        manager.tick(MON_10AM)
+        player.started[0][2]("dismissed")
+        manager.tick(MON_10AM)
+        assert len(player.started) == 1                         # 30 s before it comes back
+        assert manager._slots["bottom"]["idle_until"] - time.monotonic() > 25
+
+
+def test_ffplay_loops_for_full_slots():
+    cmd = ffplay_command("/x.mp4", "video", (0, 0, 10, 10), 900, loop=True)
+    assert cmd[cmd.index("-loop") + 1] == "0" and cmd[cmd.index("-t") + 1] == "900"
+    assert "-loop" not in ffplay_command("/x.mp4", "video", (0, 0, 10, 10), 15)

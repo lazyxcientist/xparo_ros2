@@ -860,3 +860,18 @@ def test_first_health_report_after_each_connect_is_a_full_one():
     sent.clear()
     engine.flush_health()
     assert [m["PROBLEMS_REPORT"]["full"] for m in sent if "PROBLEMS_REPORT" in m] == [True]
+
+
+
+def test_no_new_task_starts_while_an_ota_update_runs():
+    from xparo import ota
+    engine = _make_engine()
+    results = []
+    engine._send_important_dict = lambda payload: results.append(payload)
+    assert ota._update_lock.acquire(blocking=False)
+    try:
+        engine._start_task_thread({"task_id": "t1", "run_id": "r1", "task_title": "Deliver"})
+    finally:
+        ota._update_lock.release()
+    result = results[0]["TASK_RESULT"]
+    assert result["outcome"] == "updating" and result["success"] is False and result["retryable"] is True

@@ -229,6 +229,9 @@ class Xparo(Node):
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
         self.xparo_engine.on_task_event = self._on_task_event
+        # OTA updates (ota.py) end by restarting the node with the new code.
+        self.restart_requested = False
+        self.xparo_engine.restart_process = self._request_restart
         # Composable, owned by this node like self.rosbag_control above --
         # unlike that one, it needs the already-built xparo_engine (to call
         # add_live_update/add_task_history on), so it can only be
@@ -276,6 +279,14 @@ class Xparo(Node):
             status.hardware_id = hardware_id
             msg.status.append(status)
         self.self_diagnostics_pub.publish(msg)
+
+    def _request_restart(self):
+        """Called from the OTA update thread once the new version is built:
+        stops spinning; main() then shuts down cleanly and re-executes this
+        same process with the new code."""
+        self.get_logger().info("Restarting xparo to load the updated version...")
+        self.restart_requested = True
+        rclpy.try_shutdown()
 
     def _on_task_event(self, kind, info):
         """Engine.on_task_event: a task's start and result, in this node's
@@ -420,8 +431,19 @@ def main(args=None):
         xparo.xparo_engine.transport.close()
     except Exception as e:
         xparo.get_logger().warn(f"Couldn't close the dashboard connection cleanly: {e}")
-    xparo.destroy_node()
+    try:
+        xparo.destroy_node()
+    except Exception:
+        pass  # context may already be shut down (restart path)
     rclpy.try_shutdown()
+    if xparo.restart_requested:
+        # Same interpreter, same command line (orig_argv keeps a `-m
+        # xparo.xparo_ros` if that's how it was started) and same PID, so
+        # ros2 launch / systemd / the terminal keep owning it. Python and
+        # everything it loaded is replaced by the freshly built version.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable] + list(sys.orig_argv[1:]))
 
 
 if __name__ == '__main__':
