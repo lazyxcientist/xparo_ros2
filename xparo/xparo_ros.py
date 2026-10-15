@@ -29,6 +29,7 @@ from datetime import datetime
 
 
 from xparo.engine import Engine
+from xparo.task_call import TaskCallOffer
 from xparo.rosbag_control import RosbagControl, load_rosbag_config
 from xparo.diagnostics_aggregator import DiagnosticsAggregator
 from xparo.rosout_watcher import RosoutWatcher
@@ -128,6 +129,13 @@ class Xparo(Node):
         # time. Same naming convention as /xparo/ask, /xparo/task_updates.
         self.run_task_sub = self.create_subscription(String, '/xparo/run_task', self.run_task_topic_cb, 10)
         self.dash_send = self.create_publisher(String,"/xparo/response",10)
+        # AI task calling (xparo/task_call.py): ask in plain words on
+        # /xparo/ask_task; the task the AI picks (by its AI prompt) is
+        # offered on /xparo/task_call and runs on "call" sent to
+        # /xparo/task_call_confirm, or by itself after 15 s; "cancel" stops it.
+        self.ask_task_sub = self.create_subscription(String, '/xparo/ask_task', self.ask_task_cb, 10)
+        self.task_call_confirm_sub = self.create_subscription(String, '/xparo/task_call_confirm', self.task_call_confirm_cb, 10)
+        self.task_call_pub = self.create_publisher(String, '/xparo/task_call', 10)
         # Phase 4 TELEOP -- remote_ops.handle_teleop publishes here via
         # Engine's joy_publish callback, below.
         self.joy_pub = self.create_publisher(Joy, '/joy', 10)
@@ -229,6 +237,7 @@ class Xparo(Node):
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
         self.xparo_engine.on_task_event = self._on_task_event
+        self.xparo_engine.task_call = TaskCallOffer(self.xparo_engine.run_task_from_topic, self._publish_task_call)
         # OTA updates (ota.py) end by restarting the node with the new code.
         self.restart_requested = False
         self.xparo_engine.restart_process = self._request_restart
@@ -383,6 +392,24 @@ class Xparo(Node):
     def ask_question_fun(self, msg):
         user_input = str(msg.data)
         self.xparo_engine.send(user_input.upper())
+
+    def ask_task_cb(self, msg):
+        self.xparo_engine.ask_task_call(msg.data)
+
+    def task_call_confirm_cb(self, msg):
+        action = str(msg.data).strip().lower()
+        offer = self.xparo_engine.task_call
+        handled = offer.confirm() if action == "call" else offer.cancel() if action == "cancel" else None
+        if handled is None:
+            self.get_logger().error('/xparo/task_call_confirm expects "call" or "cancel"')
+        elif not handled:
+            self.get_logger().warn("No AI task call is waiting for an answer")
+
+    def _publish_task_call(self, info):
+        out = String()
+        out.data = json.dumps(info)
+        self.task_call_pub.publish(out)
+        self.get_logger().info(f"AI task call '{info.get('title') or info.get('task_id')}': {info.get('status')}")
 
     def run_task_topic_cb(self, msg):
         try:

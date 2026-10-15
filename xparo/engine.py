@@ -89,6 +89,9 @@ class Engine():
         # than an AttributeError, for Engine's standalone-outside-ROS2 use
         # (see this file's own __main__ block) and every test in this repo.
         self.bt_executor = None
+        # task_call.TaskCallOffer -- set by xparo_ros.py (it publishes the
+        # offer on a ROS topic); None = AI task calls are only answered.
+        self.task_call = None
         # ads.AdManager -- set up by setup_ads() (xparo_ros.py calls it
         # with the xparo_ads_display launch argument). None = this robot
         # shows no ads, and ads_schedule messages are ignored.
@@ -554,6 +557,14 @@ class Engine():
         if still_pending:
             with self._pending_important_sends_lock:
                 self._pending_important_sends = still_pending + self._pending_important_sends
+
+    def ask_task_call(self, question):
+        """/xparo/ask_task: ask the server's AI which task this question
+        calls (by each task's AI prompt). The answer's task_call is offered
+        through self.task_call (xparo/task_call.py) -- Call now / Cancel /
+        auto-call after 15 s, the same as the dashboard's Tasks chat."""
+        self._send_dict({"ask_bot_task_call": {"unique_id": self.local_database.unique_id,
+                                               "question": str(question)}})
 
     def send(self,message,remote_name="default"):
         filtered_data = json.dumps({"ask_bot_api":{"unique_id":self.local_database.unique_id, "data":{"from robot":"testing one.."},"question":message}})
@@ -1582,6 +1593,12 @@ class Engine():
                     "task_id": val.get("task_id"), "run_ids": cancelled, "found": bool(cancelled),
                     "message": ("Stopping..." if cancelled else "That task isn't running on this robot."),
                 }})
+            elif k=="message" and isinstance(val, dict) and isinstance(val.get("task_call"), dict):
+                # reply to ask_task_call: still published on /xparo/response
+                # like every other answer, and the task offered for calling
+                self.call_message(message)
+                if self.task_call is not None:
+                    self.task_call.offer(val["task_call"])
             elif k=="GET_RUNNING_TASKS":
                 self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
             else:
