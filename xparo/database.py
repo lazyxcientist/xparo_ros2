@@ -18,6 +18,15 @@ from .connectivity import detect_connectivity
 from .ota import summary as ota_summary
 
 
+def _fixed_location(value):
+    """(lat, lon) from "18.52,73.85", or None."""
+    try:
+        lat, lon = (float(x) for x in str(value).split(",")[:2])
+    except (TypeError, ValueError):
+        return None
+    return (lat, lon) if -90 <= lat <= 90 and -180 <= lon <= 180 else None
+
+
 class XP_Database():
     def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None):
         # Parameters
@@ -266,14 +275,21 @@ class XP_Database():
         # Network/Location data (Adding Public IP)
         return_dict["locations"] = {}
         return_dict["public_ip"] = None
-        try:
-            response = requests.get("http://ip-api.com/json/", timeout=5)
-            location_data = response.json()
-            return_dict['locations']['latitude'] = location_data.get('lat')
-            return_dict['locations']['longitude'] = location_data.get('lon')
-            return_dict['public_ip'] = location_data.get('query')
-        except requests.RequestException:
-            pass
+        # XPARO_LOCATION="lat,lon" pins the robot to its real site (an IP
+        # lookup only finds the internet provider's city); XPARO_NO_IP_LOOKUP=1
+        # stops the robot asking a third-party service (ip-api.com) at all.
+        fixed = _fixed_location(os.environ.get("XPARO_LOCATION", ""))
+        if fixed:
+            return_dict['locations']['latitude'], return_dict['locations']['longitude'] = fixed
+        elif os.environ.get("XPARO_NO_IP_LOOKUP", "").strip().lower() not in ("1", "true", "yes"):
+            try:
+                response = requests.get("http://ip-api.com/json/", timeout=5)
+                location_data = response.json()
+                return_dict['locations']['latitude'] = location_data.get('lat')
+                return_dict['locations']['longitude'] = location_data.get('lon')
+                return_dict['public_ip'] = location_data.get('query')
+            except requests.RequestException:
+                pass
 
         # Compile 'data' field with peripherals
         return_dict['data'] = {
@@ -328,6 +344,13 @@ class XP_Database():
             self.trigger_log_update(private_send)
 
     def get_device_uuid(self):
+        # XPARO_DEVICE_ID: the serial printed on the chassis (e.g. SB-0008) as
+        # the robot's identity, instead of one derived from the MAC address --
+        # set it once when the unit is built, and it shows as that serial in
+        # the fleet, subscriptions and service requests.
+        fixed = os.environ.get("XPARO_DEVICE_ID", "").strip()
+        if fixed:
+            return fixed[:100]
         # Get MAC address (which is usually stable unless hardware changes)
         # Finding F1 (HIGH): this shifted by 2 bits per byte instead of 8
         # (range(0,2*6,2) instead of range(0,8*6,8)), so only ~18 of the

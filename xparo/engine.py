@@ -1079,7 +1079,16 @@ class Engine():
             json.dump(tasks, file)
         print(f"[task_sync] synced {len(tasks)} task(s)")
 
-    def run_task_from_topic(self, task_id, override_params=None):
+    def is_this_robot(self, target):
+        """A /xparo/run_task message may name its robot ("robot": device id
+        or hostname): several robots sharing a ROS domain must not all start
+        the same delivery. No name = this robot."""
+        if not target:
+            return True
+        import socket
+        return str(target).strip() in {str(self.local_database.unique_id), socket.gethostname()}
+
+    def run_task_from_topic(self, task_id, override_params=None, allow_parallel=False):
         """/xparo/run_task's handler (xparo_ros.py) -- the locally-
         triggered counterpart to on_ws_message's own "RUN_TASK" branch
         just below, sharing the exact same dispatch (run_task.
@@ -1094,6 +1103,13 @@ class Engine():
         (Django's TASK_RESULT handler) keeps working unchanged too.
         """
         from .bt_engine import task_sync
+        if not allow_parallel and run_task.is_running(task_id):
+            # A double tap on a kiosk used to start the same delivery twice at once.
+            self._task_finished(run_task.result_message(
+                task_id, None, "busy",
+                "This task is already running on this robot. Wait for it to finish or cancel it first "
+                '(send "allow_parallel": true to run another copy on purpose).', trigger="ros_topic"))
+            return
         if self.bt_executor is None:
             print("[run_task_from_topic] no live bt_executor -- ignoring")
             self._task_finished(run_task.result_message(task_id, None, "no_executor", NO_EXECUTOR_ERROR))
@@ -1190,10 +1206,11 @@ class Engine():
             print(f'Failed to process live history: {str(e)}')
 
     def on_ws_message(self, ws, message):
-        print(message)
-        print("json recived...")
         if type(message)!=dict:
             message = json.loads(message)
+        # Only the keys: messages carry ROBOT_CREDENTIAL / REST_API_TOKEN and
+        # whole projects (trees, code), which don't belong in a robot's log.
+        print(f"server message: {', '.join(map(str, message.keys())) if isinstance(message, dict) else type(message).__name__}")
         for k,val in message.items():
             if k=="title":
                 pass
@@ -1566,7 +1583,12 @@ class Engine():
                 # repo). It used to drop the task silently, leaving the
                 # dashboard waiting; now it says why, and marks it as not
                 # worth retrying (restart_on_failure would just loop).
-                if self.bt_executor is not None:
+                if self.bt_executor is not None and run_task.is_running((val or {}).get("task_id")) \
+                        and not (val or {}).get("allow_parallel"):
+                    self._task_finished(run_task.result_message(
+                        val.get("task_id"), val.get("run_id"), "busy",
+                        "This task is already running on this robot. Wait for it to finish or cancel it first."))
+                elif self.bt_executor is not None:
                     self._start_task_thread(val)
                 else:
                     self._task_finished(run_task.result_message(

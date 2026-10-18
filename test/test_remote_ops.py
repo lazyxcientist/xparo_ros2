@@ -816,3 +816,21 @@ def test_handle_run_command_default_max_lines_unchanged_when_not_specified():
     result = responses[0]["COMMAND_RESULT"]
     assert len(result["output"].splitlines()) == remote_ops.RUN_COMMAND_MAX_LINES
     assert result["max_lines"] == remote_ops.RUN_COMMAND_MAX_LINES
+
+
+def test_list_rows_hide_secrets_and_mark_identity_params():
+    assert remote_ops.redact_param({"node": "/x", "name": "xparo_secret_key", "value": "abc"}) == \
+        {"node": "/x", "name": "xparo_secret_key", "value": "(hidden)", "protected": True}
+    assert remote_ops.redact_param({"node": "/x", "name": "xparo_stage", "value": "production"})["protected"]
+    assert remote_ops.redact_param({"node": "/x", "name": "wifi_password", "value": "pw"})["value"] == "(hidden)"
+    assert remote_ops.redact_param({"node": "/cam", "name": "fps", "value": 30}) == {"node": "/cam", "name": "fps", "value": 30}
+
+
+def test_set_refuses_identity_and_secret_params_without_running_ros2():
+    from unittest import mock
+    replies = []
+    with mock.patch.object(remote_ops.subprocess, "run") as run:
+        remote_ops.handle_set_ros2_param("/xparo", "xparo_stage", "development", "r1", replies.append)
+        remote_ops.handle_set_ros2_param("/xparo", "xparo_secret_key", "k", "r2", replies.append)
+    run.assert_not_called()
+    assert [r["SET_ROS2_PARAM_RESULT"]["success"] for r in replies] == [False, False]

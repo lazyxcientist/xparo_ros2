@@ -72,3 +72,18 @@ def test_interface_scan_exception_falls_through_to_next_step():
         with patch('xparo.database.urllib.request.urlopen', return_value=mock_cm):
             ip, source = _get_best_ip()
     assert (ip, source) == ('203.0.113.9', 'public_unreachable')
+
+
+def test_a_fixed_site_location_skips_the_ip_lookup(monkeypatch):
+    """XPARO_LOCATION pins the robot to its site; XPARO_NO_IP_LOOKUP stops the
+    third-party lookup (persona field test, 2026-10-14)."""
+    from xparo import database
+    assert database._fixed_location("18.52,73.85") == (18.52, 73.85)
+    assert database._fixed_location("nonsense") is None
+    assert database._fixed_location("200,0") is None
+
+
+def test_the_chassis_serial_can_be_the_device_id(monkeypatch):
+    from xparo import database
+    monkeypatch.setenv("XPARO_DEVICE_ID", "SB-0008")
+    assert database.XP_Database.get_device_uuid(object()) == "SB-0008"

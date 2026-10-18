@@ -288,3 +288,34 @@ class TestOnWsMessageCustomTasksSync:
         engine.on_ws_message('ws', {"custom_tasks": tasks})
 
         assert task_sync.load_custom_tasks(str(tmp_path)) == tasks
+
+
+class TestRunTaskTopicSafety:
+    """Persona field test (2026-10-14): one /xparo/run_task publish ran the
+    delivery on every robot sharing the ROS domain, and a kiosk double tap
+    ran the same delivery twice at once."""
+
+    def test_a_named_robot_only(self, tmp_path):
+        import socket
+        engine = _make_engine(tmp_path)
+        assert engine.is_this_robot(None)
+        assert engine.is_this_robot(engine.local_database.unique_id)
+        assert engine.is_this_robot(socket.gethostname())
+        assert not engine.is_this_robot("SB-0002-somewhere-else")
+
+    def test_the_same_task_twice_is_refused_while_it_runs(self, tmp_path):
+        from xparo.bt_engine import run_task
+        engine = _make_engine(tmp_path, xparo_stage="development")
+        finished = []
+        engine._task_finished = finished.append
+        engine.bt_executor = BehaviorTreeExecutor(node=MagicMock(), engine=engine)
+        import threading
+        with run_task._active_lock:
+            run_task._active_runs["already"] = {"task_id": "t1", "event": threading.Event(), "started": time.monotonic(), "reason": ""}
+        try:
+            engine.run_task_from_topic("t1", {})
+        finally:
+            with run_task._active_lock:
+                run_task._active_runs.pop("already", None)
+        assert finished and finished[0]["TASK_RESULT"]["outcome"] == "busy"
+        assert finished[0]["TASK_RESULT"]["retryable"] is False

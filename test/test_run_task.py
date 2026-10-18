@@ -311,3 +311,53 @@ class TestRunTaskOnWsMessageRoundTrip:
         assert results[0]["outcome"] == "no_executor"
         assert results[0]["retryable"] is False
         assert "ROS 2" in results[0]["error"]
+
+
+class TestUserMessage:
+    """Persona field test (2026-10-14): staff saw "fail_table_unknown
+    (AlwaysFailure): AlwaysFailure always returns FAILURE" for an order to a
+    table that isn't on the outlet's map. A tree writes what a person should
+    read to the user_message blackboard key; it rides along on TASK_RESULT."""
+
+    def test_a_failed_run_carries_the_message_set_in_the_tree(self):
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock())
+        responses = []
+        tree = ('<Sequence><SetBlackboard output_key="user_message" '
+                'value="Table 7 is not on this outlet\'s map. Please serve it by hand."/>'
+                '<AlwaysFailure name="fail_table_unknown"/></Sequence>')
+        handle_run_task(executor, {"task_id": "t-msg", "tree_xml": tree, "blackboard": {}, "save_task_history": False},
+                        responses.append, xparo_stage="development")
+        result = responses[0]["TASK_RESULT"]
+        assert result["success"] is False
+        assert result["user_message"] == "Table 7 is not on this outlet's map. Please serve it by hand."
+        assert "fail_table_unknown" in result["explanation"]  # the technical side is still there
+
+    def test_no_message_is_an_empty_string(self):
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock())
+        responses = []
+        handle_run_task(executor, {"task_id": "t-ok", "tree_xml": "<AlwaysSuccess/>", "blackboard": {},
+                                   "save_task_history": False}, responses.append, xparo_stage="development")
+        assert responses[0]["TASK_RESULT"]["user_message"] == ""
+
+    def test_a_custom_node_can_set_the_message_as_the_docs_say(self):
+        import py_trees as pt
+        from xparo.bt_engine.node_registry import NODE_REGISTRY
+
+        class _Says(pt.behaviour.Behaviour):
+            def __init__(self, name, blackboard):
+                super().__init__(name=name)
+                self.blackboard = blackboard
+
+            def update(self):
+                self.blackboard["user_message"] = "Navigation is down, serve table 5 by hand."
+                return common.Status.FAILURE
+
+        NODE_REGISTRY["_SaysAndFails"] = lambda name, attrs, blackboard, children, ros_node: _Says(name, blackboard)
+        try:
+            responses = []
+            handle_run_task(BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock()),
+                            {"task_id": "t-node", "tree_xml": "<_SaysAndFails/>", "blackboard": {}, "save_task_history": False},
+                            responses.append, xparo_stage="development")
+        finally:
+            del NODE_REGISTRY["_SaysAndFails"]
+        assert responses[0]["TASK_RESULT"]["user_message"] == "Navigation is down, serve table 5 by hand."

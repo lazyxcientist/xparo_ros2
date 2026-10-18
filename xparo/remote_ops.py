@@ -298,7 +298,7 @@ def handle_list_ros2_params(node, send_response):
                 errors.append(f"{full_node_name}: {(result.stderr or 'dump failed').strip()}")
                 continue
             for name, value in _parse_param_dump(result.stdout):
-                params.append({"node": full_node_name, "name": name, "value": value})
+                params.append(redact_param({"node": full_node_name, "name": name, "value": value}))
         except subprocess.TimeoutExpired:
             errors.append(f"{full_node_name}: dump timed out")
         except Exception as e:
@@ -307,9 +307,42 @@ def handle_list_ros2_params(node, send_response):
     send_response({"ROS2_PARAMS": {"params": params, "errors": errors}})
 
 
+# Parameters the dashboard may see but never change: the robot's identity
+# and release stage come from its launch. Secrets are never sent at all.
+IDENTITY_PARAMS = {"xparo_project_id", "xparo_secret_key", "xparo_stage", "xparo_environment", "xparo_folder"}
+_SECRET_WORDS = ("secret", "token", "password", "passwd", "credential", "api_key", "apikey", "private_key")
+REDACTED = "(hidden)"
+
+
+def is_secret_param(name):
+    low = str(name or "").lower()
+    return any(w in low for w in _SECRET_WORDS)
+
+
+def is_protected_param(name):
+    return str(name or "") in IDENTITY_PARAMS or is_secret_param(name)
+
+
+def redact_param(param):
+    """One ROS2_PARAMS row as the dashboard may see it."""
+    name = param.get("name")
+    out = dict(param)
+    if is_secret_param(name):
+        out["value"] = REDACTED
+    if is_protected_param(name):
+        out["protected"] = True
+    return out
+
+
 def handle_set_ros2_param(node_name, param_name, value, request_id, send_response):
     """Runs `ros2 param set` as an argv list, deliberately NOT shell=True
     -- node_name/param_name/value all arrive over the network."""
+    if is_protected_param(param_name):
+        send_response({"SET_ROS2_PARAM_RESULT": {
+            "request_id": request_id, "node": node_name, "name": param_name, "success": False,
+            "message": f"{param_name} can only be changed on the robot itself (relaunch it with the new value).",
+        }})
+        return
     try:
         result = subprocess.run(
             ["ros2", "param", "set", node_name, param_name, str(value)],

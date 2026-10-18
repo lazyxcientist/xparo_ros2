@@ -394,7 +394,12 @@ class Xparo(Node):
         if not task_id:
             self.get_logger().error('/xparo/run_task message missing "task_id"')
             return
-        self.xparo_engine.run_task_from_topic(task_id, payload.get("override_params"))
+        target = payload.get("robot") or payload.get("device_id")
+        if not self.xparo_engine.is_this_robot(target):
+            self.get_logger().info(f'/xparo/run_task for robot {target!r} ignored: that is not this robot')
+            return
+        self.xparo_engine.run_task_from_topic(task_id, payload.get("override_params"),
+                                              allow_parallel=bool(payload.get("allow_parallel")))
     ####################################################
     ####################################################
 

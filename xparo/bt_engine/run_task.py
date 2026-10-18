@@ -43,11 +43,12 @@ ALLOWED_TASK_STAGES = {
 }
 
 
+USER_MESSAGE_KEY = "user_message"
 DEFAULT_TIMEOUT_S = 900  # Services.timeout's own default (Django)
 
 # Outcomes a retry can't fix -- Django's restart_on_failure skips these
 # instead of re-dispatching the same broken task in a tight loop.
-NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled"}
+NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled", "busy"}
 
 _active_lock = threading.Lock()
 _active_runs = {}  # run_id -> {"task_id", "event", "started", "reason"}
@@ -59,6 +60,12 @@ def active_runs():
     with _active_lock:
         return [{"run_id": run_id, "task_id": info["task_id"], "running_s": round(now - info["started"], 1)}
                 for run_id, info in _active_runs.items()]
+
+
+def is_running(task_id):
+    """True while a run of task_id is going on this robot."""
+    with _active_lock:
+        return any(info["task_id"] == task_id for info in _active_runs.values())
 
 
 def cancel_task(task_id=None, run_id=None, reason="cancelled from the dashboard"):
@@ -222,6 +229,11 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
 
     final_blackboard = _json_safe(report.get("blackboard") or {})
     report["blackboard"] = final_blackboard
+    # What a person at the robot should read (kiosk, restaurant staff, the
+    # client's dashboard): any node -- or a plain SetBlackboard -- writes it
+    # to the "user_message" blackboard key. The explanation stays technical.
+    user_message = str(final_blackboard.get(USER_MESSAGE_KEY) or "").strip()[:500]
+    report["user_message"] = user_message  # kept in the task history too
     report["blackboard_diff"] = _blackboard_diff(blackboard, final_blackboard)
     report.update(context)
     success = bool(report.get("success"))
@@ -241,6 +253,7 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         "outcome": outcome,
         "retryable": outcome not in NOT_RETRYABLE,
         "explanation": report.get("explanation", ""),
+        "user_message": user_message,
         "failed_node": report.get("failed_node"),
         "stats": report.get("stats") or {},
         **context,
