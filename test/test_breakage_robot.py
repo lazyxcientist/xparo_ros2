@@ -579,3 +579,34 @@ def test_no_journal_means_a_normal_start(tmp_path):
     ran = []
     assert _launch_module().recover_interrupted_update(str(tmp_path / "none.json"), run=lambda *a: ran.append(a)) is None
     assert ran == []
+
+
+# ---- #28: rosbag uploads use the robot's own credential ----
+def test_uploads_authenticate_as_the_robot(tmp_path, monkeypatch):
+    from xparo import blackbox_manager
+    o = _orchestrator(tmp_path, state="closed")
+    o.use_robot_credential("robot-cred-123")
+    _bag(tmp_path, "bag_done", 500)
+    monkeypatch.setattr(blackbox_manager, "build_sensor_data", lambda p: {})
+    sent = {}
+    monkeypatch.setattr(blackbox_manager.requests, "post",
+                        lambda url, **kw: sent.update(kw) or MagicMock(status_code=201))
+    monkeypatch.setattr(o, "get_disk_usage", lambda: 10.0)
+    o._run_cycle()
+    assert sent["headers"]["Authorization"] == "RobotToken robot-cred-123"
+
+
+# ---- #29: secrets never leave the robot through the params popup ----
+def test_secret_parameters_are_hidden_in_the_params_list(monkeypatch):
+    import subprocess
+    from xparo import remote_ops
+    node = MagicMock()
+    node.get_node_names_and_namespaces.return_value = [("xparo", "/")]
+    dump = "/xparo:\n  ros__parameters:\n    xparo_secret_key: abc123\n    xparo_project_id: p1\n    wifi_password: hunter2\n"
+    monkeypatch.setattr(remote_ops.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, dump, ""))
+    out = []
+    remote_ops.handle_list_ros2_params(node, out.append)
+    values = {p["name"]: p["value"] for p in out[0]["ROS2_PARAMS"]["params"]}
+    assert values["xparo_secret_key"] == "(hidden)" and values["wifi_password"] == "(hidden)"
+    assert values["xparo_project_id"] == "p1"

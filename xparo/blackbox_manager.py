@@ -31,6 +31,9 @@ class BlackboxOrchestrator:
         # engine.py's on_ws_message) -- manage_disk_and_upload below treats
         # an empty token as "not armed yet" and skips uploads until then.
         self.API_TOKEN = ""
+        # "RobotToken" = this robot's own credential (newer servers);
+        # "Token" = the legacy REST_API_TOKEN some servers still send.
+        self.AUTH_SCHEME = "Token"
         self.xparo_website_url = xparo_website_url
         self.BAG_DIR = BAG_DIR
         # None when there's no live rclpy node to drive recording through
@@ -111,6 +114,13 @@ class BlackboxOrchestrator:
             prefix = os.path.abspath(uri) + os.sep
             return {b for b in bags if os.path.abspath(b).startswith(prefix)}
         return {max(bags, key=os.path.getmtime)} if bags else set()
+
+    def use_robot_credential(self, credential):
+        """Uploads authenticate as this robot (its ROBOT_CREDENTIAL), not with
+        the project owner's personal API token the server used to hand out."""
+        if credential:
+            self.API_TOKEN = str(credential).strip()
+            self.AUTH_SCHEME = "RobotToken"
 
     def _note_upload_failure(self):
         self._upload_failures += 1
@@ -274,7 +284,7 @@ class BlackboxOrchestrator:
                         'data': json.dumps(sensor_data),
                         'sensor_type': 'rosbag'
                     }
-                    headers = {'Authorization': f'Token {self.API_TOKEN}'}
+                    headers = {'Authorization': f'{self.AUTH_SCHEME} {self.API_TOKEN}'}
 
                     response = requests.post(
                         self.xparo_website_url+"/api/upload_rosbag/",

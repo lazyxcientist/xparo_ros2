@@ -267,6 +267,14 @@ def _coerce_param_value(value):
     return value.strip('"\'')
 
 
+_SECRET_PARAM_WORDS = ("secret", "password", "passwd", "token", "credential", "api_key", "apikey", "private_key")
+
+
+def is_secret_param(name):
+    lowered = str(name).lower()
+    return any(word in lowered for word in _SECRET_PARAM_WORDS)
+
+
 def handle_list_ros2_params(node, send_response):
     """Runs in its own thread (see engine.py's dispatch) -- bounded by
     LIST_PARAMS_TOTAL_BUDGET_SEC across every node combined, so a stuck
@@ -300,6 +308,10 @@ def handle_list_ros2_params(node, send_response):
                 errors.append(f"{full_node_name}: {(result.stderr or 'dump failed').strip()}")
                 continue
             for name, value in _parse_param_dump(result.stdout):
+                if is_secret_param(name):
+                    # e.g. xparo_secret_key: anyone who could open the
+                    # params popup (a Viewer too) used to read it in clear
+                    value = "(hidden)"
                 params.append({"node": full_node_name, "name": name, "value": value})
         except subprocess.TimeoutExpired:
             errors.append(f"{full_node_name}: dump timed out")

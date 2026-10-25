@@ -280,6 +280,7 @@ class Engine():
                                             xparo_website_url,
                                             self.BAG_DIR,self.record_bags,rosbag_control,
                                             unique_id=self.device_id)
+        self._arm_uploads(persisted_credential)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
         except:
@@ -646,6 +647,11 @@ class Engine():
                 os.remove(self._outbox_path)
         except OSError as e:
             print(f"[xparo] couldn't save the offline outbox: {e}")
+
+    def _arm_uploads(self, credential):
+        orchestrator = getattr(getattr(self, "local_database", None), "orchestrator", None)
+        if orchestrator is not None and credential:
+            orchestrator.use_robot_credential(credential)
 
     def is_online(self):
         """True when messages can reach the XPARO server right now."""
@@ -1533,6 +1539,7 @@ class Engine():
             self._send_dict({"LOCAL_FILE_CONTENT": self.get_local_file_content(val)})
         elif k=="ROBOT_CREDENTIAL":
             self._persist_credential(val)
+            self._arm_uploads(val)
         elif k=="get_initial_local_env_data":
             self.get_initial_local_env_data()
         elif k=="sync_local_database":

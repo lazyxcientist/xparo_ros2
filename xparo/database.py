@@ -208,7 +208,8 @@ class XP_Database():
                         if val:
                             self.remove_data(val)
                     elif command == "REST_API_TOKEN":
-                        if self.orchestrator:
+                        # only old servers send this; a robot credential wins
+                        if self.orchestrator and self.orchestrator.AUTH_SCHEME != "RobotToken":
                             self.orchestrator.API_TOKEN = str(val).strip()
                             self.orchestrator._process_uploads()
                     elif command == "needed_robot_data":
