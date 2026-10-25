@@ -59,8 +59,9 @@ def test_database_path_is_the_same_regardless_of_which_cwd_launched_it():
 
 def test_eval_key_is_not_specially_handled():
     """The old `elif k=="eval": return eval(val)` branch is gone -- an
-    "eval" key now falls through to call_message like any other unknown
-    key, and critically is never passed to Python's eval().
+    "eval" key is now ignored like any other unknown key (breakage review
+    #98: unknown keys are no longer republished on /xparo/response), and
+    critically is never passed to Python's eval().
     """
     engine = _make_engine()
     received = []
@@ -70,7 +71,7 @@ def test_eval_key_is_not_specially_handled():
     # up the test run -- the point of the test is that it doesn't.
     engine.on_ws_message('ws', {"eval": "__import__('os').system('true')"})
 
-    assert received == [{"eval": "__import__('os').system('true')"}]
+    assert received == []
 
 
 def test_record_bags_true_reaches_orchestrator_construction():

@@ -37,6 +37,7 @@ logs. It also enforces the task's time limit, can be cancelled, and halts
 every running node cleanly whenever a run ends early.
 """
 import platform
+import threading
 import time
 import traceback
 from collections import deque
@@ -133,6 +134,51 @@ class _TraceVisitor(py_trees.visitors.VisitorBase):
             s.run_started = None
         s.halts += 1
         s.last_status = "HALTED"
+
+
+class _Ticker:
+    """Runs tree.tick() on one long-lived helper thread and waits for it
+    while watching the cancel event and the time limit (checked every
+    0.1 s). A tick still blocked when either fires is abandoned: the run is
+    reported and released right away; the blocked call itself can only end
+    when it returns (Python threads can't be killed)."""
+
+    def __init__(self, tree):
+        self._tree = tree
+        self._request = threading.Event()
+        self._done = threading.Event()
+        self._error = None
+        self._closed = False
+        self.abandoned = False
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="xparo-bt-tick")
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            self._request.wait()
+            self._request.clear()
+            if self._closed:
+                return
+            try:
+                self._tree.tick()
+                self._error = None
+            except Exception as e:
+                self._error = e
+            self._done.set()
+
+    def tick(self, cancel_event=None, deadline=None):
+        self._done.clear()
+        self._request.set()
+        while not self._done.wait(0.1):
+            if cancel_event is not None and cancel_event.is_set():
+                return "cancelled", None
+            if deadline is not None and time.monotonic() >= deadline:
+                return "timeout", None
+        return ("error", self._error) if self._error is not None else ("ok", None)
+
+    def close(self):
+        self._closed = True
+        self._request.set()
 
 
 class BehaviorTreeExecutor:
@@ -242,6 +288,7 @@ class BehaviorTreeExecutor:
 
         interval = (1.0 / tick_rate_hz) if tick_rate_hz else 0
         deadline = (t0 + timeout_s) if timeout_s else None
+        ticker = _Ticker(tree)
         ticks = 0
         stop_reason = None
         exception = None
@@ -256,12 +303,19 @@ class BehaviorTreeExecutor:
             if max_ticks is not None and ticks >= max_ticks:
                 stop_reason = "tick_limit"
                 break
-            try:
-                tree.tick()
-            except Exception as e:
-                exception = e
+            # Ticked in a helper thread so a node that blocks (sleep(600),
+            # a socket wait) can't hold off the time limit and Cancel:
+            # those used to be checked only between ticks, so such a task
+            # never stopped and blocked OTA updates behind it.
+            tick_state, tick_error = ticker.tick(cancel_event, deadline)
+            if tick_state == "error":
+                exception = tick_error
                 stop_reason = "node_error"
                 ticks += 1
+                break
+            if tick_state in ("cancelled", "timeout"):
+                stop_reason = tick_state
+                ticker.abandoned = True
                 break
             ticks += 1
             if root.status in (common.Status.SUCCESS, common.Status.FAILURE):
@@ -273,6 +327,8 @@ class BehaviorTreeExecutor:
                     time.sleep(interval)
 
         final_status = root.status
+        if not getattr(ticker, "abandoned", False):
+            ticker.close()
         if stop_reason is not None:
             running_at_stop = [b for b in _preorder(root) if b.status == common.Status.RUNNING
                                and not getattr(b, "xparo_synthetic", False)]

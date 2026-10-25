@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from .fileutil import atomic_write, atomic_write_json
 import json
 import os
 from datetime import datetime
@@ -19,11 +20,12 @@ from .ota import summary as ota_summary
 
 
 class XP_Database():
-    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None):
+    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None,
+                 unique_id=None):
         # Parameters
         self.xparo_database_size = xparo_database_size  # Size in MB
         self.xparo_database_path = xparo_database_path
-        self.unique_id = self.get_device_uuid()
+        self.unique_id = unique_id or self.get_device_uuid()
         # self.xparo_website_url = ""
 
         ################################################
@@ -168,8 +170,7 @@ class XP_Database():
     def load_or_create_file(self, file_path, default_data):
         self.ensure_directory_exists(file_path)
         if not os.path.exists(file_path):
-            with open(file_path, 'w') as file:
-                json.dump(default_data, file)
+            atomic_write_json(file_path, default_data)
 
     ####################################################
     # Load data from file
@@ -326,6 +327,10 @@ class XP_Database():
         # reconnect rather than being silently lost.
         if self.session_id is None:
             self.trigger_log_update(private_send)
+
+    @staticmethod
+    def compute_device_uuid():
+        return XP_Database.get_device_uuid(None)
 
     def get_device_uuid(self):
         # Get MAC address (which is usually stable unless hardware changes)
@@ -590,8 +595,7 @@ class XP_Database():
                 new_logs = f.readlines()
                 pointers[rosout_file] = f.tell() # Save new position
                 
-            with open(self.log_pointers_file, 'w') as f:
-                json.dump(pointers, f)
+            atomic_write_json(self.log_pointers_file, pointers)
 
         return {"log_directory": latest_dir, "new_entries": new_logs}
 
@@ -627,8 +631,7 @@ class XP_Database():
         data[task_id] = payload
 
         # Save the updated data to file
-        with open(pth, 'w') as file:
-            json.dump(data, file)
+        atomic_write_json(pth, data)
 
         # Try to send the payload
         try:
@@ -659,8 +662,7 @@ class XP_Database():
                     del data[oldest_task_id]
 
                     # Write the updated file back
-                    with open(pth, 'w') as file:
-                        json.dump(data, file)
+                    atomic_write_json(pth, data)
                 else:
                     break  # If no more data, stop trimming
 
@@ -672,8 +674,7 @@ class XP_Database():
         if task_id in data:
             del data[task_id]  # Remove the task
             pth = os.path.join(self.xparo_database_path, "send_later.json")
-            with open(pth, 'w') as file:
-                json.dump(data, file)  # Save updated data
+            atomic_write_json(pth, data)  # Save updated data
         else:
             print(f"Task ID {task_id} not found.")
 

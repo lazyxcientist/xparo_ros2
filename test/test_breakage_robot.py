@@ -159,3 +159,179 @@ def test_cancel_task_topic_stops_a_running_task(running_t1):
     node.cancel_task_cb(Msg("t1"))
     with run_task._active_lock:
         assert run_task._active_runs["existing"]["event"].is_set()
+
+
+# ---- #31 / #98 / P29: message logging, response noise, per-key isolation ----
+def _engine():
+    from test_engine import _make_engine
+    return _make_engine()
+
+
+def test_received_messages_are_logged_by_key_and_size_only(capsys):
+    engine = _engine()
+    # keys with no side effects: the point is only what gets printed
+    engine.on_ws_message('ws', {"status": {"secret": "s3cr3t-value"}, "System": "tok-123"})
+    out = capsys.readouterr().out
+    assert "status" in out and "System" in out
+    assert "s3cr3t-value" not in out and "tok-123" not in out
+
+
+def test_only_assistant_replies_reach_xparo_response():
+    engine = _engine()
+    published = []
+    engine.call_message = lambda message, **kw: published.append(message)
+    engine.on_ws_message('ws', {"status": "x", "System": {"big": "sync"}})
+    assert published == []
+    engine.on_ws_message('ws', {"message": {"bot_response": "hi"}})
+    assert published == [{"message": {"bot_response": "hi"}}]
+
+
+def test_one_failing_key_does_not_skip_the_rest():
+    engine = _engine()
+    seen = []
+    original = engine._on_ws_key
+
+    def flaky(k, val, message):
+        if k == "first":
+            raise OSError("disk full")
+        seen.append(k)
+        return original(k, val, message)
+    engine._on_ws_key = flaky
+    engine.on_ws_message('ws', {"first": 1, "message": {"bot_response": "still here"}})
+    assert seen == ["message"]
+
+
+def test_non_json_text_is_ignored():
+    _engine().on_ws_message('ws', "not json {")   # must not raise
+
+
+# ---- #33 / #34 / #35: results survive restarts; heartbeat and files survive faults ----
+def test_unsent_results_survive_a_restart():
+    engine = _engine()
+    engine._try_send_dict = lambda payload: False          # offline
+    engine._send_important_dict({"TASK_RESULT": {"task_id": "t1", "success": True}})
+    reborn = _engine()                                     # power cut, new process
+    assert reborn._pending_important_sends == [{"TASK_RESULT": {"task_id": "t1", "success": True}}]
+    sent = []
+    reborn._try_send_dict = lambda payload: sent.append(payload) or True
+    reborn._flush_pending_important_sends()
+    assert sent and _engine()._pending_important_sends == []   # cleared once delivered
+
+
+def test_outbox_is_bounded(monkeypatch):
+    from xparo import engine as engine_module
+    monkeypatch.setattr(engine_module, "MAX_OUTBOX_MESSAGES", 3)
+    engine = _engine()
+    engine._try_send_dict = lambda payload: False
+    for i in range(5):
+        engine._send_important_dict({"n": i})
+    assert [p["n"] for p in engine._pending_important_sends] == [2, 3, 4]
+
+
+def test_heartbeat_loop_survives_errors(monkeypatch):
+    from xparo import engine as engine_module
+    engine = _engine()
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        if len(calls) >= 3:
+            raise SystemExit  # stop the endless loop for the test
+        raise OSError("No space left on device")
+    engine.private_send = boom
+    monkeypatch.setattr(engine_module.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit):
+        engine._logging_update_loop()
+    assert len(calls) == 3                                  # kept going after failures
+
+
+def test_atomic_write_keeps_old_content_when_writing_fails(tmp_path, monkeypatch):
+    from xparo import fileutil
+    target = tmp_path / "tasks.json"
+    fileutil.atomic_write_json(str(target), {"t1": {}})
+    monkeypatch.setattr(fileutil.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        fileutil.atomic_write_json(str(target), {"t2": {}})
+    assert target.read_text() == '{"t1": {}}'
+    assert [p.name for p in tmp_path.iterdir()] == ["tasks.json"]   # no temp files left behind
+
+
+# ---- #36: a node that blocks can't hold off the time limit or Cancel ----
+@pytest.fixture
+def blocking_node():
+    import py_trees
+    from py_trees import common
+    from xparo.bt_engine.node_registry import NODE_REGISTRY
+    release = threading.Event()
+
+    class _Blocks(py_trees.behaviour.Behaviour):
+        def update(self):
+            release.wait(30)           # a custom node doing time.sleep(600)
+            return common.Status.SUCCESS
+
+    NODE_REGISTRY["_BlocksForever"] = lambda name, attrs, blackboard, children, ros_node: _Blocks(name=name or "b")
+    yield
+    release.set()
+    del NODE_REGISTRY["_BlocksForever"]
+
+
+def test_time_limit_stops_a_blocked_node(blocking_node):
+    import time
+    from xparo.bt_engine.executor import BehaviorTreeExecutor
+    executor = BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock())
+    started = time.monotonic()
+    report = executor.run_with_trace("<_BlocksForever />", timeout_s=0.5, tick_rate_hz=0)
+    assert report["outcome"] == "timeout"
+    assert time.monotonic() - started < 3
+
+
+def test_cancel_stops_a_blocked_node(blocking_node):
+    import time
+    from xparo.bt_engine.executor import BehaviorTreeExecutor
+    executor = BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock())
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    report = executor.run_with_trace("<_BlocksForever />", cancel_event=cancel, tick_rate_hz=0)
+    assert report["outcome"] == "cancelled"
+    assert time.monotonic() - started < 3
+
+
+# ---- #3 / #99: cloned SD cards get their own identity; a new dongle doesn't ----
+def test_identity_is_kept_across_boots_and_a_new_wifi_dongle(tmp_path):
+    from xparo import robot_identity
+    ids = iter(["id-1", "id-2"])
+    first, moved = robot_identity.resolve(str(tmp_path), lambda: next(ids), macs={"aa", "bb"})
+    assert (first, moved) == ("id-1", False)
+    # dongle "bb" swapped for "cc": same machine (aa still there), same id
+    assert robot_identity.resolve(str(tmp_path), lambda: next(ids), macs={"aa", "cc"}) == ("id-1", False)
+    # and now cc counts as this machine too
+    assert robot_identity.resolve(str(tmp_path), lambda: next(ids), macs={"cc"}) == ("id-1", False)
+
+
+def test_cloned_card_on_other_hardware_gets_a_new_identity(tmp_path):
+    from xparo import robot_identity
+    robot_identity.resolve(str(tmp_path), lambda: "original", macs={"aa"})
+    device_id, moved = robot_identity.resolve(str(tmp_path), lambda: "clone", macs={"zz"})
+    assert (device_id, moved) == ("clone", True)
+
+
+def test_a_clone_drops_the_copied_credential(tmp_path, monkeypatch):
+    import json
+    import os
+    from xparo import robot_identity
+    from test_engine import _make_engine
+    engine = _make_engine()
+    db_dir = engine._state_dir
+    with open(os.path.join(db_dir, robot_identity.IDENTITY_FILE), "w") as f:
+        json.dump({"device_id": "original", "macs": ["11:11:11:11:11:11"]}, f)
+    with open(engine.xparo_credential_path, "w") as f:
+        json.dump({"value": "original-robot-credential", "project_id": engine.project_id}, f)
+    try:
+        clone = _make_engine()
+        assert clone.device_id != "original"
+        assert not os.path.exists(engine.xparo_credential_path)
+    finally:
+        for p in (engine.xparo_credential_path, os.path.join(db_dir, robot_identity.IDENTITY_FILE)):
+            if os.path.exists(p):
+                os.remove(p)

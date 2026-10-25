@@ -1,4 +1,5 @@
 import json
+from .fileutil import atomic_write, atomic_write_json
 import re
 import threading
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
 from . import remote_ops
+from . import robot_identity
 from . import connectivity
 from . import ota
 from .bt_engine import run_task
@@ -43,6 +45,36 @@ NO_EXECUTOR_ERROR = (
     "This robot's XPARO process is running without its ROS 2 node, so it can't run behaviour trees. "
     "Start XPARO on the robot with its ROS 2 launch file (ros2 launch xparo xparo_launch.py)."
 )
+
+
+def describe_message(message, limit=12):
+    """'title (12 B), FILE_CHUNK (2.1 MB)' -- what arrived, never its contents."""
+    if isinstance(message, (str, bytes)):
+        return f"raw message ({_human_size(len(message))})"
+    if not isinstance(message, dict):
+        return type(message).__name__
+    parts = []
+    for key, value in list(message.items())[:limit]:
+        try:
+            size = len(json.dumps(value, default=str))
+        except (TypeError, ValueError):
+            size = 0
+        parts.append(f"{key} ({_human_size(size)})")
+    if len(message) > limit:
+        parts.append(f"+{len(message) - limit} more")
+    return ", ".join(parts) or "empty message"
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+# Unsent task results/history kept for later: enough for a long outage,
+# bounded so a robot offline for weeks doesn't fill its disk or memory.
+MAX_OUTBOX_MESSAGES = 1000
 
 
 class Engine():
@@ -124,8 +156,13 @@ class Engine():
         # with no retry on reconnect. Queued here instead, flushed on every
         # successful (re)connection (send_initial_data, called via
         # on_connected) -- see _send_important_dict/_flush_pending_important_sends.
-        self._pending_important_sends = []
+        # Kept on disk too (outbox.json), so task results that finished
+        # while offline survive a power cut or restart, not just a reconnect.
         self._pending_important_sends_lock = threading.Lock()
+        # XPARO_STATE_DIR: tests (and unusual installs) keep this state elsewhere
+        self._state_dir = os.environ.get("XPARO_STATE_DIR") or xparo_database_path
+        self._outbox_path = os.path.join(self._state_dir, 'outbox.json')
+        self._pending_important_sends = self._load_outbox()
 
         # GET_LIVE_STATUS's uptime field -- when this Engine (this robot's
         # connection/process) itself started, not any Django-tracked
@@ -183,6 +220,16 @@ class Engine():
         # any RUN_TASK dispatch -- see xparo_ros.py's own declare_parameter
         # for the "production" default rationale.
         self.xparo_stage = xparo_stage
+        # Stable id for this machine; a cloned SD card on other hardware
+        # gets a new one and must not reuse the original robot's credential.
+        self.device_id, moved = robot_identity.resolve(self._state_dir, XP_Database.compute_device_uuid)
+        if moved:
+            print("[xparo] this SD card was set up on a different robot: registering as a new robot "
+                  "(the copied credential is not used)")
+            try:
+                os.remove(self.xparo_credential_path)
+            except FileNotFoundError:
+                pass
         persisted_credential = self._load_persisted_credential()
         effective_secret = persisted_credential or secret_key
 
@@ -231,7 +278,8 @@ class Engine():
         self.local_database = XP_Database(xparo_database_size,
                                             xparo_database_path,
                                             xparo_website_url,
-                                            self.BAG_DIR,self.record_bags,rosbag_control)
+                                            self.BAG_DIR,self.record_bags,rosbag_control,
+                                            unique_id=self.device_id)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
         except:
@@ -321,14 +369,22 @@ class Engine():
         seconds_since_resource_update = 0
         while True:
             time.sleep(HEARTBEAT_INTERVAL_SECONDS)
-
-            self.private_send(json.dumps(self._build_heartbeat_payload()), command_for="rest")
+            # Each step guarded: one failure (a full disk, a corrupt
+            # log_pointers.json, a root-owned file) used to end this
+            # thread, and the robot showed offline until rebooted.
+            try:
+                self.private_send(json.dumps(self._build_heartbeat_payload()), command_for="rest")
+            except Exception as e:
+                print(f"[xparo] heartbeat not sent: {e}")
 
             seconds_since_resource_update += HEARTBEAT_INTERVAL_SECONDS
             if seconds_since_resource_update >= self.local_database.update_interval:
                 seconds_since_resource_update = 0
-                if not self.local_database._stop_updates and self.local_database.session_id:
-                    self.local_database.update_logging_session(self.private_send)
+                try:
+                    if not self.local_database._stop_updates and self.local_database.session_id:
+                        self.local_database.update_logging_session(self.private_send)
+                except Exception as e:
+                    print(f"[xparo] resource/log update skipped: {e}")
 
     def _build_heartbeat_payload(self):
         """Extracted from _logging_update_loop so the diagnostics_level
@@ -545,6 +601,11 @@ class Engine():
             return
         with self._pending_important_sends_lock:
             self._pending_important_sends.append(payload)
+            if len(self._pending_important_sends) > MAX_OUTBOX_MESSAGES:
+                dropped = len(self._pending_important_sends) - MAX_OUTBOX_MESSAGES
+                del self._pending_important_sends[:dropped]
+                print(f"[xparo] offline outbox full: dropped the {dropped} oldest unsent result(s)")
+            self._save_outbox_locked()
 
     def _flush_pending_important_sends(self):
         """Called once a connection is confirmed usable again
@@ -557,9 +618,34 @@ class Engine():
         with self._pending_important_sends_lock:
             pending, self._pending_important_sends = self._pending_important_sends, []
         still_pending = [p for p in pending if not self._try_send_dict(p)]
-        if still_pending:
-            with self._pending_important_sends_lock:
+        with self._pending_important_sends_lock:
+            if still_pending:
                 self._pending_important_sends = still_pending + self._pending_important_sends
+            self._save_outbox_locked()
+
+    def _load_outbox(self):
+        try:
+            with open(self._outbox_path) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                if data:
+                    print(f"[xparo] {len(data)} unsent result(s) from before the restart will be sent once connected")
+                return data[-MAX_OUTBOX_MESSAGES:]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            print(f"[xparo] couldn't read the offline outbox ({e}); starting empty")
+        return []
+
+    def _save_outbox_locked(self):
+        """Caller holds _pending_important_sends_lock."""
+        try:
+            if self._pending_important_sends:
+                atomic_write_json(self._outbox_path, self._pending_important_sends)
+            elif os.path.exists(self._outbox_path):
+                os.remove(self._outbox_path)
+        except OSError as e:
+            print(f"[xparo] couldn't save the offline outbox: {e}")
 
     def is_online(self):
         """True when messages can reach the XPARO server right now."""
@@ -643,8 +729,7 @@ class Engine():
         if plugins is not None:
             content = json.dumps(plugins)
             self.local_database.load_or_create_file(pth, content)
-            with open(pth, 'w') as file:
-                file.write(content)
+            atomic_write(pth, content)
         else:
             if not os.path.exists(pth):
                 return
@@ -699,10 +784,8 @@ class Engine():
                 except OSError:
                     pass
             for name, source in inline_code.items():
-                with open(os.path.join(folder, name + '.py'), 'w') as file:
-                    file.write(source)
-            with open(manifest_path, 'w') as file:
-                json.dump(list(inline_code.keys()), file)
+                atomic_write(os.path.join(folder, name + '.py'), source)
+            atomic_write_json(manifest_path, list(inline_code.keys()))
 
         names = []
         if os.path.exists(manifest_path):
@@ -741,8 +824,7 @@ class Engine():
 
     @staticmethod
     def _write_sync_state(directory, state):
-        with open(os.path.join(directory, 'sync_state.json'), 'w') as file:
-            json.dump(state, file)
+        atomic_write_json(os.path.join(directory, 'sync_state.json'), state)
 
     def sync_custom_node_files(self, custom_node_files=None):
         """Multi-language custom BT node system, Phase 5/6/7 -- the robot-
@@ -840,8 +922,7 @@ class Engine():
                 language_dir = _language_dir(language)
                 os.makedirs(language_dir, exist_ok=True)
                 source_path = os.path.join(language_dir, name + extension)
-                with open(source_path, 'w') as file:
-                    file.write(entry.get('source', ''))
+                atomic_write(source_path, entry.get('source', ''))
                 if language == 'bash':
                     os.chmod(source_path, 0o755)
                 # A fresh Django sync is by definition the new authoritative
@@ -872,8 +953,7 @@ class Engine():
                     except OSError:
                         pass
 
-            with open(manifest_path, 'w') as file:
-                json.dump(manifest, file)
+            atomic_write_json(manifest_path, manifest)
 
         manifest = {}
         if os.path.exists(manifest_path):
@@ -907,8 +987,7 @@ class Engine():
             entry['synced_at'] = datetime.utcnow().isoformat()
             manifest_needs_rewrite = True
         if manifest_needs_rewrite:
-            with open(manifest_path, 'w') as file:
-                json.dump(manifest, file)
+            atomic_write_json(manifest_path, manifest)
 
         # Git-tracked, sync-code-read-only -- ships two known-good example
         # nodes (one Action, one Condition) per language, usable with zero
@@ -1068,8 +1147,7 @@ class Engine():
         from .rosbag_control import ROSBAG_CONFIG_FILENAME
         pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"], ROSBAG_CONFIG_FILENAME)
         os.makedirs(os.path.dirname(pth), exist_ok=True)
-        with open(pth, 'w') as file:
-            json.dump(config, file)
+        atomic_write_json(pth, config)
 
         # bt_executor.node is the live Xparo node -- its own
         # rosbag_control (if this robot was launched with
@@ -1099,8 +1177,7 @@ class Engine():
         from .bt_engine.task_sync import TASKS_FILENAME
         pth = os.path.join(self.files["xparo_custom_behaviors_folder_path"], TASKS_FILENAME)
         os.makedirs(os.path.dirname(pth), exist_ok=True)
-        with open(pth, 'w') as file:
-            json.dump(tasks, file)
+        atomic_write_json(pth, tasks)
         print(f"[task_sync] synced {len(tasks)} task(s)")
 
     def run_task_from_topic(self, task_id, override_params=None):
@@ -1214,410 +1291,423 @@ class Engine():
             print(f'Failed to process live history: {str(e)}')
 
     def on_ws_message(self, ws, message):
-        print(message)
-        print("json recived...")
+        # Only key names and sizes: printing whole messages logged robot
+        # credentials, the owner's API token and every file chunk in full
+        # (filling ~/.ros/log and leaking secrets into pasted terminals).
+        print(f"[xparo] received {describe_message(message)}")
         if type(message)!=dict:
-            message = json.loads(message)
+            try:
+                message = json.loads(message)
+            except (TypeError, ValueError) as e:
+                print(f"[xparo] ignoring a message that isn't JSON: {e}")
+                return
+        if not isinstance(message, dict):
+            return
         for k,val in message.items():
-            if k=="title":
-                pass
-            elif k=="disc":
-                pass
-            elif k=="goal":
-                pass
-            elif k=="rules":
-                pass
-            elif k=="aiml":
-                content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
+            # One key failing (a full disk, a bad file) used to abort every
+            # key after it in the same sync.
+            try:
+                self._on_ws_key(k, val, message)
+            except Exception as e:
+                print(f"[xparo] handling {k!r} failed: {e}")
+
+    def _on_ws_key(self, k, val, message):
+        if k=="title":
+            pass
+        elif k=="disc":
+            pass
+        elif k=="goal":
+            pass
+        elif k=="rules":
+            pass
+        elif k=="aiml":
+            content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
 {val}
 </BehaviorTree>
 </root>'''
-                self.local_database.load_or_create_file(self.files["behavior"],content)
-                with open(self.files["behavior"], 'w') as file:
-                    file.write(content)
-            elif k=="maps":
-                content =  f'''{val}'''
-                self.local_database.load_or_create_file(self.files["env"],content)
-                with open(self.files["env"], 'w') as file:
-                    file.write(content)
-            elif k=="local_env":
-                content =  f'''{val}'''
-                self.local_database.load_or_create_file(self.files["local_env"],content)
-                with open(self.files["local_env"], 'w') as file:
-                    file.write(content)
-            elif k=="Sets":
-                content =  f'''{val}'''
-                self.local_database.load_or_create_file(self.files["file"],content)
-                with open(self.files["file"], 'w') as file:
-                    file.write(content)
-            elif k=="properties":
-                content =  f'''{val}'''
-                self.local_database.load_or_create_file(self.files["properties"],content)
-                with open(self.files["properties"], 'w') as file:
-                    file.write(content)
-            elif k=="custom_aiml":
-                # Bidirectional file sync: a synced custom_aiml entry used
-                # to be written directly into xparo_custom_behaviors_folder_path's
-                # own top level -- the exact same folder curated fixtures
-                # like quick_delivery_tree.xml live in. A user's tree
-                # merely sharing that name silently overwrote the fixture
-                # (a real, observed data-loss bug -- confirmed via `git
-                # status` showing quick_delivery_tree.xml dirty from
-                # exactly this). Its own subfolder makes that collision
-                # structurally impossible, and keeps the top level a
-                # curated-examples-only zone permanently.
-                custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
-                os.makedirs(custom_aiml_dir, exist_ok=True)
-                aiml_sync_state = self._read_sync_state(custom_aiml_dir)
-                for kk,vv in val.items():
-                    # kk is a tree name a project member typed on the
-                    # dashboard -- Django validates it (apps/analytics/
-                    # models.py's validate_custom_file_name) before ever
-                    # saving/relaying it, but this robot doesn't trust that
-                    # alone: confirmed live that without this check, a name
-                    # like "../../etc/whatever" writes straight through to
-                    # that traversed path, past the package root, with
-                    # fully attacker-controlled content. Skip (not abort
-                    # the whole sync) so the rest of a legitimate batch
-                    # still lands.
-                    safe_pth = remote_ops.safe_path_in(custom_aiml_dir, kk + '.xml')
-                    if safe_pth is None:
-                        print(f"[custom_aiml sync] refusing unsafe tree name {kk!r} (path traversal attempt)")
-                        continue
-                    pth = str(safe_pth)
-                    content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
+            self.local_database.load_or_create_file(self.files["behavior"],content)
+            atomic_write(self.files["behavior"], content)
+        elif k=="maps":
+            content =  f'''{val}'''
+            self.local_database.load_or_create_file(self.files["env"],content)
+            atomic_write(self.files["env"], content)
+        elif k=="local_env":
+            content =  f'''{val}'''
+            self.local_database.load_or_create_file(self.files["local_env"],content)
+            atomic_write(self.files["local_env"], content)
+        elif k=="Sets":
+            content =  f'''{val}'''
+            self.local_database.load_or_create_file(self.files["file"],content)
+            atomic_write(self.files["file"], content)
+        elif k=="properties":
+            content =  f'''{val}'''
+            self.local_database.load_or_create_file(self.files["properties"],content)
+            atomic_write(self.files["properties"], content)
+        elif k=="custom_aiml":
+            # Bidirectional file sync: a synced custom_aiml entry used
+            # to be written directly into xparo_custom_behaviors_folder_path's
+            # own top level -- the exact same folder curated fixtures
+            # like quick_delivery_tree.xml live in. A user's tree
+            # merely sharing that name silently overwrote the fixture
+            # (a real, observed data-loss bug -- confirmed via `git
+            # status` showing quick_delivery_tree.xml dirty from
+            # exactly this). Its own subfolder makes that collision
+            # structurally impossible, and keeps the top level a
+            # curated-examples-only zone permanently.
+            custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
+            os.makedirs(custom_aiml_dir, exist_ok=True)
+            aiml_sync_state = self._read_sync_state(custom_aiml_dir)
+            for kk,vv in val.items():
+                # kk is a tree name a project member typed on the
+                # dashboard -- Django validates it (apps/analytics/
+                # models.py's validate_custom_file_name) before ever
+                # saving/relaying it, but this robot doesn't trust that
+                # alone: confirmed live that without this check, a name
+                # like "../../etc/whatever" writes straight through to
+                # that traversed path, past the package root, with
+                # fully attacker-controlled content. Skip (not abort
+                # the whole sync) so the rest of a legitimate batch
+                # still lands.
+                safe_pth = remote_ops.safe_path_in(custom_aiml_dir, kk + '.xml')
+                if safe_pth is None:
+                    print(f"[custom_aiml sync] refusing unsafe tree name {kk!r} (path traversal attempt)")
+                    continue
+                pth = str(safe_pth)
+                content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
 <BehaviorTree ID="MainTree">
 {vv}
 </BehaviorTree>
 </root>'''
-                    self.local_database.load_or_create_file(pth,content)
-                    with open(pth, 'w') as file:
-                        file.write(content)
-                    # Fresh Django content is the new authoritative
-                    # baseline -- same "Django changed -> update baseline"
-                    # outcome the custom_node_files manifest already
-                    # applies, hashing the raw tree text (vv), not the
-                    # <root>/<BehaviorTree> wrapper around it.
-                    aiml_sync_state[kk] = {
-                        "hash": sync_hash.content_hash(vv),
-                        "synced_at": datetime.utcnow().isoformat(),
-                    }
-                self._write_sync_state(custom_aiml_dir, aiml_sync_state)
-            elif k=="custom_maps":
-                # Same fix, same reasoning as custom_aiml just above --
-                # its own subfolder under xparo_custom_evns_folder_path,
-                # leaving that root free for any future curated env
-                # examples the same way.
-                custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
-                os.makedirs(custom_maps_dir, exist_ok=True)
-                maps_sync_state = self._read_sync_state(custom_maps_dir)
-                for kk,vv in val.items():
-                    # Same guard as custom_aiml just above, same confirmed
-                    # bug it closes -- see that block's comment.
-                    safe_pth = remote_ops.safe_path_in(custom_maps_dir, kk + '.env')
-                    if safe_pth is None:
-                        print(f"[custom_maps sync] refusing unsafe env name {kk!r} (path traversal attempt)")
-                        continue
-                    pth = str(safe_pth)
-                    content =  f'''{vv}'''
-                    self.local_database.load_or_create_file(pth,content)
-                    with open(pth, 'w') as file:
-                        file.write(content)
-                    maps_sync_state[kk] = {
-                        "hash": sync_hash.content_hash(vv),
-                        "synced_at": datetime.utcnow().isoformat(),
-                    }
-                self._write_sync_state(custom_maps_dir, maps_sync_state)
-            elif k=="custom_Sets" or k=="custom_sets":
-                for kk,vv in val.items():
-                    # Unlike custom_aiml/custom_maps just above, kk here
-                    # has no forced extension at all -- full filename
-                    # control -- so the same guard matters even more.
-                    safe_pth = remote_ops.safe_path_in(self.files["xparo_custom_files_folder_path"], kk)
-                    if safe_pth is None:
-                        print(f"[custom_Sets sync] refusing unsafe file name {kk!r} (path traversal attempt)")
-                        continue
-                    pth = str(safe_pth)
-                    content =  f'''{vv}'''
-                    self.local_database.load_or_create_file(pth,content)
-                    with open(pth, 'w') as file:
-                        file.write(content)
-            elif k=="custom_bt_node_plugins":
-                # Phase 12 -- val is Project_Dashboard.custom_bt_node_plugins's
-                # shape ([{"path":..., "enabled":...}]), same "persist to
-                # disk, mirroring custom_aiml's pattern" as everything else
-                # in this block, then actually (re)load whichever paths are
-                # enabled into NODE_REGISTRY.
-                self.sync_bt_plugins(val)
-            elif k=="custom_bt_node_inline_code":
-                # Phase 13 -- val is Project_Dashboard.custom_bt_node_inline_code's
-                # shape ({node_name: python_source}). Django only ever
-                # sends this once role-gating + the allow_inline_bt_code
-                # opt-in have both already passed (Manage_Dash.py's
-                # save_aiml), so no trust decision is made here -- this
-                # robot trusts whatever its own project's Django instance
-                # relays, same as every other sync branch in this method.
-                self.sync_bt_inline_nodes(val)
-            elif k=="rosbag_config":
-                # val is DataAnalysis._get_rosbag_config()'s shape
-                # ({record_all, ignore_topics, include_topics, start_mode,
-                # start_delay_seconds}) -- see sync_rosbag_config's own
-                # docstring for what does/doesn't apply live vs. on next
-                # launch.
-                self.sync_rosbag_config(val)
-            elif k=="ads_schedule":
-                # Ads Center (apps/ads): the ads this robot's owner approved
-                # -- the reply to GET_ads_schedule, or pushed on any change.
-                if self.ad_manager is not None:
-                    self.ad_manager.update_schedule(val)
-            elif k=="ads_plays_ack":
-                # Which uploaded plays (ADS_PLAYS) the server stored.
-                if self.ad_manager is not None:
-                    self.ad_manager.on_ack(val)
-            elif k=="ads_proof_ack":
-                # The server's answer to one screenshot (ADS_PROOF).
-                if self.ad_manager is not None:
-                    self.ad_manager.on_proof_ack(val)
-            elif k=="custom_tasks":
-                # val is DataAnalysis._get_custom_tasks()'s shape
-                # ({task_id: {behaviour_tree_name, blackboard_mapping,
-                # params, save_task_history}}) -- see sync_custom_tasks'
-                # own docstring.
-                self.sync_custom_tasks(val)
-            elif k=="custom_node_files":
-                # Multi-language custom BT node system, Phase 5 -- val is
-                # DataAnalysis._get_custom_node_files_for_sync()'s shape
-                # ({file_name: {"language":..., "source":...}}). See
-                # sync_custom_node_files' own docstring for what happens
-                # to non-Python entries today.
-                #
-                # Always ack, matching FILE_LIST/DELETE_ACK/TELEOP_ACK's
-                # own "the caller always hears back" convention -- a
-                # compile/registration failure used to only ever be
-                # printed here, invisible to whoever just edited the file
-                # from the dashboard.
-                sync_failures = self.sync_custom_node_files(val)
-                self._send_dict({"CUSTOM_NODE_SYNC_RESULT": {
-                    "registered_tags": sorted(self._custom_node_file_tags),
-                    "failures": sync_failures,
-                }})
-            elif k=="REQUEST_LOCAL_FILE_CONTENT":
-                # Bidirectional file sync (see /home/scientist/.claude/
-                # plans/breezy-splashing-koala.md, Part 5): Django only
-                # ever asks for names whose hash it couldn't already
-                # resolve as a clean push-down -- this always answers with
-                # actual content, never decides anything about conflicts
-                # itself (that's entirely Django's call, see
-                # DataAnalysis.resolve_local_file_content); if Django ends
-                # up not pushing anything back for a name because it
-                # turned out to be a real conflict, this robot's own local
-                # copy is simply left exactly as it was.
-                self._send_dict({"LOCAL_FILE_CONTENT": self.get_local_file_content(val)})
-            elif k=="ROBOT_CREDENTIAL":
-                self._persist_credential(val)
-            elif k=="get_initial_local_env_data":
-                self.get_initial_local_env_data()
-            elif k=="sync_local_database":
-                # Bidirectional file sync -- see get_local_file_state's own
-                # docstring for why this is a real, hash-aware report now
-                # instead of the unconditional raw-content push this used
-                # to be.
-                self._send_dict({"LOCAL_FILE_STATE": self.get_local_file_state()})
-            elif k=="log_updated":
-                self.local_database.dashboard_receive({"log_updated":val},self.private_send)
-                self.local_database._stop_updates = False
-            elif k=="REST_API_TOKEN":
-                # dashboard_receive already has a correct handler for this
-                # (arms orchestrator.API_TOKEN and flushes any queued
-                # uploads) -- it was just never reachable from here.
-                self.local_database.dashboard_receive({"REST_API_TOKEN":val},self.private_send)
-            # ---- Phase 4 remote-ops -- see remote_ops.py's module
-            # docstring for why these are plain function calls here rather
-            # than inline logic: the exact same handlers drive both this
-            # transport and transports/tethered_tcp.py.
-            elif k=="RUN_COMMAND":
-                command = val.get("command", "")
-                request_id = val.get("request_id")
-                timeout = remote_ops.clamp_command_timeout(val.get("timeout"))
-                max_lines = val.get("max_lines")
-                if command.strip():
-                    threading.Thread(
-                        target=remote_ops.handle_run_command,
-                        args=(command, request_id, timeout, self._send_dict),
-                        kwargs={"max_lines": max_lines},
-                        daemon=True,
-                    ).start()
-                else:
-                    self._send_dict({"COMMAND_RESULT": {
-                        "request_id": request_id, "command": command,
-                        "success": False, "exit_code": None, "timed_out": False,
-                        "output": "(empty command)", "truncated": False,
-                    }})
-            elif k=="TELEOP":
-                val = val if isinstance(val, dict) else {}
-                remote_ops.handle_teleop(val.get("axes", []), val.get("buttons", []), self.joy_publish, self._send_dict,
-                                         deadman=self.teleop, seq=val.get("seq"), session=val.get("session"))
-            elif k=="LIST_FILES":
-                remote_ops.handle_list_files(self.transfer_dir, self._send_dict)
-            elif k=="DELETE_FILE":
-                remote_ops.handle_delete_file(self.transfer_dir, val.get("path", ""), self._send_dict)
-            elif k=="FILE_REQ":
-                self.file_transfer.handle_file_req(val, self._send_dict)
-            elif k=="FILE_CHUNK":
-                # send_response lets a size-limit violation (finding F7)
-                # actually reach the sender instead of failing silently.
-                self.file_transfer.handle_file_chunk(val, self._send_dict)
-            elif k=="FILE_COMPLETE":
-                self.file_transfer.handle_file_complete(self._send_dict)
-            # ---- Fleet-management popups ported from the AUV GCS (see
-            # /home/scientist/.claude/plans/breezy-splashing-koala.md) --
-            # same remote_ops.py "plain function + send_response callback"
-            # shape as the Phase 4 remote-ops handlers just above.
-            elif k=="REBOOT_ROBOT":
+                self.local_database.load_or_create_file(pth,content)
+                atomic_write(pth, content)
+                # Fresh Django content is the new authoritative
+                # baseline -- same "Django changed -> update baseline"
+                # outcome the custom_node_files manifest already
+                # applies, hashing the raw tree text (vv), not the
+                # <root>/<BehaviorTree> wrapper around it.
+                aiml_sync_state[kk] = {
+                    "hash": sync_hash.content_hash(vv),
+                    "synced_at": datetime.utcnow().isoformat(),
+                }
+            self._write_sync_state(custom_aiml_dir, aiml_sync_state)
+        elif k=="custom_maps":
+            # Same fix, same reasoning as custom_aiml just above --
+            # its own subfolder under xparo_custom_evns_folder_path,
+            # leaving that root free for any future curated env
+            # examples the same way.
+            custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
+            os.makedirs(custom_maps_dir, exist_ok=True)
+            maps_sync_state = self._read_sync_state(custom_maps_dir)
+            for kk,vv in val.items():
+                # Same guard as custom_aiml just above, same confirmed
+                # bug it closes -- see that block's comment.
+                safe_pth = remote_ops.safe_path_in(custom_maps_dir, kk + '.env')
+                if safe_pth is None:
+                    print(f"[custom_maps sync] refusing unsafe env name {kk!r} (path traversal attempt)")
+                    continue
+                pth = str(safe_pth)
+                content =  f'''{vv}'''
+                self.local_database.load_or_create_file(pth,content)
+                atomic_write(pth, content)
+                maps_sync_state[kk] = {
+                    "hash": sync_hash.content_hash(vv),
+                    "synced_at": datetime.utcnow().isoformat(),
+                }
+            self._write_sync_state(custom_maps_dir, maps_sync_state)
+        elif k=="custom_Sets" or k=="custom_sets":
+            for kk,vv in val.items():
+                # Unlike custom_aiml/custom_maps just above, kk here
+                # has no forced extension at all -- full filename
+                # control -- so the same guard matters even more.
+                safe_pth = remote_ops.safe_path_in(self.files["xparo_custom_files_folder_path"], kk)
+                if safe_pth is None:
+                    print(f"[custom_Sets sync] refusing unsafe file name {kk!r} (path traversal attempt)")
+                    continue
+                pth = str(safe_pth)
+                content =  f'''{vv}'''
+                self.local_database.load_or_create_file(pth,content)
+                atomic_write(pth, content)
+        elif k=="custom_bt_node_plugins":
+            # Phase 12 -- val is Project_Dashboard.custom_bt_node_plugins's
+            # shape ([{"path":..., "enabled":...}]), same "persist to
+            # disk, mirroring custom_aiml's pattern" as everything else
+            # in this block, then actually (re)load whichever paths are
+            # enabled into NODE_REGISTRY.
+            self.sync_bt_plugins(val)
+        elif k=="custom_bt_node_inline_code":
+            # Phase 13 -- val is Project_Dashboard.custom_bt_node_inline_code's
+            # shape ({node_name: python_source}). Django only ever
+            # sends this once role-gating + the allow_inline_bt_code
+            # opt-in have both already passed (Manage_Dash.py's
+            # save_aiml), so no trust decision is made here -- this
+            # robot trusts whatever its own project's Django instance
+            # relays, same as every other sync branch in this method.
+            self.sync_bt_inline_nodes(val)
+        elif k=="rosbag_config":
+            # val is DataAnalysis._get_rosbag_config()'s shape
+            # ({record_all, ignore_topics, include_topics, start_mode,
+            # start_delay_seconds}) -- see sync_rosbag_config's own
+            # docstring for what does/doesn't apply live vs. on next
+            # launch.
+            self.sync_rosbag_config(val)
+        elif k=="ads_schedule":
+            # Ads Center (apps/ads): the ads this robot's owner approved
+            # -- the reply to GET_ads_schedule, or pushed on any change.
+            if self.ad_manager is not None:
+                self.ad_manager.update_schedule(val)
+        elif k=="ads_plays_ack":
+            # Which uploaded plays (ADS_PLAYS) the server stored.
+            if self.ad_manager is not None:
+                self.ad_manager.on_ack(val)
+        elif k=="ads_proof_ack":
+            # The server's answer to one screenshot (ADS_PROOF).
+            if self.ad_manager is not None:
+                self.ad_manager.on_proof_ack(val)
+        elif k=="custom_tasks":
+            # val is DataAnalysis._get_custom_tasks()'s shape
+            # ({task_id: {behaviour_tree_name, blackboard_mapping,
+            # params, save_task_history}}) -- see sync_custom_tasks'
+            # own docstring.
+            self.sync_custom_tasks(val)
+        elif k=="custom_node_files":
+            # Multi-language custom BT node system, Phase 5 -- val is
+            # DataAnalysis._get_custom_node_files_for_sync()'s shape
+            # ({file_name: {"language":..., "source":...}}). See
+            # sync_custom_node_files' own docstring for what happens
+            # to non-Python entries today.
+            #
+            # Always ack, matching FILE_LIST/DELETE_ACK/TELEOP_ACK's
+            # own "the caller always hears back" convention -- a
+            # compile/registration failure used to only ever be
+            # printed here, invisible to whoever just edited the file
+            # from the dashboard.
+            sync_failures = self.sync_custom_node_files(val)
+            self._send_dict({"CUSTOM_NODE_SYNC_RESULT": {
+                "registered_tags": sorted(self._custom_node_file_tags),
+                "failures": sync_failures,
+            }})
+        elif k=="REQUEST_LOCAL_FILE_CONTENT":
+            # Bidirectional file sync (see /home/scientist/.claude/
+            # plans/breezy-splashing-koala.md, Part 5): Django only
+            # ever asks for names whose hash it couldn't already
+            # resolve as a clean push-down -- this always answers with
+            # actual content, never decides anything about conflicts
+            # itself (that's entirely Django's call, see
+            # DataAnalysis.resolve_local_file_content); if Django ends
+            # up not pushing anything back for a name because it
+            # turned out to be a real conflict, this robot's own local
+            # copy is simply left exactly as it was.
+            self._send_dict({"LOCAL_FILE_CONTENT": self.get_local_file_content(val)})
+        elif k=="ROBOT_CREDENTIAL":
+            self._persist_credential(val)
+        elif k=="get_initial_local_env_data":
+            self.get_initial_local_env_data()
+        elif k=="sync_local_database":
+            # Bidirectional file sync -- see get_local_file_state's own
+            # docstring for why this is a real, hash-aware report now
+            # instead of the unconditional raw-content push this used
+            # to be.
+            self._send_dict({"LOCAL_FILE_STATE": self.get_local_file_state()})
+        elif k=="log_updated":
+            self.local_database.dashboard_receive({"log_updated":val},self.private_send)
+            self.local_database._stop_updates = False
+        elif k=="REST_API_TOKEN":
+            # dashboard_receive already has a correct handler for this
+            # (arms orchestrator.API_TOKEN and flushes any queued
+            # uploads) -- it was just never reachable from here.
+            self.local_database.dashboard_receive({"REST_API_TOKEN":val},self.private_send)
+        # ---- Phase 4 remote-ops -- see remote_ops.py's module
+        # docstring for why these are plain function calls here rather
+        # than inline logic: the exact same handlers drive both this
+        # transport and transports/tethered_tcp.py.
+        elif k=="RUN_COMMAND":
+            command = val.get("command", "")
+            request_id = val.get("request_id")
+            timeout = remote_ops.clamp_command_timeout(val.get("timeout"))
+            max_lines = val.get("max_lines")
+            if command.strip():
                 threading.Thread(
-                    target=remote_ops.handle_reboot,
-                    args=(val.get("password"), self._send_dict),
+                    target=remote_ops.handle_run_command,
+                    args=(command, request_id, timeout, self._send_dict),
+                    kwargs={"max_lines": max_lines},
                     daemon=True,
                 ).start()
-            elif k=="GET_ROS2_TOPICS":
-                if self.bt_executor is not None:
-                    remote_ops.handle_list_ros2_topics(self.bt_executor.node, self._send_dict)
-                else:
-                    self._send_dict({"ROS2_TOPICS": {"topics": []}})
-            elif k=="GET_ROS2_PARAMS":
-                if self.bt_executor is not None:
-                    threading.Thread(
-                        target=remote_ops.handle_list_ros2_params,
-                        args=(self.bt_executor.node, self._send_dict),
-                        daemon=True,
-                    ).start()
-                else:
-                    self._send_dict({"ROS2_PARAMS": {"params": [], "errors": ["no live ROS2 node on this connection"]}})
-            elif k=="SET_ROS2_PARAM":
-                threading.Thread(
-                    target=remote_ops.handle_set_ros2_param,
-                    args=(val.get("node", ""), val.get("name", ""), val.get("value", ""), val.get("request_id"), self._send_dict),
-                    daemon=True,
-                ).start()
-            elif k=="GET_ROSBAG_STATUS":
-                self._send_dict({"ROSBAG_STATUS": remote_ops.get_rosbag_status(self._get_rosbag_control())})
-            elif k in ("START_ROSBAG", "STOP_ROSBAG", "SAVE_ROSBAG"):
-                action = {"START_ROSBAG": "start", "STOP_ROSBAG": "stop", "SAVE_ROSBAG": "save"}[k]
-                remote_ops.handle_rosbag_action(self._get_rosbag_control(), action, self._send_dict)
-            elif k=="WATCH_ERROR_LOGS":
-                # Health & Errors popup is open with "Watch live" on: push
-                # the component board every flush (see flush_health). Ends
-                # on UNWATCH, or by itself after HEALTH_WATCH_SEC in case
-                # the browser went away without saying so.
-                self._health_watch_until = time.monotonic() + HEALTH_WATCH_SEC
-                self._refresh_self_diagnostics()
-                aggregator = self._get_diagnostics_aggregator()
-                if aggregator is not None:
-                    self._send_dict({"DIAGNOSTICS_SNAPSHOT": aggregator.snapshot()})
-                self.flush_health()
-            elif k=="UNWATCH_ERROR_LOGS":
-                self._health_watch_until = 0.0
-            elif k=="GET_LIVE_STATUS":
-                threading.Thread(
-                    target=remote_ops.handle_get_live_status,
-                    args=(
-                        self.local_database.get_smart_resource_consumption,
-                        self.local_database.get_cpu_temperature,
-                        time.time() - self._engine_started_at,
-                        self._send_dict,
-                    ),
-                    daemon=True,
-                ).start()
-            # ---- Wi-Fi / Bluetooth popups -- see connectivity.py. Each
-            # runs in its own thread: a rescan, a Bluetooth scan or a
-            # network switch all block for seconds.
-            elif k=="GET_WIFI_NETWORKS":
-                threading.Thread(
-                    target=connectivity.handle_get_wifi_networks,
-                    args=(bool((val or {}).get("rescan")), self._send_dict),
-                    daemon=True,
-                ).start()
-            elif k=="WIFI_CONNECT":
-                # The result is sent with _send_important_dict: switching
-                # networks can drop this very connection, and the result
-                # must still arrive once the robot is back.
-                threading.Thread(
-                    target=connectivity.handle_wifi_connect,
-                    args=(val, self._send_important_dict),
-                    kwargs={
-                        "is_server_reachable": self._xparo_server_reachable,
-                        "on_network_changed": self._on_network_changed,
-                    },
-                    daemon=True,
-                ).start()
-            elif k=="WIFI_FORGET":
-                threading.Thread(target=connectivity.handle_wifi_forget, args=(val, self._send_dict), daemon=True).start()
-            elif k=="WIFI_RADIO":
-                threading.Thread(target=connectivity.handle_wifi_radio, args=(val, self._send_dict), daemon=True).start()
-            elif k=="GET_BLUETOOTH_DEVICES":
-                threading.Thread(
-                    target=connectivity.handle_get_bluetooth_devices,
-                    args=(bool((val or {}).get("scan")), self._send_dict),
-                    daemon=True,
-                ).start()
-            # ---- Software updates (ota.py) -- threads: a fetch, a build
-            # and dependency installs all take a while.
-            elif k=="GET_OTA_STATUS":
-                threading.Thread(
-                    target=ota.handle_get_status, args=(bool((val or {}).get("fetch")), self._send_dict), daemon=True,
-                ).start()
-            elif k=="OTA_UPDATE":
-                threading.Thread(
-                    target=ota.handle_update, args=(val, self._send_dict, self._send_important_dict),
-                    kwargs={"restart": self.restart_process, "running_tasks": run_task.active_runs,
-                            "marker_path": self._ota_marker_path},
-                    daemon=True,
-                ).start()
-            elif k=="BLUETOOTH_ACTION":
-                threading.Thread(target=connectivity.handle_bluetooth_action, args=(val, self._send_dict), daemon=True).start()
-            elif k=="GET_DIAGNOSTICS_SNAPSHOT":
-                self._refresh_self_diagnostics()
-                aggregator = self._get_diagnostics_aggregator()
-                snapshot = aggregator.snapshot() if aggregator is not None else {"components": {}, "overall_level": None}
-                self._send_dict({"DIAGNOSTICS_SNAPSHOT": snapshot})
-            elif k=="GET_XPARO_VERSION":
-                self._send_dict({"XPARO_VERSION": {
-                    "xparo_git_commit": self.local_database.get_xparo_git_commit(),
-                    "ros_distro": os.environ.get("ROS_DISTRO"),
-                }})
-            elif k=="RUN_TASK":
-                # bt_executor is None when this Engine isn't owned by a
-                # live Xparo node (standalone use, or most tests in this
-                # repo). It used to drop the task silently, leaving the
-                # dashboard waiting; now it says why, and marks it as not
-                # worth retrying (restart_on_failure would just loop).
-                if self.bt_executor is not None:
-                    self._start_task_thread(val)
-                else:
-                    self._task_finished(run_task.result_message(
-                        (val or {}).get("task_id"), (val or {}).get("run_id"), "no_executor", NO_EXECUTOR_ERROR,
-                    ))
-            elif k=="CANCEL_TASK":
-                val = val or {}
-                cancelled = run_task.cancel_task(
-                    task_id=val.get("task_id"), run_id=val.get("run_id"),
-                    reason=val.get("reason") or "cancelled from the dashboard",
-                )
-                self._send_dict({"TASK_CANCEL_ACK": {
-                    "task_id": val.get("task_id"), "run_ids": cancelled, "found": bool(cancelled),
-                    "message": ("Stopping..." if cancelled else "That task isn't running on this robot."),
-                }})
-            elif k=="message" and isinstance(val, dict) and isinstance(val.get("task_call"), dict):
-                # reply to ask_task_call: still published on /xparo/response
-                # like every other answer, and the task offered for calling
-                self.call_message(message)
-                if self.task_call is not None:
-                    self.task_call.offer(val["task_call"])
-            elif k=="GET_RUNNING_TASKS":
-                self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
             else:
-                self.call_message(message)
+                self._send_dict({"COMMAND_RESULT": {
+                    "request_id": request_id, "command": command,
+                    "success": False, "exit_code": None, "timed_out": False,
+                    "output": "(empty command)", "truncated": False,
+                }})
+        elif k=="TELEOP":
+            val = val if isinstance(val, dict) else {}
+            remote_ops.handle_teleop(val.get("axes", []), val.get("buttons", []), self.joy_publish, self._send_dict,
+                                     deadman=self.teleop, seq=val.get("seq"), session=val.get("session"))
+        elif k=="LIST_FILES":
+            remote_ops.handle_list_files(self.transfer_dir, self._send_dict)
+        elif k=="DELETE_FILE":
+            remote_ops.handle_delete_file(self.transfer_dir, val.get("path", ""), self._send_dict)
+        elif k=="FILE_REQ":
+            self.file_transfer.handle_file_req(val, self._send_dict)
+        elif k=="FILE_CHUNK":
+            # send_response lets a size-limit violation (finding F7)
+            # actually reach the sender instead of failing silently.
+            self.file_transfer.handle_file_chunk(val, self._send_dict)
+        elif k=="FILE_COMPLETE":
+            self.file_transfer.handle_file_complete(self._send_dict)
+        # ---- Fleet-management popups ported from the AUV GCS (see
+        # /home/scientist/.claude/plans/breezy-splashing-koala.md) --
+        # same remote_ops.py "plain function + send_response callback"
+        # shape as the Phase 4 remote-ops handlers just above.
+        elif k=="REBOOT_ROBOT":
+            threading.Thread(
+                target=remote_ops.handle_reboot,
+                args=(val.get("password"), self._send_dict),
+                daemon=True,
+            ).start()
+        elif k=="GET_ROS2_TOPICS":
+            if self.bt_executor is not None:
+                remote_ops.handle_list_ros2_topics(self.bt_executor.node, self._send_dict)
+            else:
+                self._send_dict({"ROS2_TOPICS": {"topics": []}})
+        elif k=="GET_ROS2_PARAMS":
+            if self.bt_executor is not None:
+                threading.Thread(
+                    target=remote_ops.handle_list_ros2_params,
+                    args=(self.bt_executor.node, self._send_dict),
+                    daemon=True,
+                ).start()
+            else:
+                self._send_dict({"ROS2_PARAMS": {"params": [], "errors": ["no live ROS2 node on this connection"]}})
+        elif k=="SET_ROS2_PARAM":
+            threading.Thread(
+                target=remote_ops.handle_set_ros2_param,
+                args=(val.get("node", ""), val.get("name", ""), val.get("value", ""), val.get("request_id"), self._send_dict),
+                daemon=True,
+            ).start()
+        elif k=="GET_ROSBAG_STATUS":
+            self._send_dict({"ROSBAG_STATUS": remote_ops.get_rosbag_status(self._get_rosbag_control())})
+        elif k in ("START_ROSBAG", "STOP_ROSBAG", "SAVE_ROSBAG"):
+            action = {"START_ROSBAG": "start", "STOP_ROSBAG": "stop", "SAVE_ROSBAG": "save"}[k]
+            remote_ops.handle_rosbag_action(self._get_rosbag_control(), action, self._send_dict)
+        elif k=="WATCH_ERROR_LOGS":
+            # Health & Errors popup is open with "Watch live" on: push
+            # the component board every flush (see flush_health). Ends
+            # on UNWATCH, or by itself after HEALTH_WATCH_SEC in case
+            # the browser went away without saying so.
+            self._health_watch_until = time.monotonic() + HEALTH_WATCH_SEC
+            self._refresh_self_diagnostics()
+            aggregator = self._get_diagnostics_aggregator()
+            if aggregator is not None:
+                self._send_dict({"DIAGNOSTICS_SNAPSHOT": aggregator.snapshot()})
+            self.flush_health()
+        elif k=="UNWATCH_ERROR_LOGS":
+            self._health_watch_until = 0.0
+        elif k=="GET_LIVE_STATUS":
+            threading.Thread(
+                target=remote_ops.handle_get_live_status,
+                args=(
+                    self.local_database.get_smart_resource_consumption,
+                    self.local_database.get_cpu_temperature,
+                    time.time() - self._engine_started_at,
+                    self._send_dict,
+                ),
+                daemon=True,
+            ).start()
+        # ---- Wi-Fi / Bluetooth popups -- see connectivity.py. Each
+        # runs in its own thread: a rescan, a Bluetooth scan or a
+        # network switch all block for seconds.
+        elif k=="GET_WIFI_NETWORKS":
+            threading.Thread(
+                target=connectivity.handle_get_wifi_networks,
+                args=(bool((val or {}).get("rescan")), self._send_dict),
+                daemon=True,
+            ).start()
+        elif k=="WIFI_CONNECT":
+            # The result is sent with _send_important_dict: switching
+            # networks can drop this very connection, and the result
+            # must still arrive once the robot is back.
+            threading.Thread(
+                target=connectivity.handle_wifi_connect,
+                args=(val, self._send_important_dict),
+                kwargs={
+                    "is_server_reachable": self._xparo_server_reachable,
+                    "on_network_changed": self._on_network_changed,
+                },
+                daemon=True,
+            ).start()
+        elif k=="WIFI_FORGET":
+            threading.Thread(target=connectivity.handle_wifi_forget, args=(val, self._send_dict), daemon=True).start()
+        elif k=="WIFI_RADIO":
+            threading.Thread(target=connectivity.handle_wifi_radio, args=(val, self._send_dict), daemon=True).start()
+        elif k=="GET_BLUETOOTH_DEVICES":
+            threading.Thread(
+                target=connectivity.handle_get_bluetooth_devices,
+                args=(bool((val or {}).get("scan")), self._send_dict),
+                daemon=True,
+            ).start()
+        # ---- Software updates (ota.py) -- threads: a fetch, a build
+        # and dependency installs all take a while.
+        elif k=="GET_OTA_STATUS":
+            threading.Thread(
+                target=ota.handle_get_status, args=(bool((val or {}).get("fetch")), self._send_dict), daemon=True,
+            ).start()
+        elif k=="OTA_UPDATE":
+            threading.Thread(
+                target=ota.handle_update, args=(val, self._send_dict, self._send_important_dict),
+                kwargs={"restart": self.restart_process, "running_tasks": run_task.active_runs,
+                        "marker_path": self._ota_marker_path},
+                daemon=True,
+            ).start()
+        elif k=="BLUETOOTH_ACTION":
+            threading.Thread(target=connectivity.handle_bluetooth_action, args=(val, self._send_dict), daemon=True).start()
+        elif k=="GET_DIAGNOSTICS_SNAPSHOT":
+            self._refresh_self_diagnostics()
+            aggregator = self._get_diagnostics_aggregator()
+            snapshot = aggregator.snapshot() if aggregator is not None else {"components": {}, "overall_level": None}
+            self._send_dict({"DIAGNOSTICS_SNAPSHOT": snapshot})
+        elif k=="GET_XPARO_VERSION":
+            self._send_dict({"XPARO_VERSION": {
+                "xparo_git_commit": self.local_database.get_xparo_git_commit(),
+                "ros_distro": os.environ.get("ROS_DISTRO"),
+            }})
+        elif k=="RUN_TASK":
+            # bt_executor is None when this Engine isn't owned by a
+            # live Xparo node (standalone use, or most tests in this
+            # repo). It used to drop the task silently, leaving the
+            # dashboard waiting; now it says why, and marks it as not
+            # worth retrying (restart_on_failure would just loop).
+            if self.bt_executor is not None:
+                self._start_task_thread(val)
+            else:
+                self._task_finished(run_task.result_message(
+                    (val or {}).get("task_id"), (val or {}).get("run_id"), "no_executor", NO_EXECUTOR_ERROR,
+                ))
+        elif k=="CANCEL_TASK":
+            val = val or {}
+            cancelled = run_task.cancel_task(
+                task_id=val.get("task_id"), run_id=val.get("run_id"),
+                reason=val.get("reason") or "cancelled from the dashboard",
+            )
+            self._send_dict({"TASK_CANCEL_ACK": {
+                "task_id": val.get("task_id"), "run_ids": cancelled, "found": bool(cancelled),
+                "message": ("Stopping..." if cancelled else "That task isn't running on this robot."),
+            }})
+        elif k=="message" and isinstance(val, dict) and isinstance(val.get("task_call"), dict):
+            # reply to ask_task_call: still published on /xparo/response
+            # like every other answer, and the task offered for calling
+            self.call_message(message)
+            if self.task_call is not None:
+                self.task_call.offer(val["task_call"])
+        elif k=="GET_RUNNING_TASKS":
+            self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
+        elif k in ("message", "bot_response", "error"):
+            # assistant answers and errors -> /xparo/response
+            self.call_message(message)
+        else:
+            # Unhandled sync keys (status, System, ...) used to republish
+            # the whole project sync on /xparo/response.
+            print(f"[xparo] no handler for {k!r}; ignored")
 
 
     def get_initial_local_env_data(self):

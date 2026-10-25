@@ -60,3 +60,14 @@ try:
     import rclpy  # noqa: F401
 except ImportError:
     _install_ros_stand_ins()
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path_factory, monkeypatch):
+    """Engine keeps unsent task results (outbox.json) and the robot identity
+    in its state dir; each test gets its own, so nothing leaks between
+    tests or into the source tree."""
+    monkeypatch.setenv("XPARO_STATE_DIR", str(tmp_path_factory.mktemp("xparo_state")))
