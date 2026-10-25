@@ -61,6 +61,16 @@ try:
 except ImportError:
     _install_ros_stand_ins()
 
+try:
+    from launch import LaunchDescription  # noqa: F401  (this repo's own launch/ folder isn't it)
+except ImportError:
+    for _name in ("launch", "launch.actions", "launch.conditions", "launch.substitutions",
+                  "launch_ros", "launch_ros.actions"):
+        sys.modules.pop(_name, None)
+    for _name in ("launch", "launch.actions", "launch.conditions", "launch.substitutions",
+                  "launch_ros", "launch_ros.actions"):
+        sys.modules.setdefault(_name, MagicMock(name=_name))
+
 
 import pytest  # noqa: E402
 
@@ -70,4 +80,6 @@ def _isolated_state(tmp_path_factory, monkeypatch):
     """Engine keeps unsent task results (outbox.json) and the robot identity
     in its state dir; each test gets its own, so nothing leaks between
     tests or into the source tree."""
-    monkeypatch.setenv("XPARO_STATE_DIR", str(tmp_path_factory.mktemp("xparo_state")))
+    state = tmp_path_factory.mktemp("xparo_state")
+    monkeypatch.setenv("XPARO_STATE_DIR", str(state))
+    monkeypatch.setenv("XPARO_OTA_JOURNAL", str(state / "ota_journal.json"))

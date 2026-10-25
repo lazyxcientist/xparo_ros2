@@ -335,3 +335,247 @@ def test_a_clone_drops_the_copied_credential(tmp_path, monkeypatch):
         for p in (engine.xparo_credential_path, os.path.join(db_dir, robot_identity.IDENTITY_FILE)):
             if os.path.exists(p):
                 os.remove(p)
+
+
+# ---- #32 / #63 / #64: recordings on a full disk, failed uploads, wrong clocks ----
+def _orchestrator(tmp_path, state="writing", uri=None):
+    from xparo.blackbox_manager import BlackboxOrchestrator
+    from xparo.rosbag_control import WRITING, CLOSED
+    control = MagicMock()
+    control.state = WRITING if state == "writing" else CLOSED
+    control.current_session_uri = uri
+    o = BlackboxOrchestrator(ROBOT_ID="r", xparo_website_url="http://x", BAG_DIR=str(tmp_path), rosbag_control=control)
+    o.API_TOKEN = "t"
+    return o
+
+
+def _bag(tmp_path, name, mtime):
+    import os
+    d = tmp_path / name
+    d.mkdir()
+    f = d / f"{name}_0.mcap"
+    f.write_bytes(b"x" * 10)
+    os.utime(f, (mtime, mtime))
+    return str(f)
+
+
+def test_the_open_session_is_found_by_path_even_if_the_clock_jumped(tmp_path):
+    # the session being recorded has an OLDER mtime than a finished bag (clock rolled back)
+    open_bag = _bag(tmp_path, "bag_new_ab12", 1000)
+    done_bag = _bag(tmp_path, "bag_old", 5000)
+    o = _orchestrator(tmp_path, uri=str(tmp_path / "bag_new_ab12"))
+    assert o._open_session_bags([open_bag, done_bag]) == {open_bag}
+
+
+def test_cleanup_never_deletes_the_open_session(tmp_path, monkeypatch):
+    import os
+    from xparo import blackbox_manager
+    open_bag = _bag(tmp_path, "bag_open", 1000)
+    done_bag = _bag(tmp_path, "bag_done", 500)
+    o = _orchestrator(tmp_path, uri=str(tmp_path / "bag_open"))
+    usage = iter([95.0, 95.0, 60.0])
+    monkeypatch.setattr(o, "get_disk_usage", lambda: next(usage, 60.0))
+    Usage = type("U", (), {"total": 100, "used": 95})
+    monkeypatch.setattr(blackbox_manager.shutil, "disk_usage", lambda p: Usage)
+    monkeypatch.setattr(os.path, "getsize", lambda p: 50)      # deleting finished bags helps
+    o._force_cleanup()
+    assert os.path.exists(open_bag) and not os.path.exists(done_bag)
+
+
+def test_disk_full_of_other_files_stops_recording_instead_of_wiping_bags(tmp_path, monkeypatch):
+    import os
+    from xparo import blackbox_manager
+    done_bag = _bag(tmp_path, "bag_done", 500)
+    o = _orchestrator(tmp_path, state="closed")
+    o.stop_recording = MagicMock()
+    Usage = type("U", (), {"total": 1000, "used": 990})
+    monkeypatch.setattr(blackbox_manager.shutil, "disk_usage", lambda p: Usage)
+    o._force_cleanup()                                        # bags are tiny: deleting them won't help
+    assert os.path.exists(done_bag)
+    o.stop_recording.assert_called_once()
+
+
+def test_failed_upload_backs_off_instead_of_resending_every_cycle(tmp_path, monkeypatch):
+    from xparo import blackbox_manager
+    _bag(tmp_path, "bag_done", 500)
+    o = _orchestrator(tmp_path, state="closed")
+    monkeypatch.setattr(blackbox_manager, "build_sensor_data", lambda p: {})
+    posts = []
+    monkeypatch.setattr(blackbox_manager.requests, "post",
+                        lambda *a, **k: posts.append(1) or MagicMock(status_code=402, text="no credits"))
+    monkeypatch.setattr(o, "get_disk_usage", lambda: 10.0)
+    o._run_cycle()
+    o._run_cycle()                                            # still inside the back-off window
+    assert len(posts) == 1 and o._upload_failures == 1
+
+
+def test_manager_loop_survives_a_failing_cycle(tmp_path, monkeypatch):
+    from xparo import blackbox_manager
+    o = _orchestrator(tmp_path, state="closed")
+    calls = []
+
+    def cycle():
+        calls.append(1)
+        if len(calls) == 2:
+            o.running = False
+        raise OSError("bag folder deleted")
+    o._run_cycle = cycle
+    monkeypatch.setattr(blackbox_manager.time, "sleep", lambda s: None)
+    o.manage_disk_and_upload()
+    assert len(calls) == 2
+
+
+# ---- #39 / #67 / #68 / #89 / #90: setup mistakes and stuck reconnect loops ----
+def test_pasted_keys_are_cleaned_and_checked():
+    from xparo.xparo_ros import clean_setting, check_connection_settings
+    assert clean_setting('  "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"\n') == "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"
+    assert check_connection_settings("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed", "abc123") == []
+    assert check_connection_settings("", "") and len(check_connection_settings("", "")) == 2
+    assert "doesn't look like" in check_connection_settings("my project", "abc")[0]
+    assert "spaces" in check_connection_settings("1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed", "ab c")[0]
+
+
+def test_a_second_copy_of_the_node_is_refused(tmp_path):
+    from xparo.xparo_ros import acquire_single_instance_lock
+    lock_path = str(tmp_path / "xparo.lock")
+    first = acquire_single_instance_lock(lock_path)
+    assert first is not None
+    import subprocess
+    import sys
+    # a different process (like a second `ros2 run xparo ...`) can't take it
+    code = ("import fcntl,sys; f=open(sys.argv[1],'a+');\n"
+            "try:\n fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('got')\n"
+            "except OSError: print('refused')")
+    out = subprocess.run([sys.executable, "-c", code, lock_path], capture_output=True, text=True).stdout.strip()
+    assert out == "refused"
+    first.close()
+    assert acquire_single_instance_lock(lock_path) is not None   # free again once the first exits
+
+
+def test_running_with_sudo_is_warned_about(monkeypatch, tmp_path):
+    from xparo import xparo_ros
+    monkeypatch.setattr(xparo_ros.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "priya")
+    assert any("sudo" in p for p in xparo_ros.check_run_environment(str(tmp_path)))
+
+
+def test_reconnect_delay_is_spread_between_robots():
+    from xparo.transports import django_ws
+    assert 5 <= django_ws.RECONNECT_DELAY_SECONDS <= 12
+
+
+def test_a_credential_rejected_later_falls_back_to_the_secret_key(monkeypatch):
+    from xparo.transports import django_ws
+    t = django_ws.DjangoWsTransport.__new__(django_ws.DjangoWsTransport)
+    t._websocket_connected = False
+    t.ws = None
+    fallback = MagicMock()
+    t.on_persisted_credential_rejected = fallback
+    clock = [0.0]
+    monkeypatch.setattr(django_ws.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(t, "_credential_rejected", lambda: True)
+
+    def sleep(s):
+        clock[0] += s
+    t._credential_watchdog_loop(sleep=sleep, check_every=15)
+    fallback.assert_called_once()
+    assert clock[0] >= django_ws.CREDENTIAL_CHECK_AFTER_SECONDS
+
+
+# ---- #61: live updates never block the tree ----
+def test_live_updates_do_not_block_when_the_link_is_slow():
+    import time
+    engine = _engine()
+    gate = threading.Event()
+    engine.private_send = lambda data, **kw: gate.wait(5)     # a link that hangs
+    started = time.monotonic()
+    for i in range(engine.LIVE_UPDATE_QUEUE_SIZE + 50):
+        engine.add_live_update({"node_name": f"n{i}", "curr": "RUNNING"})
+    assert time.monotonic() - started < 1                      # the tick loop wasn't held up
+    assert engine._live_dropped >= 49                          # overflow dropped, not queued forever
+    gate.set()
+
+
+# ---- #62: a big download doesn't hold up other commands ----
+def test_file_download_runs_in_the_background():
+    import time
+    engine = _engine()
+    gate = threading.Event()
+    engine.file_transfer = MagicMock()
+    engine.file_transfer.handle_file_req.side_effect = lambda req, send: gate.wait(5)
+    started = time.monotonic()
+    engine.on_ws_message('ws', {"FILE_REQ": {"filename": "big_folder", "direction": "download"}})
+    assert time.monotonic() - started < 1          # the message loop is free for Cancel/teleop
+    gate.set()
+
+
+# ---- #60: C++ nodes aren't recompiled when nothing changed ----
+def test_cpp_node_is_compiled_once_per_change(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from xparo.bt_engine import runners
+    compiles = []
+
+    def fake_gpp(cmd, **kw):
+        out = cmd[cmd.index("-o") + 1]
+        with open(out, "w") as f:
+            f.write("binary")
+        os.chmod(out, 0o755)
+        compiles.append(out)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(runners.subprocess, "run", fake_gpp)
+    src = "class Greet : public BT::SyncActionNode {};"
+    path, err = runners.compile_cpp_node(src, "", str(tmp_path), "greet")
+    assert err is None and os.path.exists(path)
+    runners.compile_cpp_node(src, "", str(tmp_path), "greet")          # reconnect: same source
+    assert len(compiles) == 1
+    runners.compile_cpp_node(src + " // v2", "", str(tmp_path), "greet")  # edited: rebuild
+    assert len(compiles) == 2
+    assert not os.path.exists(path + ".building")                   # swapped in, not left behind
+
+
+# ---- #58: switching a robot to another project ----
+def test_switching_projects_sets_the_old_projects_files_aside(tmp_path):
+    from xparo.project_files import retire_other_project_files
+    beh, envs = tmp_path / "custom_behaviors", tmp_path / "custom_envs"
+    (beh / "custom_aiml").mkdir(parents=True)
+    (beh / "custom_aiml" / "patrol.xml").write_text("<old/>")
+    (beh / "tasks.json").write_text("{}")
+    (envs / "custom_maps").mkdir(parents=True)
+    assert retire_other_project_files(str(beh), str(envs), "project-a") is None   # first run: just remember
+    moved = retire_other_project_files(str(beh), str(envs), "project-b")
+    assert moved and not (beh / "custom_aiml").exists() and not (beh / "tasks.json").exists()
+    assert (tmp_path / moved / "behaviors" / "custom_aiml" / "patrol.xml").read_text() == "<old/>"  # kept, not deleted
+    assert retire_other_project_files(str(beh), str(envs), "project-b") is None   # same project again: nothing moves
+
+
+# ---- #13: a power cut during an OTA update ----
+def _launch_module():
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "launch", "xparo_launch.py")
+    spec = importlib.util.spec_from_file_location("xparo_launch_for_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_an_interrupted_update_is_rolled_back_at_the_next_launch(tmp_path):
+    from xparo import ota
+    journal = str(tmp_path / "ota_journal.json")
+    ota.write_journal({"repo": "/ws/src/xparo", "workspace": "/ws", "from": "aaaa1111", "to": "bbbb2222",
+                       "symlink_install": True}, path=journal)
+    ran = []
+    ok = _launch_module().recover_interrupted_update(journal, run=lambda argv, cwd: ran.append((argv, cwd)) or 0,
+                                                      log=lambda m: None)
+    assert ok is True
+    assert ran[0] == (["git", "reset", "--hard", "aaaa1111"], "/ws/src/xparo")
+    assert ran[1] == (["colcon", "build", "--packages-select", "xparo", "--symlink-install"], "/ws")
+    import os
+    assert not os.path.exists(journal)
+
+
+def test_no_journal_means_a_normal_start(tmp_path):
+    ran = []
+    assert _launch_module().recover_interrupted_update(str(tmp_path / "none.json"), run=lambda *a: ran.append(a)) is None
+    assert ran == []

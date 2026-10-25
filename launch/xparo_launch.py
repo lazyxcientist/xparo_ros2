@@ -74,7 +74,42 @@ def _rosbag_record_topic_args(custom_behaviors_folder_path):
     return ' '.join(include)
 
 
+OTA_JOURNAL_PATH = os.environ.get("XPARO_OTA_JOURNAL") or os.path.join(os.path.expanduser("~"), ".xparo", "ota_journal.json")
+
+
+def recover_interrupted_update(journal_path=OTA_JOURNAL_PATH, run=None, log=print):
+    """An OTA update whose journal is still here never finished (power cut
+    or crash mid-update): the checkout or the build may be half-new and the
+    node may not even import. Put the previous version back and rebuild it
+    before starting anything. Kept self-contained (json + subprocess only)
+    on purpose: it must work when the half-updated xparo package doesn't."""
+    import json
+    import subprocess
+    run = run or (lambda argv, cwd: subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=1800).returncode)
+    try:
+        with open(journal_path) as f:
+            entry = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        entry = {}
+    if not entry.get("repo") or not entry.get("from"):
+        os.remove(journal_path)
+        return False
+    log(f"[xparo] An update to {entry.get('to', '?')[:8]} was interrupted -- restoring {entry['from'][:8]} first...")
+    ok = run(["git", "reset", "--hard", entry["from"]], entry["repo"]) == 0
+    build = ["colcon", "build", "--packages-select", "xparo"] + (["--symlink-install"] if entry.get("symlink_install") else [])
+    ok = ok and run(build, entry.get("workspace") or entry["repo"]) == 0
+    if ok:
+        os.remove(journal_path)
+        log("[xparo] Previous version restored. Start the update again from the dashboard when ready.")
+    else:
+        log(f"[xparo] Restoring the previous version failed; see {journal_path} and rebuild by hand.")
+    return ok
+
+
 def generate_launch_description():
+    recover_interrupted_update()
     # "xparo_ros" is the node's executable name (see the Node(executable=...)
     # below), not the package name -- get_package_share_directory needs the
     # actual ROS2 package name from package.xml/CMakeLists.txt's project(),

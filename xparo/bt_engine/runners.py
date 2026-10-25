@@ -6,6 +6,7 @@ sync_custom_node_files (not through plugin_loader.load_plugins' class-
 scanning, which is Python-source-specific) -- see that method's own
 docstring for the registration flow.
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -360,14 +361,30 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     elif os.path.exists(header_path):
         os.remove(header_path)
 
+    full_source = header_include + source + _CPP_HOST_MAIN.format(class_name=class_name)
     with open(source_path, "w") as file:
-        file.write(header_include + source + _CPP_HOST_MAIN.format(class_name=class_name))
+        file.write(full_source)
 
+    # Same source and flags as the last successful build: reuse it. Every
+    # reconnect used to recompile every C++ node (up to 2 min each) while
+    # Cancel and teleop waited behind it.
+    build_key = hashlib.sha256("\0".join([full_source, header_source, _ROS_INCLUDE_DIR, _ROS_LIB_DIR]).encode()).hexdigest()
+    key_path = executable_path + ".build-key"
+    try:
+        with open(key_path) as file:
+            if file.read().strip() == build_key and os.access(executable_path, os.X_OK):
+                return executable_path, None
+    except OSError:
+        pass
+
+    # Built next to it and swapped in: overwriting the binary in place
+    # failed ("text file busy") while a running task was using it.
+    building_path = executable_path + ".building"
     compile_cmd = [
         "g++", "-std=c++17", source_path,
         "-I", _ROS_INCLUDE_DIR,
         "-L", _ROS_LIB_DIR, "-lbehaviortree_cpp",
-        "-o", executable_path,
+        "-o", building_path,
     ]
     try:
         result = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=120)
@@ -378,6 +395,9 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     if result.returncode != 0:
         print(f"[bt_engine cpp runner] {node_name}: compile failed:\\n{result.stderr[-2000:]}")
         return None, result.stderr[-500:]
+    os.replace(building_path, executable_path)
+    with open(key_path, "w") as file:
+        file.write(build_key)
     return executable_path, None
 
 

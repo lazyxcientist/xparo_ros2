@@ -347,8 +347,14 @@ def handle_update(req, send_progress, send_result, restart=None, running_tasks=l
             progress("dependencies", f"Installed {', '.join(packages)}.", state="done")
 
         progress("download", f"Moving to {new['short']}...")
+        # Written before anything changes and removed once the new version
+        # is built: if the power goes in between, the next `ros2 launch`
+        # finds it and puts the previous version back (launch/xparo_launch.py).
+        write_journal({"repo": loc["repo"], "workspace": loc["workspace"], "from": old["commit"],
+                       "to": new["commit"], "symlink_install": bool(loc.get("symlink_install")), "at": time.time()})
         rc, out = _git(loc["repo"], "merge", "--ff-only", "@{u}")
         if rc != 0:
+            clear_journal()
             return result(False, "Couldn't move the checkout to the new version. Nothing was changed.",
                           log=_tail(out))
         progress("download", f"Now at {new['short']}: {new['subject']}", state="done")
@@ -359,10 +365,13 @@ def handle_update(req, send_progress, send_result, restart=None, running_tasks=l
             progress("build", "Build failed -- going back to the previous version.", state="failed", log=_tail(out))
             _git(loc["repo"], "reset", "--keep", old["commit"])
             rebuilt, _ = _build(loc)
+            if rebuilt:
+                clear_journal()
             return result(False, (f"The new version didn't build, so the robot went back to {old['short']}"
                                   + ("" if rebuilt else " (rebuilding that also failed -- check the robot)") + "."),
                           log=_tail(out), rolled_back=True)
         progress("build", "Built.", state="done")
+        clear_journal()
 
         if restart is None:
             return result(True, f"Updated to {new['short']}. Restart xparo on the robot to start using it.",
@@ -376,6 +385,30 @@ def handle_update(req, send_progress, send_result, restart=None, running_tasks=l
         _update_lock.release()
     if restarting:
         restart()
+
+
+def journal_path():
+    """Outside the install tree on purpose (a broken build can't touch it).
+    XPARO_OTA_JOURNAL overrides it (tests)."""
+    return os.environ.get("XPARO_OTA_JOURNAL") or os.path.join(os.path.expanduser("~"), ".xparo", "ota_journal.json")
+
+
+def write_journal(entry, path=None):
+    path = path or journal_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entry, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def clear_journal(path=None):
+    try:
+        os.remove(path or journal_path())
+    except FileNotFoundError:
+        pass
 
 
 def _build(loc):

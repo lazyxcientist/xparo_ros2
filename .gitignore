@@ -26,3 +26,7 @@ custom_envs/custom_maps/
 # from inside a real deployment's checkout could commit a live credential
 # to history.
 config/credential.json
+
+# breakage review #58: per-project marker and set-aside files of a previous project
+custom_behaviors/.xparo_project_id
+custom_behaviors/.previous_projects/

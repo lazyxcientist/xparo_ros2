@@ -6,6 +6,7 @@ today -- was inline in xparo.py before the transports/ split (see base.py's
 Transport ABC docstring for why the split exists).
 """
 import json
+import random
 import socket
 import threading
 import time
@@ -25,7 +26,14 @@ DEFAULT_ENVIRONMENT = "production"
 # Passed to websocket-client's own run_forever(reconnect=...) -- the single
 # reconnect mechanism (see send()'s except block for why a second, ad hoc
 # one used to race with it).
-RECONNECT_DELAY_SECONDS = 5
+# Spread per process (5-12 s): after a server deploy every robot used to
+# reconnect at the same instant, each with a full sync, on one worker.
+RECONNECT_DELAY_SECONDS = random.randint(5, 12)
+# With a saved robot credential and the socket down this long, check
+# whether the server now rejects that credential (robot deleted/rotated):
+# websocket-client reports a 403 only on the very first attempt, so a
+# credential invalidated while running used to loop silently forever.
+CREDENTIAL_CHECK_AFTER_SECONDS = 60
 
 # "hybrid" connection_type: roughly how many of websocket-client's own
 # reconnect cycles (each RECONNECT_DELAY_SECONDS apart) to let pass before
@@ -84,6 +92,7 @@ class DjangoWsTransport(Transport):
         # (and harmless) for the other connection_type values.
         self.rest_fallback_active = False
         self._rest_running = False
+        self._closed = True
         # Set by engine.py only when secret_key here came from a persisted
         # ROBOT_CREDENTIAL (config/credential.json), never for a raw
         # xparo_secret_key launch argument -- see on_ws_error below for why
@@ -173,6 +182,8 @@ class DjangoWsTransport(Transport):
                                           "ping_timeout": WS_PING_TIMEOUT_SECONDS}, daemon=True).start()
                 if self.connection_type=="hybrid":
                     threading.Thread(target=self._hybrid_watchdog_loop, daemon=True).start()
+                if self.on_persisted_credential_rejected is not None:
+                    threading.Thread(target=self._credential_watchdog_loop, daemon=True).start()
             else:
                 print("already connected to xparo remote")
         elif self.connection_type=="rest":
@@ -247,6 +258,35 @@ class DjangoWsTransport(Transport):
             # own). on_ws_close/on_ws_error already cover "the socket
             # died" via that loop; a failed send here just means this one
             # message is lost, same as it would be mid-reconnect either way.
+
+    def _credential_rejected(self):
+        """One handshake attempt: True only for an explicit 403."""
+        try:
+            conn = websocket.create_connection(self.socket_full_url, timeout=15)
+            conn.close()
+            return False
+        except websocket.WebSocketBadStatusException as e:
+            return getattr(e, "status_code", None) == 403
+        except Exception:
+            return False   # offline, DNS... not a credential problem
+
+    def _credential_watchdog_loop(self, sleep=time.sleep, check_every=15):
+        down_since = None
+        while self.on_persisted_credential_rejected is not None and not getattr(self, "_closed", False):
+            sleep(check_every)
+            if self.websocket_connected:
+                down_since = None
+                continue
+            down_since = down_since or time.monotonic()
+            if time.monotonic() - down_since >= CREDENTIAL_CHECK_AFTER_SECONDS and self._credential_rejected():
+                callback, self.on_persisted_credential_rejected = self.on_persisted_credential_rejected, None
+                if callback is not None:
+                    print("saved robot credential is rejected by the server (robot deleted?) -- "
+                          "switching back to the project secret key")
+                    callback()
+                return
+            if down_since and time.monotonic() - down_since >= CREDENTIAL_CHECK_AFTER_SECONDS:
+                down_since = time.monotonic()   # check again a minute later
 
     def on_ws_error(self, ws, error):
         # websocket-client's run_forever(reconnect=N) only calls on_error

@@ -472,8 +472,11 @@ class RosbagControl:
         # self.bag_dir) so every session lands in the same known place
         # regardless of the recorder process's launch cwd.
         req = Record.Request()
+        # A short random suffix: a robot whose clock jumps back (no RTC,
+        # no NTP yet) used to reuse an old name, the recorder rejected it
+        # and recording silently never started.
         req.uri = os.path.join(
-            self.bag_dir, 'bag_' + datetime.datetime.now().strftime('%Y_%m_%d-%H_%M_%S')
+            self.bag_dir, 'bag_' + datetime.datetime.now().strftime('%Y_%m_%d-%H_%M_%S') + '_' + os.urandom(2).hex()
         )
 
         def on_record_response(res):
@@ -481,6 +484,9 @@ class RosbagControl:
                 self.node.get_logger().error(f'Record REJECTED: {res.error_string}. State left as-is.')
                 self.resync()
                 return
+            # The open session, by path -- the uploader must never pick it,
+            # and "newest file by time" is wrong once the clock jumps.
+            self.current_session_uri = req.uri
             self.node.get_logger().info('Session opened, resuming to start writing...')
             self._call(self.resume_client, Resume.Request(), 'resume',
                        on_ok=lambda: self._verify_after(WRITING, 'Recording started.'))

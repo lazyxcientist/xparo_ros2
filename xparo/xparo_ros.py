@@ -30,6 +30,7 @@ from datetime import datetime
 
 from xparo.engine import Engine
 from xparo.task_call import TaskCallOffer
+from xparo.project_files import retire_other_project_files
 from xparo.bt_engine import run_task
 from xparo.rosbag_control import RosbagControl, load_rosbag_config
 from xparo.diagnostics_aggregator import DiagnosticsAggregator
@@ -70,8 +71,14 @@ class Xparo(Node):
         # xparo_config.get("", "")
         ################################################
         ## parameters
-        self.xparo_project_id = self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value
-        self.xparo_secret_key = self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value
+        # Pasted keys often carry spaces, quotes or a newline: those used to
+        # end up in the connection URL and fail with a misleading
+        # "check your internet connection" loop.
+        self.xparo_project_id = clean_setting(self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value)
+        self.xparo_secret_key = clean_setting(self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value)
+        for problem in check_connection_settings(self.xparo_project_id, self.xparo_secret_key):
+            self.get_logger().error(problem)
+
         self.xparo_connection_type = self.declare_parameter("xparo_connection_type", xparo_config.get("xparo_connection_type", "websocket")  ).value
         # "production" (xparo.in, https/wss) or "local" (127.0.0.1:8000,
         # http/ws, for developing against a local Django server). Defaults
@@ -87,6 +94,18 @@ class Xparo(Node):
         # own safety-first default just above.
         self.xparo_stage = self.declare_parameter("xparo_stage", xparo_config.get("xparo_stage", "production")  ).value
         self.xparo_folder = self.declare_parameter("xparo_folder", base_path_for_package  ).value
+        for problem in check_run_environment(self.xparo_folder):
+            self.get_logger().warning(problem)
+        # One xparo per project on a robot: a second copy (started by
+        # accident) fought the first for the server connection and ran
+        # every topic-triggered task twice.
+        self._instance_lock = acquire_single_instance_lock(
+            os.path.join(os.environ.get("XPARO_STATE_DIR") or os.path.join(self.xparo_folder, "xparo", self.xparo_project_id or "no-project"),
+                         "xparo.lock"))
+        if self._instance_lock is None:
+            self.get_logger().error("Another xparo node is already running for this project on this robot. "
+                                    "Stop it first (ros2 node list / ps aux | grep xparo). Exiting.")
+            raise SystemExit(1)
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
         self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
         self.xparo_env_path = self.declare_parameter("xparo_env_path",os.path.join(self.xparo_folder,'config','default.env')).value
@@ -240,6 +259,16 @@ class Xparo(Node):
                               tethered_channels_config = self.tethered_channels_config)
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
+        # A robot switched to another project must not carry the old
+        # project's trees/tasks/code into the new one.
+        try:
+            moved = retire_other_project_files(self.files["xparo_custom_behaviors_folder_path"],
+                                               self.files["xparo_custom_evns_folder_path"], self.xparo_project_id)
+            if moved:
+                self.get_logger().warning(f"This robot moved to another project: the previous project's synced "
+                                          f"files were moved to {moved}")
+        except OSError as e:
+            self.get_logger().error(f"couldn't set aside the previous project's files: {e}")
         self.xparo_engine.on_task_event = self._on_task_event
         self.xparo_engine.task_call = TaskCallOffer(
             self.xparo_engine.run_task_from_topic, self._publish_task_call,
@@ -485,6 +514,64 @@ class Xparo(Node):
 
 
 
+
+
+def clean_setting(value):
+    """'  "abc-123"\n' -> 'abc-123'."""
+    return str(value or "").strip().strip('"\'').strip()
+
+
+def check_connection_settings(project_id, secret_key):
+    """Plain-language problems with the configured ids (empty list = fine)."""
+    import re
+    problems = []
+    if not project_id:
+        problems.append("xparo_project_id is empty: copy the project ID from the dashboard (Keys & credits).")
+    elif not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", project_id):
+        problems.append(f"xparo_project_id {project_id!r} doesn't look like a project ID "
+                        "(it should look like 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed).")
+    if not secret_key:
+        problems.append("xparo_secret_key is empty: create a secret key on the dashboard (Keys & credits).")
+    elif any(c.isspace() for c in secret_key) or "/" in secret_key:
+        problems.append("xparo_secret_key contains spaces or '/': paste only the key itself.")
+    return problems
+
+
+def check_run_environment(package_dir):
+    """Warnings for the classic 'ran it with sudo once' mess: files the
+    node must rewrite end up owned by root and every later normal run fails
+    to save credentials, tasks and trees."""
+    problems = []
+    try:
+        if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+            problems.append("xparo is running with sudo. Files it writes become owned by root and later runs "
+                            "without sudo can't update them. Run it as your normal user.")
+    except AttributeError:
+        return problems
+    for sub in ("config", "custom_behaviors"):
+        path = os.path.join(package_dir, sub)
+        if os.path.isdir(path) and not os.access(path, os.W_OK):
+            problems.append(f"{path} isn't writable by this user (probably created by a sudo run). "
+                            f"Fix it with: sudo chown -R $USER {path}")
+    return problems
+
+
+def acquire_single_instance_lock(path):
+    """An exclusive, non-blocking lock held for the life of the process
+    (released automatically if it dies). None if another process has it."""
+    import fcntl
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
 
 
 def main(args=None):

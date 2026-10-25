@@ -19,6 +19,12 @@ from .connectivity import detect_connectivity
 from .ota import summary as ota_summary
 
 
+# New for every start of this process (not for every reconnect): the server
+# uses it to run "Auto launch on start" tasks once per start, instead of
+# again after every Wi-Fi hiccup.
+BOOT_ID = uuid.uuid4().hex
+
+
 class XP_Database():
     def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None,
                  unique_id=None):
@@ -259,6 +265,7 @@ class XP_Database():
         return_dict['used_disk'] = f"{disk_info.used / (1024 ** 3):.2f} GB"
         return_dict['free_disk'] = f"{disk_info.free / (1024 ** 3):.2f} GB"
         return_dict['device_id'] = self.unique_id
+        return_dict['boot_id'] = BOOT_ID
         # The id(s) this machine had before -- lets the server find and
         # keep its existing robot row instead of creating a second one.
         return_dict['previous_device_ids'] = self.get_previous_device_ids()

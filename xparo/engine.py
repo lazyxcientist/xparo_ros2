@@ -710,9 +710,41 @@ class Engine():
                                                                 "datetime": message.get("datetime", ""),
 
                                                                 }})
-        self.private_send(filtered_data,
-                        #   command_for="rest"
-                          )
+        self._queue_live_update(filtered_data)
+
+    # Live node-status updates are a nicety: they go out from a queue on
+    # their own thread. They used to be sent inside the tree's tick loop,
+    # so a slow or half-dead link froze the tree itself. When the queue is
+    # full (link too slow), new updates are dropped, never the robot delayed.
+    LIVE_UPDATE_QUEUE_SIZE = 200
+
+    _download_lock = threading.Lock()
+
+    def _run_download(self, req):
+        with self._download_lock:
+            try:
+                self.file_transfer.handle_file_req(req, self._send_dict)
+            except Exception as e:
+                self._send_dict({"error": {"message": f"download failed: {e}"}})
+
+    def _queue_live_update(self, data):
+        import queue
+        if getattr(self, "_live_queue", None) is None:
+            self._live_queue = queue.Queue(maxsize=self.LIVE_UPDATE_QUEUE_SIZE)
+            self._live_dropped = 0
+            threading.Thread(target=self._live_update_sender, daemon=True, name="xparo-live-updates").start()
+        try:
+            self._live_queue.put_nowait(data)
+        except queue.Full:
+            self._live_dropped += 1
+
+    def _live_update_sender(self):
+        while True:
+            data = self._live_queue.get()
+            try:
+                self.private_send(data)
+            except Exception as e:
+                print(f"[xparo] live update not sent: {e}")
 
     def sync_bt_plugins(self, plugins=None):
         """Phase 12. `plugins` is Project_Dashboard.custom_bt_node_plugins's
@@ -1548,7 +1580,14 @@ class Engine():
         elif k=="DELETE_FILE":
             remote_ops.handle_delete_file(self.transfer_dir, val.get("path", ""), self._send_dict)
         elif k=="FILE_REQ":
-            self.file_transfer.handle_file_req(val, self._send_dict)
+            if isinstance(val, dict) and val.get("direction") == "download":
+                # Zipping and streaming a big folder used to run right here,
+                # holding up every other command (Cancel, teleop, tasks) for
+                # minutes. Downloads now run one at a time in the background.
+                threading.Thread(target=self._run_download, args=(val,), daemon=True,
+                                 name="xparo-file-download").start()
+            else:
+                self.file_transfer.handle_file_req(val, self._send_dict)
         elif k=="FILE_CHUNK":
             # send_response lets a size-limit violation (finding F7)
             # actually reach the sender instead of failing silently.

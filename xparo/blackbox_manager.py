@@ -43,6 +43,10 @@ class BlackboxOrchestrator:
         self.DISK_MAX_PCT = 90.0
         self.DISK_TARGET_PCT = 70.0
         self.CHECK_INTERVAL = 15  # Faster checks for testing
+        # After a failed upload (no credits, server error, no network) the
+        # same bags used to be re-sent from zero every 15 s.
+        self._upload_failures = 0
+        self._upload_retry_at = 0.0
 
         if not os.path.exists(self.BAG_DIR):
             os.makedirs(self.BAG_DIR, exist_ok=True)
@@ -73,23 +77,46 @@ class BlackboxOrchestrator:
     def manage_disk_and_upload(self):
         """Background thread to manage disk and sync to Django/Azure."""
         while self.running:
-            usage = self.get_disk_usage()
-            if usage > self.DISK_MAX_PCT:
-                self._force_cleanup()
-            # Pure local disk hygiene, no server contact -- runs every
-            # cycle regardless of API_TOKEN, so the boot-cleanup
-            # throwaway (see _is_boot_session_bag) gets discarded even
-            # before this robot has fully connected, not stuck waiting
-            # alongside real uploads.
-            self._discard_boot_session_bags()
-            # self._process_uploads()
-            # 2. CHECK TOKEN BEFORE UPLOADING
-            if not self.API_TOKEN or self.API_TOKEN == "":
-                print("[MANAGER THREAD] Idle: Waiting for API_TOKEN from server...")
-            else:
-                self._process_uploads()
-
+            # One failure (the bag folder deleted by hand, a read-only
+            # file) used to end this thread, and the disk then filled up.
+            try:
+                self._run_cycle()
+            except Exception as e:
+                print(f"[MANAGER THREAD] cycle failed, retrying next time: {e}")
             time.sleep(self.CHECK_INTERVAL)
+
+    def _run_cycle(self):
+        usage = self.get_disk_usage()
+        if usage > self.DISK_MAX_PCT:
+            self._force_cleanup()
+        # Pure local disk hygiene, no server contact -- runs every
+        # cycle regardless of API_TOKEN, so the boot-cleanup
+        # throwaway (see _is_boot_session_bag) gets discarded even
+        # before this robot has fully connected, not stuck waiting
+        # alongside real uploads.
+        self._discard_boot_session_bags()
+        # 2. CHECK TOKEN BEFORE UPLOADING
+        if not self.API_TOKEN or self.API_TOKEN == "":
+            print("[MANAGER THREAD] Idle: Waiting for API_TOKEN from server...")
+        elif time.monotonic() >= self._upload_retry_at:
+            self._process_uploads()
+
+    def _open_session_bags(self, bags):
+        """Bag files of the session the recorder still has open. By path
+        when RosbagControl knows it; otherwise the newest file (by mtime)."""
+        if self.rosbag_control is None or self.rosbag_control.state not in (WRITING, PAUSED):
+            return set()
+        uri = getattr(self.rosbag_control, "current_session_uri", None)
+        if uri:
+            prefix = os.path.abspath(uri) + os.sep
+            return {b for b in bags if os.path.abspath(b).startswith(prefix)}
+        return {max(bags, key=os.path.getmtime)} if bags else set()
+
+    def _note_upload_failure(self):
+        self._upload_failures += 1
+        delay = min(self.CHECK_INTERVAL * (2 ** self._upload_failures), 3600)
+        self._upload_retry_at = time.monotonic() + delay
+        print(f"[UPLOAD] paused for {delay:.0f} s after {self._upload_failures} failed attempt(s)")
 
     def _find_bag_files(self):
         """xparo_launch.py's ExecuteProcess always passes --compression-mode
@@ -144,10 +171,25 @@ class BlackboxOrchestrator:
             os.rmdir(parent)
 
     def _force_cleanup(self):
+        """Disk over DISK_MAX_PCT: delete the oldest *finished* bags until
+        under DISK_TARGET_PCT. Never the session being recorded (deleting
+        an open file frees nothing and loses it). If deleting every
+        finished bag still wouldn't get under the limit, the disk is full of
+        other things: recording is stopped and nothing is deleted, instead
+        of wiping every bag each cycle for no gain."""
         files = self._find_bag_files()
-        files.sort(key=os.path.getctime)
-        for f in files:
-            if self.get_disk_usage() < self.DISK_TARGET_PCT: break
+        open_bags = self._open_session_bags(files)
+        closed = sorted((f for f in files if f not in open_bags), key=os.path.getmtime)
+        stats = shutil.disk_usage(self.BAG_DIR)
+        reclaimable = sum(os.path.getsize(f) for f in closed if os.path.exists(f))
+        if (stats.used - reclaimable) / stats.total * 100 > self.DISK_MAX_PCT:
+            print(f"[CLEANUP] Disk is {stats.used / stats.total * 100:.0f}% full of files other than recordings -- "
+                  f"stopping recording instead of deleting bags. Free some space on the robot.")
+            self.stop_recording()
+            return
+        for f in closed:
+            if self.get_disk_usage() < self.DISK_TARGET_PCT:
+                break
             self._remove_bag_and_metadata(f)
             print(f"[CLEANUP] Disk threshold met. Deleted: {f}")
 
@@ -194,12 +236,9 @@ class BlackboxOrchestrator:
         # Sort by modification time (oldest first)
         all_bags.sort(key=os.path.getmtime)
 
-        # If a session is currently open (writing or merely paused -- either
-        # way its .mcap is still being appended to), ignore the absolute
-        # newest file. If it's the initial sync and nothing is recording
-        # yet, we can try all.
-        session_open = self.rosbag_control is not None and self.rosbag_control.state in (WRITING, PAUSED)
-        target_bags = all_bags[:-1] if session_open else all_bags
+        # The session still being written (or paused) is never uploaded.
+        open_bags = self._open_session_bags(all_bags)
+        target_bags = [b for b in all_bags if b not in open_bags]
 
         if not target_bags:
             # Deliberately quiet when there's genuinely nothing recorded
@@ -248,11 +287,15 @@ class BlackboxOrchestrator:
                     # 201 is DRF's default for 'Created'
                     if response.status_code in [200, 201]:
                         self._remove_bag_and_metadata(bag_path)
+                        self._upload_failures = 0
                         print(f"[SUCCESS] Server confirmed receipt. Deleted: {filename}")
                     else:
-                        print(f"[FAILED] Server status {response.status_code}: {response.text}")
+                        print(f"[FAILED] Server status {response.status_code}: {response.text[:300]}")
+                        self._note_upload_failure()
+                        break
             except Exception as e:
                 print(f"[NETWORK ERROR] Could not reach server: {e}")
+                self._note_upload_failure()
                 break # Stop loop to retry next interval
 
 def handle_exit(signum, frame):
