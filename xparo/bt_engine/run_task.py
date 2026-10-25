@@ -47,7 +47,7 @@ DEFAULT_TIMEOUT_S = 900  # Services.timeout's own default (Django)
 
 # Outcomes a retry can't fix -- Django's restart_on_failure skips these
 # instead of re-dispatching the same broken task in a tight loop.
-NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled"}
+NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled", "already_running"}
 
 _active_lock = threading.Lock()
 _active_runs = {}  # run_id -> {"task_id", "event", "started", "reason"}
@@ -176,8 +176,23 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
     timeout_s = timeout_s if timeout_s > 0 else None  # 0 = no time limit
 
     event = threading.Event()
+    # One run of a task at a time on a robot: a double click, two tabs, or
+    # Run now + /xparo/run_task used to start two trees driving the same
+    # motors. Checked and claimed under one lock so two arrivals can't both
+    # pass. A dispatch that really wants parallel runs says allow_parallel.
     with _active_lock:
-        _active_runs[run_id] = {"task_id": task_id, "event": event, "started": time.monotonic(), "reason": ""}
+        already_running = (not val.get("allow_parallel")) and any(
+            info["task_id"] == task_id for info in _active_runs.values())
+        if not already_running:
+            _active_runs[run_id] = {"task_id": task_id, "event": event, "started": time.monotonic(), "reason": ""}
+    if already_running:
+        send_response(result_message(
+            task_id, run_id, "already_running",
+            "This task is already running on this robot, so it wasn't started a second time.",
+            "Wait for the current run to finish, or cancel it first.",
+            task_title=context["task_title"], trigger=context["trigger"],
+        ))
+        return
     # send_response gets exactly one message per run (the TASK_RESULT);
     # "it started" goes through its own callback so the dashboard can show
     # the run as live (and offer Cancel) instead of guessing.

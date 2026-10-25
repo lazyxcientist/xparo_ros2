@@ -16,6 +16,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 # ----------------------------------------------------------------------
@@ -403,13 +405,7 @@ MIN_JOY_AXES = 4
 MIN_JOY_BUTTONS = 3
 
 
-def handle_teleop(axes, buttons, joy_publish, send_response):
-    """joy_publish(axes: list[float], buttons: list[int]) -> None -- the
-    caller supplies this (wired to a real rclpy Publisher in production,
-    a plain recorder in tests) since publishing a sensor_msgs/Joy message
-    needs an actual ROS2 node context this module deliberately doesn't
-    depend on.
-    """
+def _sanitize_axis(a):
     # Finding F13 (confirmed live): a payload like {"axes": [Infinity,
     # -Infinity, NaN, 99999999.9], "buttons": [1,0,1]} was published to the
     # real Joy topic completely unvalidated -- fin/thruster control code
@@ -418,21 +414,120 @@ def handle_teleop(axes, buttons, joy_publish, send_response):
     # safety issue, not just a data-quality one. Non-finite values are
     # neutralized to 0.0 (a stick that can't be trusted is treated as
     # centered, not passed through), and everything else is clamped.
-    def _sanitize_axis(a):
-        try:
-            a = float(a)
-        except (TypeError, ValueError):
-            return 0.0
-        if not math.isfinite(a):
-            return 0.0
-        return max(-1.0, min(1.0, a))
+    try:
+        a = float(a)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(a):
+        return 0.0
+    return max(-1.0, min(1.0, a))
 
+
+def _normalize_joy(axes, buttons):
     axes = [_sanitize_axis(a) for a in (axes or [])]
     buttons = [int(bool(b)) for b in (buttons or [])]
     if len(axes) < MIN_JOY_AXES:
         axes += [0.0] * (MIN_JOY_AXES - len(axes))
     if len(buttons) < MIN_JOY_BUTTONS:
         buttons += [0] * (MIN_JOY_BUTTONS - len(buttons))
+    return axes, buttons
+
+
+# The dashboard streams TELEOP about every 80 ms while someone drives. If
+# nothing arrives for this long (Wi-Fi dropped, tab closed, laptop asleep),
+# the robot is sent a centred stick instead of holding the last command.
+TELEOP_DEADMAN_SECONDS = 0.5
+
+
+class TeleopDeadman:
+    """Publishes /joy for TELEOP and stops the robot when the commands stop.
+
+    - command(): publishes a (sanitized) stick, unless it is older than one
+      already published (same `session`, lower or equal `seq`): delayed
+      TCP bursts after a network hiccup are dropped instead of replayed.
+    - check(): called ~10x a second by a background thread; once no command
+      has arrived for `timeout_s` while the stick was off-centre, publishes
+      all-zero axes/buttons once.
+    timeout_s <= 0 turns the deadman off (old behaviour).
+    """
+
+    def __init__(self, joy_publish, timeout_s=TELEOP_DEADMAN_SECONDS, clock=time.monotonic):
+        self._joy_publish = joy_publish
+        self.timeout_s = timeout_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last_at = None
+        self._moving = False
+        self._session = None
+        self._seq = None
+        self._thread = None
+
+    def command(self, axes, buttons, seq=None, session=None):
+        axes, buttons = _normalize_joy(axes, buttons)
+        with self._lock:
+            if seq is not None and session is not None and session == self._session \
+                    and self._seq is not None and _as_int(seq) <= self._seq:
+                return False  # stale: a newer command was already published
+            if session is not None:
+                self._session, self._seq = session, _as_int(seq)
+            self._last_at = self._clock()
+            self._moving = any(axes) or any(buttons)
+        self._joy_publish(axes, buttons)
+        self._ensure_thread()
+        return True
+
+    def stop(self):
+        """Centre the stick now (connection lost, node shutting down)."""
+        with self._lock:
+            was_moving, self._moving = self._moving, False
+        if was_moving:
+            axes, buttons = _normalize_joy([], [])
+            self._joy_publish(axes, buttons)
+        return was_moving
+
+    def check(self):
+        if self.timeout_s <= 0:
+            return False
+        with self._lock:
+            expired = self._moving and self._last_at is not None and \
+                self._clock() - self._last_at >= self.timeout_s
+        return self.stop() if expired else False
+
+    def _ensure_thread(self):
+        if self.timeout_s <= 0 or (self._thread is not None and self._thread.is_alive()):
+            return
+
+        def loop():
+            while True:
+                time.sleep(min(0.1, self.timeout_s / 2))
+                try:
+                    self.check()
+                except Exception as e:  # never let the safety loop die
+                    print(f"[teleop] deadman check failed: {e}")
+        self._thread = threading.Thread(target=loop, daemon=True, name="xparo-teleop-deadman")
+        self._thread.start()
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def handle_teleop(axes, buttons, joy_publish, send_response, deadman=None, seq=None, session=None):
+    """joy_publish(axes: list[float], buttons: list[int]) -> None -- the
+    caller supplies this (wired to a real rclpy Publisher in production,
+    a plain recorder in tests) since publishing a sensor_msgs/Joy message
+    needs an actual ROS2 node context this module deliberately doesn't
+    depend on. With `deadman` (a TeleopDeadman), publishing goes through it
+    so the robot stops when the stream of commands stops.
+    """
+    if deadman is not None:
+        published = deadman.command(axes, buttons, seq=seq, session=session)
+        send_response({"TELEOP_ACK": {"success": True, "stale": not published}})
+        return
+    axes, buttons = _normalize_joy(axes, buttons)
     joy_publish(axes, buttons)
     send_response({"TELEOP_ACK": {"success": True}})
 

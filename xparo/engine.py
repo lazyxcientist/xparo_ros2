@@ -80,6 +80,9 @@ class Engine():
         # supplies the real one; defaults to a no-op so TELEOP is a safe
         # no-op (still acks) rather than a crash outside a live node.
         self.joy_publish = joy_publish or (lambda axes, buttons: None)
+        # Every TELEOP goes through this: it stops the robot (centred stick)
+        # when commands stop arriving, and drops delayed, out-of-order ones.
+        self.teleop = remote_ops.TeleopDeadman(lambda axes, buttons: self.joy_publish(axes, buttons))
         # bt_engine.executor.BehaviorTreeExecutor -- set post-construction
         # by xparo_ros.py, same reasoning as call_message/files just below
         # in Xparo.__init__: it needs this already-built Engine instance to
@@ -557,6 +560,16 @@ class Engine():
         if still_pending:
             with self._pending_important_sends_lock:
                 self._pending_important_sends = still_pending + self._pending_important_sends
+
+    def is_online(self):
+        """True when messages can reach the XPARO server right now."""
+        transport = getattr(self, "transport", None)
+        if transport is None:
+            return False
+        connected = getattr(transport, "websocket_connected", None)
+        if connected is None:
+            connected = getattr(transport, "connected", True)
+        return bool(connected) or getattr(transport, "connection_type", "") == "rest"
 
     def ask_task_call(self, question):
         """/xparo/ask_task: ask the server's AI which task this question
@@ -1442,7 +1455,9 @@ class Engine():
                         "output": "(empty command)", "truncated": False,
                     }})
             elif k=="TELEOP":
-                remote_ops.handle_teleop(val.get("axes", []), val.get("buttons", []), self.joy_publish, self._send_dict)
+                val = val if isinstance(val, dict) else {}
+                remote_ops.handle_teleop(val.get("axes", []), val.get("buttons", []), self.joy_publish, self._send_dict,
+                                         deadman=self.teleop, seq=val.get("seq"), session=val.get("session"))
             elif k=="LIST_FILES":
                 remote_ops.handle_list_files(self.transfer_dir, self._send_dict)
             elif k=="DELETE_FILE":

@@ -181,6 +181,11 @@ def generate_launch_description():
                 package='xparo',
                 executable='xparo_ros',
                 name='xparo_ros',
+                # come back by itself after a crash (a bad custom node, a
+                # bug) instead of leaving the robot offline until someone
+                # walks over to it
+                respawn=True,
+                respawn_delay=3.0,
                 parameters=[{
                             'xparo_project_id':                     xparo_project_id,
                             'xparo_secret_key':                     xparo_secret_key,

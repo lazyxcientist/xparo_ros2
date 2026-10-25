@@ -12,6 +12,7 @@ to a robot-local file by a *separate* sync step before this ever runs).
 import importlib
 import importlib.util
 import inspect
+import threading
 import logging
 import os
 import sys
@@ -54,6 +55,37 @@ def _load_module_from_file(path):
     return module
 
 
+# A custom node file's top-level code runs at import, at every boot, before
+# the robot connects. One with an endless loop, input() or rclpy.spin()
+# used to hang the node there forever (nothing could fix it remotely); one
+# calling sys.exit() killed it. Each file now gets this long, then is skipped.
+PLUGIN_IMPORT_TIMEOUT_S = 10
+
+
+def _load_module_with_timeout(path_or_dotted, timeout_s=None):
+    timeout_s = PLUGIN_IMPORT_TIMEOUT_S if timeout_s is None else timeout_s
+    outcome = {}
+
+    def target():
+        try:
+            outcome["module"] = _load_module(path_or_dotted)
+        except BaseException as e:  # SystemExit from a node's top level too
+            outcome["error"] = e
+
+    worker = threading.Thread(target=target, daemon=True, name="xparo-plugin-import")
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        raise TimeoutError(f"its top-level code was still running after {timeout_s:g} s "
+                           f"(an endless loop, input() or spin() outside a class?) -- skipped")
+    if "error" in outcome:
+        error = outcome["error"]
+        if isinstance(error, SystemExit):
+            raise RuntimeError(f"it called sys.exit({error.code!r}) at import -- skipped") from None
+        raise error
+    return outcome["module"]
+
+
 def _load_module(path_or_dotted):
     """A real filesystem path (contains a path separator, or ends in
     .py) is loaded directly from that file; anything else is treated as
@@ -76,7 +108,7 @@ def load_plugins(paths):
     registry = {}
     for path in paths:
         try:
-            module = _load_module(path)
+            module = _load_module_with_timeout(path)
         except Exception as e:
             print(f"[bt_engine plugin_loader] failed to load {path!r}: {e}")
             continue

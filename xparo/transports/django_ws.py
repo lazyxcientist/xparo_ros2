@@ -41,6 +41,20 @@ MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK = 5
 # fast from every affected robot at once is exactly the kind of thing that
 # turns a brief server hiccup into a thundering-herd pile-on.
 HYBRID_REST_FALLBACK_POLL_INTERVAL_SECONDS = 2
+# Every HTTP call has a time limit: (connect, read) seconds. Without one, a
+# request on a half-dead Wi-Fi link could block forever -- the heartbeat
+# thread stopped and the robot showed offline until rebooted.
+HTTP_TIMEOUT = (5, 20)
+# WebSocket keep-alive: a ping every 20 s, and a socket that doesn't answer
+# within 10 s is treated as dead and reconnected. Without it a silently
+# dropped connection still looked "connected" and task results sent into
+# it were lost.
+WS_PING_INTERVAL_SECONDS = 20
+WS_PING_TIMEOUT_SECONDS = 10
+# connection_type "rest": poll for news every 5 s (it used to fetch the full
+# project sync 5x a second), backing off up to a minute while unreachable.
+REST_POLL_INTERVAL_SECONDS = 5
+REST_MAX_BACKOFF_SECONDS = 60
 
 
 class Xparo_socket(websocket.WebSocketApp):
@@ -69,6 +83,7 @@ class DjangoWsTransport(Transport):
         # _hybrid_watchdog_loop/_hybrid_rest_fallback_loop below. Unused
         # (and harmless) for the other connection_type values.
         self.rest_fallback_active = False
+        self._rest_running = False
         # Set by engine.py only when secret_key here came from a persisted
         # ROBOT_CREDENTIAL (config/credential.json), never for a raw
         # xparo_secret_key launch argument -- see on_ws_error below for why
@@ -153,19 +168,17 @@ class DjangoWsTransport(Transport):
                 # as a plain thread it did, still connected and
                 # heartbeating, until something SIGKILLed it.
                 threading.Thread(target=self.ws.run_forever,
-                                  kwargs={"reconnect": RECONNECT_DELAY_SECONDS}, daemon=True).start()
+                                  kwargs={"reconnect": RECONNECT_DELAY_SECONDS,
+                                          "ping_interval": WS_PING_INTERVAL_SECONDS,
+                                          "ping_timeout": WS_PING_TIMEOUT_SECONDS}, daemon=True).start()
                 if self.connection_type=="hybrid":
                     threading.Thread(target=self._hybrid_watchdog_loop, daemon=True).start()
             else:
                 print("already connected to xparo remote")
         elif self.connection_type=="rest":
-            response = requests.get(self.website_full_url)
-            if response.status_code == 201:
-                data = response.json()
-                self.on_message('self.ws',data)
-                threading.Thread(target=self.start_reset_framework, daemon=True).start()
-            else:
-                print("no response")
+            # In the background: offline at boot used to raise here and
+            # crash the whole node.
+            threading.Thread(target=self.start_reset_framework, daemon=True).start()
         elif self.connection_type=="offline":
             print("offline mode with custom llm is comming soon...")
         ###################################################
@@ -179,6 +192,7 @@ class DjangoWsTransport(Transport):
         # creating self.ws (e.g. "rest"/"offline" modes, or a transport
         # that's being retired before its first connect() attempt).
         self.rest_fallback_active = False
+        self._rest_running = False
         if getattr(self, "ws", None) is not None:
             self.ws.close()
         self.websocket_connected = False
@@ -214,7 +228,8 @@ class DjangoWsTransport(Transport):
             if command_for=="websocket":
                 self.ws.send(message)
             elif command_for=="rest":
-                response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json'})
+                response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json'},
+                                         timeout=HTTP_TIMEOUT)
                 if response.status_code == 201:
                     self.on_message('rest', response.json())
                     return True
@@ -320,7 +335,7 @@ class DjangoWsTransport(Transport):
               "reconnect attempts -- falling back to REST polling until it recovers")
         while self.rest_fallback_active:
             try:
-                response = requests.get(self.website_full_url)
+                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT)
                 if response.status_code == 201:
                     self.on_message('rest', response.json())
             except Exception as e:
@@ -328,16 +343,28 @@ class DjangoWsTransport(Transport):
             time.sleep(HYBRID_REST_FALLBACK_POLL_INTERVAL_SECONDS)
         print("hybrid mode: websocket recovered -- stopping REST fallback")
 
-    def start_reset_framework(self):
-        print("starting reset framework")
-        check = self.send(json.dumps({"initiliaze":True}))
-        if check:
-            while True:
-                response = requests.get(self.website_full_url)
+    def start_reset_framework(self, sleep=time.sleep):
+        """connection_type "rest": fetch the initial sync, then poll. Never
+        raises (an error used to end polling for good) and backs off while
+        the server can't be reached."""
+        print("starting REST polling")
+        delay = REST_POLL_INTERVAL_SECONDS
+        initialized = False
+        while getattr(self, "_rest_running", True):
+            try:
+                if not initialized:
+                    self.send(json.dumps({"initiliaze": True}), command_for="rest")
+                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT)
                 if response.status_code == 201:
-                    data = response.json()
-                    self.on_message('self.ws',data)
-                time.sleep(0.2)
-        else:
-            print("unable to connect with X.P.A.R.O server")
-            self.on_ws_close('self.ws')
+                    if not initialized:
+                        initialized = True
+                        self.on_connected()
+                    self.on_message('rest', response.json())
+                    delay = REST_POLL_INTERVAL_SECONDS
+                else:
+                    print(f"XPARO server answered {response.status_code}; check xparo_secret_key / xparo_project_id")
+                    delay = min(delay * 2, REST_MAX_BACKOFF_SECONDS)
+            except Exception as e:
+                print(f"XPARO server not reachable ({e}); retrying in {delay:.0f} s")
+                delay = min(delay * 2, REST_MAX_BACKOFF_SECONDS)
+            sleep(delay)

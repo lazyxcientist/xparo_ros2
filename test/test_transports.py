@@ -65,7 +65,11 @@ def test_connect_passes_reconnect_delay_to_run_forever():
         transport = _make_transport(connection_type="websocket")
         transport.connect()
 
-    assert captured['kwargs'] == {"reconnect": django_ws.RECONNECT_DELAY_SECONDS}
+    # ...with a keep-alive ping, so a silently dead socket is noticed
+    # (breakage review #14) instead of swallowing task results.
+    assert captured['kwargs'] == {"reconnect": django_ws.RECONNECT_DELAY_SECONDS,
+                                  "ping_interval": django_ws.WS_PING_INTERVAL_SECONDS,
+                                  "ping_timeout": django_ws.WS_PING_TIMEOUT_SECONDS}
 
 
 def test_send_failure_does_not_trigger_manual_reconnect():

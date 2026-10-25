@@ -30,6 +30,7 @@ from datetime import datetime
 
 from xparo.engine import Engine
 from xparo.task_call import TaskCallOffer
+from xparo.bt_engine import run_task
 from xparo.rosbag_control import RosbagControl, load_rosbag_config
 from xparo.diagnostics_aggregator import DiagnosticsAggregator
 from xparo.rosout_watcher import RosoutWatcher
@@ -119,23 +120,26 @@ class Xparo(Node):
         ).value
 
 
-        self.ask_question = self.create_subscription(String, '/xparo/ask', self.ask_question_fun, 10)
-        self.task_updates = self.create_subscription(String,'/xparo/task_updates',self.task_updates,10)
-        self.bt_log = self.create_subscription(String,'/bt_xparo_log',self.live_updates,10)
+        self.ask_question = self.create_subscription(String, '/xparo/ask', self._guarded(self.ask_question_fun), 10)
+        self.task_updates = self.create_subscription(String,'/xparo/task_updates',self._guarded(self.task_updates),10)
+        self.bt_log = self.create_subscription(String,'/bt_xparo_log',self._guarded(self.live_updates),10)
         # Behaviour Tree redesign: local task execution -- publish
         # {"task_id": "...", "override_params": {...}} here (override_params
         # optional) to run an already-synced task (Engine.sync_custom_tasks)
         # directly on this robot, no Django round trip needed at trigger
         # time. Same naming convention as /xparo/ask, /xparo/task_updates.
-        self.run_task_sub = self.create_subscription(String, '/xparo/run_task', self.run_task_topic_cb, 10)
+        self.run_task_sub = self.create_subscription(String, '/xparo/run_task', self._guarded(self.run_task_topic_cb), 10)
         self.dash_send = self.create_publisher(String,"/xparo/response",10)
         # AI task calling (xparo/task_call.py): ask in plain words on
         # /xparo/ask_task; the task the AI picks (by its AI prompt) is
         # offered on /xparo/task_call and runs on "call" sent to
-        # /xparo/task_call_confirm, or by itself after 15 s; "cancel" stops it.
-        self.ask_task_sub = self.create_subscription(String, '/xparo/ask_task', self.ask_task_cb, 10)
-        self.task_call_confirm_sub = self.create_subscription(String, '/xparo/task_call_confirm', self.task_call_confirm_cb, 10)
+        # /xparo/task_call_confirm within 15 s (no answer: nothing runs);
+        # "cancel" drops the offer or stops the run it started.
+        self.ask_task_sub = self.create_subscription(String, '/xparo/ask_task', self._guarded(self.ask_task_cb), 10)
+        self.task_call_confirm_sub = self.create_subscription(String, '/xparo/task_call_confirm', self._guarded(self.task_call_confirm_cb), 10)
         self.task_call_pub = self.create_publisher(String, '/xparo/task_call', 10)
+        # Stop a running task from the robot itself (task id, or {"task_id"/"run_id"}).
+        self.cancel_task_sub = self.create_subscription(String, '/xparo/cancel_task', self._guarded(self.cancel_task_cb), 10)
         # Phase 4 TELEOP -- remote_ops.handle_teleop publishes here via
         # Engine's joy_publish callback, below.
         self.joy_pub = self.create_publisher(Joy, '/joy', 10)
@@ -237,7 +241,9 @@ class Xparo(Node):
         self.xparo_engine.call_message=self.call_message
         self.xparo_engine.files = self.files
         self.xparo_engine.on_task_event = self._on_task_event
-        self.xparo_engine.task_call = TaskCallOffer(self.xparo_engine.run_task_from_topic, self._publish_task_call)
+        self.xparo_engine.task_call = TaskCallOffer(
+            self.xparo_engine.run_task_from_topic, self._publish_task_call,
+            cancel_task=lambda task_id: run_task.cancel_task(task_id=task_id, reason="cancelled on the robot (/xparo/task_call_confirm)"))
         # OTA updates (ota.py) end by restarting the node with the new code.
         self.restart_requested = False
         self.xparo_engine.restart_process = self._request_restart
@@ -263,8 +269,8 @@ class Xparo(Node):
         # Before connect(), so the first connection asks for the ad schedule.
         self.xparo_engine.setup_ads(self.xparo_ads_display, node=self)
         self.xparo_engine.connect()
-        self.create_timer(SELF_DIAGNOSTICS_PERIOD_SEC, self._publish_self_diagnostics)
-        self.create_timer(HEALTH_FLUSH_SEC, self.xparo_engine.flush_health)
+        self.create_timer(SELF_DIAGNOSTICS_PERIOD_SEC, self._guarded(self._publish_self_diagnostics))
+        self.create_timer(HEALTH_FLUSH_SEC, self._guarded(self.xparo_engine.flush_health))
 
     def _publish_self_diagnostics(self):
         """xparo's own health on the standard /diagnostics topic (1 Hz, the
@@ -389,11 +395,24 @@ class Xparo(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to process task history: {str(e)}')
 
+    def _offline_reply(self, topic):
+        """Asking while offline used to fail silently, leaving a voice app
+        waiting on /xparo/response forever. Answer right away instead."""
+        if self.xparo_engine.is_online():
+            return False
+        self.call_message({"message": {"error": "offline", "responded_by": "robot",
+                                       "bot_response": "I'm offline right now, so I can't ask the AI. Try again when I'm connected."}})
+        self.get_logger().warn(f"{topic}: not connected to XPARO, question not sent")
+        return True
+
     def ask_question_fun(self, msg):
-        user_input = str(msg.data)
-        self.xparo_engine.send(user_input.upper())
+        if self._offline_reply('/xparo/ask'):
+            return
+        self.xparo_engine.send(str(msg.data))
 
     def ask_task_cb(self, msg):
+        if self._offline_reply('/xparo/ask_task'):
+            return
         self.xparo_engine.ask_task_call(msg.data)
 
     def task_call_confirm_cb(self, msg):
@@ -411,17 +430,54 @@ class Xparo(Node):
         self.task_call_pub.publish(out)
         self.get_logger().info(f"AI task call '{info.get('title') or info.get('task_id')}': {info.get('status')}")
 
+    def _guarded(self, callback):
+        """Every topic callback goes through this: one bad message (wrong
+        JSON shape, a bug) is logged instead of escaping rclpy.spin() and
+        killing the whole node."""
+        def wrapper(*args):
+            try:
+                return callback(*args)
+            except Exception as e:
+                msg = args[0] if args else None
+                self.get_logger().error(f"{getattr(callback, '__name__', 'callback')} failed on {str(getattr(msg, 'data', msg))[:200]!r}: {e}")
+        return wrapper
+
     def run_task_topic_cb(self, msg):
         try:
             payload = json.loads(msg.data)
         except Exception as e:
             self.get_logger().error(f'Failed to parse /xparo/run_task message: {str(e)}')
             return
+        if isinstance(payload, str):
+            payload = {"task_id": payload}  # a bare task id is fine too
+        if not isinstance(payload, dict):
+            self.get_logger().error('/xparo/run_task expects {"task_id": "...", "override_params": {...}}')
+            return
         task_id = payload.get("task_id")
-        if not task_id:
+        if not task_id or not isinstance(task_id, (str, int)):
             self.get_logger().error('/xparo/run_task message missing "task_id"')
             return
-        self.xparo_engine.run_task_from_topic(task_id, payload.get("override_params"))
+        params = payload.get("override_params")
+        if params is not None and not isinstance(params, dict):
+            self.get_logger().error('/xparo/run_task "override_params" must be an object like {"speed": "1.0"}')
+            return
+        self.xparo_engine.run_task_from_topic(str(task_id), params)
+
+    def cancel_task_cb(self, msg):
+        raw = str(msg.data).strip()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = raw
+        if isinstance(payload, dict):
+            stopped = run_task.cancel_task(task_id=payload.get("task_id"), run_id=payload.get("run_id"),
+                                           reason="cancelled on the robot (/xparo/cancel_task)")
+        else:
+            stopped = run_task.cancel_task(task_id=str(payload), reason="cancelled on the robot (/xparo/cancel_task)")
+        if stopped:
+            self.get_logger().info(f"Stopping {len(stopped)} run(s): {', '.join(stopped)}")
+        else:
+            self.get_logger().warn(f"/xparo/cancel_task: no running task matches {raw!r}")
     ####################################################
     ####################################################
 

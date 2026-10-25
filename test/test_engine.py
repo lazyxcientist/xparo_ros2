@@ -186,7 +186,7 @@ def test_teleop_dispatches_to_remote_ops_and_publishes_joy():
     axes, buttons = joy_calls[0]
     assert len(axes) == 4 and len(buttons) == 3  # padded, see remote_ops.MIN_JOY_*
     import json
-    assert json.loads(sent[0]) == {"TELEOP_ACK": {"success": True}}
+    assert json.loads(sent[0]) == {"TELEOP_ACK": {"success": True, "stale": False}}
 
 
 def test_list_files_dispatches_against_engine_transfer_dir(tmp_path):
