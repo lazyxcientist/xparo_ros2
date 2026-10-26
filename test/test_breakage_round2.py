@@ -204,3 +204,37 @@ def test_update_recovery_gives_up_after_a_few_failures(tmp_path):
         assert os.path.exists(journal)
     assert launch.recover_interrupted_update(journal, run=lambda argv, cwd: 1, log=lambda m: None) is False
     assert not os.path.exists(journal)
+
+
+def test_a_shared_ros_domain_is_called_out(monkeypatch, tmp_path):
+    """V1: on the default domain every robot shares /joy and task topics."""
+    from xparo.xparo_ros import check_run_environment, other_xparo_nodes
+    monkeypatch.delenv("ROS_DOMAIN_ID", raising=False)
+    assert any("ROS_DOMAIN_ID" in p for p in check_run_environment(str(tmp_path)))
+    monkeypatch.setenv("ROS_DOMAIN_ID", "12")
+    assert not any("ROS_DOMAIN_ID" in p for p in check_run_environment(str(tmp_path)))
+    assert other_xparo_nodes([("xparo", "/"), ("xparo", "/"), ("talker", "/")]) == [("xparo", "/")]
+    assert other_xparo_nodes([("xparo", "/")]) == []
+
+
+def test_file_chunks_out_of_order_are_refused_and_downloads_carry_seq(tmp_path):
+    """V11: chunks relayed in any order were written garbled and reported ok."""
+    import base64
+    from xparo.remote_ops import FileTransferSession
+    sent = []
+    s = FileTransferSession(str(tmp_path))
+    s.handle_file_req({"filename": "a.bin", "direction": "upload", "size": 2}, sent.append)
+    s.handle_file_chunk({"data": base64.b64encode(b"x").decode(), "seq": 1}, sent.append)
+    assert "error" in sent[-1] and not (tmp_path / "a.bin").exists()
+
+    s.handle_file_req({"filename": "b.bin", "direction": "upload", "size": 2}, sent.append)
+    for i in range(2):
+        s.handle_file_chunk({"data": base64.b64encode(b"y").decode(), "seq": i}, sent.append)
+    s.handle_file_complete(sent.append)
+    assert sent[-1]["FILE_COMPLETE"]["status"] == "ok" and (tmp_path / "b.bin").read_bytes() == b"yy"
+
+    sent.clear()
+    s.handle_file_req({"filename": "b.bin", "direction": "download", "token": "t1"}, sent.append)
+    assert sent[0]["FILE_REQ"]["token"] == "t1"
+    assert sent[1]["FILE_CHUNK"]["seq"] == 0 and sent[1]["FILE_CHUNK"]["token"] == "t1"
+    assert sent[-1]["FILE_COMPLETE"]["token"] == "t1"

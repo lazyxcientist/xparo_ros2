@@ -687,11 +687,14 @@ class FileTransferSession:
                 except OSError as e:
                     send_response({"error": {"message": str(e)}})
                     return
-                self._current_upload = {"file": f, "expected_size": size, "received": 0}
+                self._current_upload = {"file": f, "expected_size": size, "received": 0, "next_seq": 0}
                 send_response({"FILE_REQ": {"filename": filename, "direction": "upload", "ready": True}})
 
             elif direction == "download":
                 rel = req.get("filename", "")
+                # Echoed on every reply: all of the project's open tabs get
+                # them, and only the tab that asked keeps the file.
+                token = str(req.get("token") or "")[:64]
                 transfer_base = self.base_dir.resolve()
                 file_path = (self.base_dir / rel).resolve()
                 if file_path != transfer_base and not str(file_path).startswith(str(transfer_base) + os.sep):
@@ -723,14 +726,22 @@ class FileTransferSession:
                     file_size = stream_path.stat().st_size
                     send_response({"FILE_REQ": {
                         "filename": download_name, "size": file_size, "direction": "download",
+                        "token": token,
                     }})
+                    seq = 0
                     with open(stream_path, "rb") as f:
                         while True:
                             chunk = f.read(FILE_CHUNK_SIZE)
                             if not chunk:
                                 break
-                            send_response({"FILE_CHUNK": {"data": base64.b64encode(chunk).decode("ascii")}})
-                    send_response({"FILE_COMPLETE": {"status": "ok", "expected": file_size, "received": file_size}})
+                            send_response({"FILE_CHUNK": {
+                                "data": base64.b64encode(chunk).decode("ascii"),
+                                "seq": seq, "token": token,
+                            }})
+                            seq += 1
+                    send_response({"FILE_COMPLETE": {
+                        "status": "ok", "expected": file_size, "received": file_size, "token": token,
+                    }})
                 finally:
                     if zip_tmp_dir is not None:
                         shutil.rmtree(zip_tmp_dir, ignore_errors=True)
@@ -760,6 +771,19 @@ class FileTransferSession:
         # full). A declared expected_size, if smaller than the hard cap,
         # tightens the limit further -- a transfer must not exceed what it
         # said it would send either.
+        # Chunks carry seq (newer dashboards): one out of order or missing
+        # means the file on disk would be garbled, so stop now instead of
+        # reporting "ok" at FILE_COMPLETE. No seq = older sender, unchecked.
+        seq = chunk_payload.get("seq")
+        if seq is not None:
+            expected_seq = self._current_upload.get("next_seq", 0)
+            if seq != expected_seq:
+                self._abort_upload(delete_partial=True)
+                respond({"error": {
+                    "message": f"upload chunk {seq} arrived when {expected_seq} was expected -- aborted, nothing was kept",
+                }})
+                return
+            self._current_upload["next_seq"] = expected_seq + 1
         limit = MAX_UPLOAD_SIZE_BYTES
         expected = self._current_upload["expected_size"]
         if expected > 0:

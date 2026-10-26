@@ -309,7 +309,25 @@ class Xparo(Node):
         self.xparo_engine.setup_ads(self.xparo_ads_display, node=self)
         self.xparo_engine.connect()
         self.create_timer(SELF_DIAGNOSTICS_PERIOD_SEC, self._guarded(self._publish_self_diagnostics))
+        self._other_xparo_checked = False
+        self._other_xparo_timer = self.create_timer(OTHER_XPARO_CHECK_SEC, self._guarded(self._warn_if_other_xparo))
         self.create_timer(HEALTH_FLUSH_SEC, self._guarded(self.xparo_engine.flush_health))
+
+    def _warn_if_other_xparo(self):
+        """Once, a few seconds after start: another robot's xparo on the same
+        ROS domain means shared /joy and task topics (round 2, V1)."""
+        if self._other_xparo_checked:
+            return
+        self._other_xparo_checked = True
+        try:
+            self._other_xparo_timer.cancel()
+        except Exception:
+            pass
+        others = other_xparo_nodes(self.get_node_names_and_namespaces(), self.get_namespace())
+        if others:
+            self.get_logger().error(
+                f"Another xparo node is on this ROS network ({len(others)} more): robots on one ROS_DOMAIN_ID share "
+                f"/joy and /xparo/run_task, so commands for one reach all. Give each robot its own ROS_DOMAIN_ID.")
 
     def _publish_self_diagnostics(self):
         """xparo's own health on the standard /diagnostics topic (1 Hz, the
@@ -547,6 +565,19 @@ def check_connection_settings(project_id, secret_key):
     return problems
 
 
+OTHER_XPARO_CHECK_SEC = 10.0
+
+
+def other_xparo_nodes(node_names_and_namespaces, own_namespace="/"):
+    """Other xparo nodes visible on this ROS graph (another robot on the
+    same ROS_DOMAIN_ID): [(name, namespace), ...] minus this node."""
+    seen = [(n, ns) for n, ns in node_names_and_namespaces if n == "xparo"]
+    others = list(seen)
+    if (("xparo", own_namespace)) in others:
+        others.remove(("xparo", own_namespace))
+    return others
+
+
 def check_run_environment(package_dir):
     """Warnings for the classic 'ran it with sudo once' mess: files the
     node must rewrite end up owned by root and every later normal run fails
@@ -558,6 +589,10 @@ def check_run_environment(package_dir):
                             "without sudo can't update them. Run it as your normal user.")
     except AttributeError:
         return problems
+    if os.environ.get("ROS_DOMAIN_ID", "0").strip() in ("", "0"):
+        problems.append("ROS_DOMAIN_ID is not set (0). Every robot on this network shares /joy, /xparo/run_task "
+                        "and /xparo/cancel_task: driving or tasking one robot reaches all of them. Give each robot "
+                        "its own number, e.g. `export ROS_DOMAIN_ID=12` in ~/.bashrc (1-101).")
     for sub in ("config", "custom_behaviors"):
         path = os.path.join(package_dir, sub)
         if os.path.isdir(path) and not os.access(path, os.W_OK):
