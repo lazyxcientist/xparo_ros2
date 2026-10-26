@@ -65,6 +65,14 @@ def _now_iso(dt):
     return dt.isoformat(timespec="seconds")
 
 
+# The server re-sends the schedule on every connect and every night. One
+# older than this means the robot has been cut off long enough that a venue
+# may have withdrawn consent or a campaign been stopped since: it stops
+# playing until it hears from the server again, instead of playing those
+# ads on for days.
+MAX_SCHEDULE_AGE_S = 36 * 3600
+
+
 class AdManager:
     def __init__(self, folder, send, backend, base_url=None, now=datetime.datetime.now, capture=None):
         """folder: where the schedule, ad files and play log live.
@@ -83,6 +91,11 @@ class AdManager:
         self.backend = backend
         self.now = now
         self.items = self.store.load().get("ads") or []
+        try:
+            self.schedule_at = os.path.getmtime(self.store.schedule_path)
+        except OSError:
+            self.schedule_at = None
+        self._stale_logged = False
         self._slots = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -137,6 +150,8 @@ class AdManager:
             self.store.prune(localized)
             with self._lock:
                 self.items = localized["ads"]
+                self.schedule_at = time.time()
+                self._stale_logged = False
             if not self.backend.plays_itself:
                 self.backend.schedule_changed(self.items)
             else:
@@ -173,6 +188,11 @@ class AdManager:
             return
         now = now or self.now()
         with self._lock:
+            if self.schedule_is_stale():
+                if not self._stale_logged:
+                    log.warning("ads paused: no schedule from the server for over %d hours", MAX_SCHEDULE_AGE_S // 3600)
+                    self._stale_logged = True
+                return
             groups = scheduler.active_by_placement(self.items, now)
             for placement, queue in groups.items():
                 slot = self._slots.setdefault(placement, {"busy": False, "index": 0, "token": None})
@@ -188,6 +208,9 @@ class AdManager:
                 item = due[slot["index"] % len(due)]
                 slot["index"] = (slot["index"] + 1) % len(due)
                 self._start(placement, slot, item, now)
+
+    def schedule_is_stale(self):
+        return self.schedule_at is not None and time.time() - self.schedule_at > MAX_SCHEDULE_AGE_S
 
     def _slot_key(self, item):
         return (item.get("id"), item.get("slot") or "")

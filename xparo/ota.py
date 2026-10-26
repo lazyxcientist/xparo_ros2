@@ -415,5 +415,9 @@ def _build(loc):
     argv = ["colcon", "build", "--packages-select", "xparo"]
     if loc.get("symlink_install"):
         argv.append("--symlink-install")
+    # The robot keeps running (navigation, sensors) while it builds: at
+    # normal priority the build could starve those control loops.
+    if shutil.which("nice"):
+        argv = ["nice", "-n", "15"] + argv
     rc, out = _run(argv, BUILD_TIMEOUT_SEC, cwd=loc["workspace"])
     return rc == 0, out

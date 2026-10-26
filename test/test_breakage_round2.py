@@ -238,3 +238,48 @@ def test_file_chunks_out_of_order_are_refused_and_downloads_carry_seq(tmp_path):
     assert sent[0]["FILE_REQ"]["token"] == "t1"
     assert sent[1]["FILE_CHUNK"]["seq"] == 0 and sent[1]["FILE_CHUNK"]["token"] == "t1"
     assert sent[-1]["FILE_COMPLETE"]["token"] == "t1"
+
+
+def test_ros2_node_logs_are_read(tmp_path, monkeypatch):
+    """V32: only ROS 1's rosout.log was read -- ROS 2 never writes it."""
+    from xparo.database import XP_Database
+    logs = tmp_path / "log"
+    run = logs / "2026-10-26-09-00-00-000000-bot-123"
+    run.mkdir(parents=True)
+    (run / "launch.log").write_text("launch started\n")
+    (logs / "bt_executor_123_1.log").write_text("[ERROR] it broke\n")
+    monkeypatch.setenv("ROS_LOG_DIR", str(logs))
+    db = XP_Database.__new__(XP_Database)
+    db.log_pointers_file = str(tmp_path / "pointers.json")
+    first = db.get_ros2_jazzy_logs()["new_entries"]
+    assert "[ERROR] it broke\n" in first and "launch started\n" in first
+    assert db.get_ros2_jazzy_logs()["new_entries"] == []     # nothing new
+    with open(logs / "bt_executor_123_1.log", "a") as f:
+        f.write("[WARN] again\n")
+    assert db.get_ros2_jazzy_logs()["new_entries"] == ["[WARN] again\n"]
+
+
+def test_ota_build_runs_at_low_priority(monkeypatch):
+    """V35: the rebuild competed with navigation at full priority."""
+    from xparo import ota
+    seen = {}
+    monkeypatch.setattr(ota, "_run", lambda argv, timeout, cwd=None: (seen.setdefault("argv", argv), (0, ""))[1])
+    monkeypatch.setattr(ota.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert ota._build({"workspace": "/ws"})[0]
+    assert seen["argv"][:3] == ["nice", "-n", "15"] and "colcon" in seen["argv"]
+
+
+def test_ads_pause_when_the_robot_has_not_heard_from_the_server_for_days(tmp_path):
+    """N15: a robot offline after the venue withdrew consent kept playing for days."""
+    import time as _time
+    from test_ads import FakePlayer, MON_10AM, entry, make_manager
+    from xparo.ads import manager as ads_manager
+    player = FakePlayer()
+    manager, _ = make_manager(tmp_path, player)
+    manager.items = [entry("xparo-a")]
+    manager.schedule_at = _time.time() - ads_manager.MAX_SCHEDULE_AGE_S - 60
+    manager.tick(MON_10AM)
+    assert player.started == []
+    manager.schedule_at = _time.time()
+    manager.tick(MON_10AM)
+    assert len(player.started) == 1

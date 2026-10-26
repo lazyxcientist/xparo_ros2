@@ -573,38 +573,74 @@ class XP_Database():
             averages["avg_gpu_percent"] = sum(gpu_values) / len(gpu_values)
         return averages
 
+    # Per call, so a node that logs a lot can't make one update huge.
+    MAX_LOG_LINES_PER_UPDATE = 500
+
+    @staticmethod
+    def ros_log_dir():
+        """Where ROS 2 writes its logs: ROS_LOG_DIR, else $ROS_HOME/log,
+        else ~/.ros/log."""
+        if os.environ.get('ROS_LOG_DIR'):
+            return os.path.expanduser(os.environ['ROS_LOG_DIR'])
+        if os.environ.get('ROS_HOME'):
+            return os.path.join(os.path.expanduser(os.environ['ROS_HOME']), 'log')
+        return os.path.expanduser('~/.ros/log/')
+
     def get_ros2_jazzy_logs(self):
-        """Fetches new lines from the latest ROS2 log directory."""
-        log_base_dir = os.path.expanduser('~/.ros/log/')
-        new_logs = []
-        
-        if not os.path.exists(log_base_dir):
+        """New lines from the ROS 2 logs of the current run.
+
+        This looked for rosout.log, which is ROS 1's: ROS 2 never writes
+        it, so nothing was ever sent. ROS 2 writes one file per node
+        (<node>_<pid>_<time>.log) in the log folder, plus launch.log in a
+        folder per `ros2 launch`; the newest launch folder and the node
+        files written since it started are read from where they were left."""
+        log_base_dir = self.ros_log_dir()
+        if not os.path.isdir(log_base_dir):
             return {"error": "ROS2 log directory not found."}
-            
-        # Get the most recently modified directory in the ROS log folder
-        subdirs = [os.path.join(log_base_dir, d) for d in os.listdir(log_base_dir) if os.path.isdir(os.path.join(log_base_dir, d))]
-        if not subdirs:
+        try:
+            entries = [os.path.join(log_base_dir, d) for d in os.listdir(log_base_dir)]
+        except OSError as e:
+            return {"error": f"ROS2 logs can't be read: {e}"}
+        subdirs = [p for p in entries if os.path.isdir(p)]
+        latest_dir = max(subdirs, key=os.path.getmtime) if subdirs else log_base_dir
+        since = os.path.getmtime(latest_dir) - 60 if subdirs else 0
+        files = [p for p in entries if p.endswith('.log') and os.path.isfile(p) and os.path.getmtime(p) >= since]
+        if subdirs:
+            files += [os.path.join(latest_dir, f) for f in os.listdir(latest_dir) if f.endswith('.log')]
+        if not files:
             return {"error": "No ROS2 logs found."}
-            
-        latest_dir = max(subdirs, key=os.path.getmtime)
-        rosout_file = os.path.join(latest_dir, 'rosout.log')
-        
-        if os.path.exists(rosout_file):
-            # Load pointers to know where we stopped reading last time
-            pointers = {}
-            if os.path.exists(self.log_pointers_file):
+
+        pointers = {}
+        if os.path.exists(self.log_pointers_file):
+            try:
                 with open(self.log_pointers_file, 'r') as f:
                     pointers = json.load(f)
-            
-            last_position = pointers.get(rosout_file, 0)
-            
-            with open(rosout_file, 'r') as f:
-                f.seek(last_position)
-                new_logs = f.readlines()
-                pointers[rosout_file] = f.tell() # Save new position
-                
-            atomic_write_json(self.log_pointers_file, pointers)
-
+            except (OSError, ValueError):
+                pointers = {}
+        new_logs = []
+        for path in sorted(files, key=os.path.getmtime):
+            room = self.MAX_LOG_LINES_PER_UPDATE - len(new_logs)
+            if room <= 0:
+                break
+            try:
+                with open(path, 'r', errors='replace') as f:
+                    position = pointers.get(path, 0)
+                    f.seek(0, os.SEEK_END)
+                    if position > f.tell():      # file was replaced
+                        position = 0
+                    f.seek(position)
+                    lines = []
+                    for line in iter(f.readline, ''):
+                        lines.append(line)
+                        if len(lines) >= room:
+                            break
+                    pointers[path] = f.tell()
+            except OSError:
+                continue
+            new_logs.extend(lines)
+        # forget files that are gone, or the pointer file grows forever
+        pointers = {p: v for p, v in pointers.items() if os.path.exists(p)}
+        atomic_write_json(self.log_pointers_file, pointers)
         return {"log_directory": latest_dir, "new_entries": new_logs}
 
     def trigger_log_update(self, private_send):
