@@ -136,6 +136,11 @@ class _TraceVisitor(py_trees.visitors.VisitorBase):
         s.last_status = "HALTED"
 
 
+# How long a stopped run waits for a blocked node's tick to return before
+# halting the tree around it.
+ABANDON_GRACE_S = 2.0
+
+
 class _Ticker:
     """Runs tree.tick() on one long-lived helper thread and waits for it
     while watching the cancel event and the time limit (checked every
@@ -179,6 +184,39 @@ class _Ticker:
     def close(self):
         self._closed = True
         self._request.set()
+
+    def wait_done(self, timeout):
+        """True once the current tick has returned."""
+        return self._done.wait(timeout)
+
+    def stopped(self):
+        """Event set once the helper thread has really finished (a blocked
+        tick returned and the thread exited)."""
+        event = threading.Event()
+
+        def watch():
+            self._done.wait()
+            self.close()
+            self._thread.join()
+            event.set()
+        threading.Thread(target=watch, daemon=True, name="xparo-bt-tick-watch").start()
+        return event
+
+
+def _stop_running(root, errors):
+    """Halts every RUNNING node, deepest first, each on its own: one
+    terminate() raising used to end root.stop() early, so the remaining
+    nodes' "stop the motor" code never ran."""
+    running = [b for b in _preorder(root) if b.status == common.Status.RUNNING]
+    for behaviour in reversed(running):
+        try:
+            behaviour.stop(common.Status.INVALID)
+        except Exception as halt_error:
+            errors.append(halt_error)
+    try:
+        root.stop(common.Status.INVALID)
+    except Exception as halt_error:
+        errors.append(halt_error)
 
 
 class BehaviorTreeExecutor:
@@ -228,14 +266,18 @@ class BehaviorTreeExecutor:
             state = self._tick_loop(root, tick_rate_hz=tick_rate_hz, max_ticks=max_ticks,
                                     timeout_s=timeout_s, cancel_event=cancel_event, trace=True, run_id=run_id,
                                     live_context=live_context)
-            return self._report(base, root, blackboard, problems, state, started_wall)
+            report = self._report(base, root, blackboard, problems, state, started_wall)
+            if state.get("still_ticking") is not None:
+                # not JSON: run_task.py takes it out before sending
+                report["_still_ticking"] = state["still_ticking"]
+            return report
         except Exception as e:  # a bug in the engine itself -- still report it
             report = dict(base)
             report.update(self._outcome_fields("engine_error", f"{type(e).__name__}: {e}"))
             report.update({
                 "status": "INVALID", "blackboard": dict(blackboard), "problems": [], "nodes": [], "timeline": [],
                 "stats": {}, "failed_node": None, "traceback": _short_traceback(e),
-                "finished_at": datetime.now().astimezone().isoformat(), "duration_s": time.time() - started_wall,
+                "finished_at": datetime.now().astimezone().isoformat(), "duration_s": max(0.0, time.time() - started_wall),
             })
             return report
 
@@ -327,6 +369,17 @@ class BehaviorTreeExecutor:
                     time.sleep(interval)
 
         final_status = root.status
+        still_ticking = None
+        if getattr(ticker, "abandoned", False):
+            # Give the blocked node a moment to return, so halting below
+            # doesn't run alongside it.
+            if ticker.wait_done(ABANDON_GRACE_S):
+                ticker.abandoned = False
+            else:
+                # Still blocked: the run stays registered ("stopping") until
+                # this thread really ends (run_task.py), so the same task
+                # can't be started again while the old node still runs.
+                still_ticking = ticker.stopped()
         if not getattr(ticker, "abandoned", False):
             ticker.close()
         if stop_reason is not None:
@@ -336,10 +389,7 @@ class BehaviorTreeExecutor:
                 # Halt whatever is still running (terminate() lets nodes
                 # cancel goals, kill processes...), then report the halt
                 # to the live view so nothing stays highlighted RUNNING.
-                try:
-                    root.stop(common.Status.INVALID)
-                except Exception as halt_error:  # keep the original story
-                    running_at_stop.append(halt_error)
+                _stop_running(root, running_at_stop)
                 try:
                     _on_post_tick(tree)
                 except Exception:
@@ -351,6 +401,7 @@ class BehaviorTreeExecutor:
             "status": final_status, "ticks": ticks, "stop_reason": stop_reason, "exception": exception,
             "visitor": visitor, "timeline": timeline_out, "timeline_dropped": dropped[0],
             "running_at_stop": running_at_stop, "elapsed": time.monotonic() - t0,
+            "still_ticking": still_ticking,
         }
 
     # ------------------------------------------------------------ report
@@ -370,7 +421,7 @@ class BehaviorTreeExecutor:
             "timeline": [], "stats": {"nodes_total": 0, "nodes_ticked": 0, "node_ticks": 0, "tree_ticks": 0},
             "failed_node": {"name": first.get("node", ""), "tag": first.get("tag", ""), "path": first.get("path", ""),
                             "reason": first["message"]} if first.get("path") else None,
-            "finished_at": datetime.now().astimezone().isoformat(), "duration_s": time.time() - started_wall,
+            "finished_at": datetime.now().astimezone().isoformat(), "duration_s": max(0.0, time.time() - started_wall),
         })
         return report
 
@@ -436,7 +487,9 @@ class BehaviorTreeExecutor:
             "timeline_dropped": state["timeline_dropped"],
             "stats": _totals(real_rows, state["ticks"]),
             "finished_at": datetime.now().astimezone().isoformat(),
-            "duration_s": time.time() - started_wall,
+            # the monotonic tick-loop time: an NTP clock jump mid-task used to
+            # give negative or hours-long durations
+            "duration_s": state.get("elapsed", 0.0),
         })
         return report
 

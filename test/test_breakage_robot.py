@@ -569,7 +569,8 @@ def test_an_interrupted_update_is_rolled_back_at_the_next_launch(tmp_path):
     ok = _launch_module().recover_interrupted_update(journal, run=lambda argv, cwd: ran.append((argv, cwd)) or 0,
                                                       log=lambda m: None)
     assert ok is True
-    assert ran[0] == (["git", "reset", "--hard", "aaaa1111"], "/ws/src/xparo")
+    # --keep: other uncommitted edits survive (round 2, V21)
+    assert ran[0] == (["git", "reset", "--keep", "aaaa1111"], "/ws/src/xparo")
     assert ran[1] == (["colcon", "build", "--packages-select", "xparo", "--symlink-install"], "/ws")
     import os
     assert not os.path.exists(journal)

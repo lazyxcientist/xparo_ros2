@@ -110,6 +110,12 @@ def result_message(task_id, run_id, outcome, error, explanation="", **extra):
     }}
 
 
+def _release_when_stopped(run_id, stopped_event):
+    stopped_event.wait()
+    with _active_lock:
+        _active_runs.pop(run_id, None)
+
+
 def handle_run_task(executor, val, send_response, add_task_history=None, xparo_stage="production",
                     subtree_resolver=None, on_started=None):
     """Blocks the calling thread until the tree reaches a final status,
@@ -212,6 +218,7 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
     if delay > 0:
         event.wait(min(delay, 300))
 
+    report = None
     try:
         if not tree_xml.strip():
             where = f"Behaviour tree {tree_name!r}" if tree_name else "The project's main behaviour tree"
@@ -227,8 +234,19 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
                 live_context={"task_id": task_id, "tree_name": tree_name, "task_title": context["task_title"]},
             )
     finally:
+        still_ticking = report.pop("_still_ticking", None) if isinstance(report, dict) else None
         with _active_lock:
-            info = _active_runs.pop(run_id, {})
+            if still_ticking is None:
+                info = _active_runs.pop(run_id, {})
+            else:
+                # A node is still blocked in its tick: keep the run
+                # registered (so "already running" still protects it) until
+                # that thread really returns.
+                info = dict(_active_runs.get(run_id, {}))
+                if run_id in _active_runs:
+                    _active_runs[run_id]["stopping"] = True
+                threading.Thread(target=_release_when_stopped, args=(run_id, still_ticking),
+                                 daemon=True, name="xparo-run-release").start()
     if report.get("outcome") == "cancelled" and info.get("reason"):
         report["explanation"] = f"The task was cancelled ({info['reason']})."
     failed = report.get("failed_node")

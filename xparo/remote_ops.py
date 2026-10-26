@@ -68,11 +68,10 @@ def handle_run_command(command, request_id, timeout, send_response, max_lines=No
     timed_out = False
     exit_code = None
     try:
-        proc = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout,
-        )
-        exit_code = proc.returncode
-        output = (proc.stdout or "") + (proc.stderr or "")
+        # its own process group: a timeout ends everything it started
+        from .proc import run_group
+        exit_code, stdout, stderr = run_group(command, timeout, shell=True)
+        output = (stdout or "") + (stderr or "")
     except subprocess.TimeoutExpired as e:
         timed_out = True
         stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")

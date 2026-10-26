@@ -55,16 +55,21 @@ class BashProcessNode(behaviour.Behaviour):
         for key, value in resolved.items():
             env[key.upper()] = "" if value is None else str(value)
 
+        from ..proc import GroupProcess
         try:
-            proc = subprocess.run(
-                [self.script_path], env=env, capture_output=True, text=True, timeout=self.TICK_TIMEOUT_S,
-            )
+            # own process group: a timeout, Cancel or the run's time limit
+            # (halt below) ends the script and everything it started
+            self._group = GroupProcess([self.script_path], env=env)
+            returncode, stdout, stderr = self._group.run(self.TICK_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             self.feedback_message = f"no exit within {self.TICK_TIMEOUT_S}s -- treating as hung"
             return common.Status.FAILURE
         except OSError as exc:
             self.feedback_message = f"failed to run: {exc}"
             return common.Status.FAILURE
+        finally:
+            self._group = None
+        proc = subprocess.CompletedProcess([self.script_path], returncode, stdout, stderr)
 
         for line in proc.stdout.splitlines():
             if "=" not in line:
@@ -79,7 +84,11 @@ class BashProcessNode(behaviour.Behaviour):
         return status
 
     def halt(self):
-        pass  # see class docstring above -- no live child by the time this runs
+        # Cancel / the time limit while the script still runs (the tick is
+        # stopped from another thread): end its whole process group.
+        group = getattr(self, "_group", None)
+        if group is not None:
+            group.stop()
 
 
 # ---------------------------------------------------------------------------

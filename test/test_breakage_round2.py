@@ -1,0 +1,206 @@
+"""Regression tests for round 2 of the breakage review (robot side).
+Each test names the finding it guards ([V] = robot-hardware persona)."""
+import json
+from unittest.mock import MagicMock, patch
+
+from xparo.transports import django_ws
+
+
+def _transport(connection_type="rest"):
+    # The real constructor: round-1 tests built the transport with __new__,
+    # which is how V4/V5 (bugs in __init__) slipped through.
+    return django_ws.DjangoWsTransport("secret-abc", "proj-1", on_message=MagicMock(),
+                                       on_connected=MagicMock(), connection_type=connection_type)
+
+
+def test_rest_mode_actually_polls():
+    """V4: connection_type rest stopped before its first request."""
+    t = _transport("rest")
+    calls = []
+
+    def fake_get(*a, **kw):
+        calls.append(kw)
+        t._rest_running = False
+        return MagicMock(status_code=201, content=b'{"a": 1}', json=lambda: {"a": 1})
+    with patch.object(django_ws.requests, "get", side_effect=fake_get), \
+            patch.object(django_ws.requests, "post"), \
+            patch.object(django_ws.threading, "Thread") as thread:
+        t.connect()
+        target = thread.call_args.kwargs["target"]
+        assert t._rest_running is True
+        target(sleep=lambda s: None)
+    assert calls and t.on_message.call_count == 1
+
+
+def test_credential_watchdog_runs_until_closed():
+    """V5: _closed started True, so the watchdog exited immediately."""
+    t = _transport("websocket")
+    assert t._closed is False
+    t.close()
+    assert t._closed is True
+
+
+def test_an_unchanged_rest_sync_is_not_processed_again():
+    """V6: every poll rewrote every tree on the SD card."""
+    t = _transport("rest")
+    body = MagicMock(content=b'{"x": 1}', json=lambda: {"x": 1})
+    assert t._on_rest_body(body) is True
+    assert t._on_rest_body(body) is False
+    assert t.on_message.call_count == 1
+
+
+def test_the_secret_is_not_in_any_url():
+    """K3/V25: URLs (and so access logs) carried the robot's secret."""
+    t = _transport("websocket")
+    assert "secret-abc" not in t.socket_full_url and "secret-abc" not in t.website_full_url
+    assert t.auth_headers == {django_ws.SECRET_HEADER: "secret-abc"}
+
+
+def _engine():
+    from test_engine import _make_engine
+    return _make_engine()
+
+
+def test_results_sent_late_are_marked_replayed():
+    """V2: a stale failure from the outbox restarted the task by itself."""
+    engine = _engine()
+    sent = []
+    engine.private_send = lambda data, **kw: sent.append(json.loads(data))
+    engine.transport = MagicMock(websocket_connected=True)
+    engine._pending_important_sends = [{"TASK_RESULT": {"task_id": "t", "success": False}}]
+    engine._flush_pending_important_sends()
+    assert sent == [{"TASK_RESULT": {"task_id": "t", "success": False, "replayed": True}}]
+
+
+def test_a_rest_send_counts_as_delivered():
+    """V24: in REST fallback every result was sent twice."""
+    engine = _engine()
+    engine.private_send = lambda data, **kw: None
+    engine.transport = MagicMock(websocket_connected=False, connection_type="hybrid", rest_fallback_active=True)
+    assert engine._try_send_dict({"x": 1}) is True
+
+
+def test_a_stopped_run_stays_registered_until_its_blocked_node_returns():
+    """V3: the run was released while the blocked node still ran, so the
+    same task could start again and drive alongside it."""
+    import threading
+    import py_trees
+    from py_trees import common
+    from xparo.bt_engine import executor as ex
+    from xparo.bt_engine.node_registry import NODE_REGISTRY
+    release = threading.Event()
+
+    class _Blocks(py_trees.behaviour.Behaviour):
+        def update(self):
+            release.wait(10)
+            return common.Status.SUCCESS
+    NODE_REGISTRY["_BlocksR2"] = lambda name, attrs, blackboard, children, ros_node: _Blocks(name=name or "b")
+    old_grace, ex.ABANDON_GRACE_S = ex.ABANDON_GRACE_S, 0.1
+    try:
+        report = ex.BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock()).run_with_trace(
+            "<_BlocksR2 />", timeout_s=0.3, tick_rate_hz=0)
+        stopped = report["_still_ticking"]
+        assert report["outcome"] == "timeout" and not stopped.is_set()
+        release.set()
+        assert stopped.wait(5)
+    finally:
+        ex.ABANDON_GRACE_S = old_grace
+        release.set()
+        del NODE_REGISTRY["_BlocksR2"]
+
+
+def test_one_failing_terminate_does_not_skip_the_others():
+    """V27: root.stop() ended at the first terminate() that raised."""
+    import py_trees
+    from py_trees import common
+    from xparo.bt_engine.executor import _stop_running
+    stopped = []
+
+    class _Node(py_trees.behaviour.Behaviour):
+        def __init__(self, name, fail):
+            super().__init__(name=name)
+            self.fail = fail
+
+        def update(self):
+            return common.Status.RUNNING
+
+        def terminate(self, new_status):
+            if new_status == common.Status.INVALID and self.status == common.Status.RUNNING:
+                stopped.append(self.name)
+                if self.fail:
+                    raise RuntimeError("motor driver gone")
+    a, b = _Node("a", True), _Node("b", False)
+    root = py_trees.composites.Parallel("p", policy=py_trees.common.ParallelPolicy.SuccessOnAll(), children=[a, b])
+    root.tick_once()
+    errors = []
+    _stop_running(root, errors)
+    assert set(stopped) == {"a", "b"} and errors
+
+
+def test_a_timed_out_command_stops_its_children_too(tmp_path):
+    """V8: only the shell was killed; what it started kept running."""
+    import subprocess
+    import time
+    import pytest
+    from xparo.proc import run_group
+    marker = tmp_path / "still-running"
+    # the child keeps touching a file every 0.1 s for 5 s
+    cmd = f"(for i in $(seq 50); do touch {marker}; sleep 0.1; done) & wait"
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_group(cmd, 0.5, shell=True)
+    marker.unlink(missing_ok=True)
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
+def test_a_tree_deleted_on_the_dashboard_is_deleted_here(tmp_path):
+    """V13: deleted trees stayed on the robot and stayed runnable."""
+    engine = _engine()
+    engine.files["xparo_custom_behaviors_folder_path"] = str(tmp_path)
+    folder = tmp_path / "custom_aiml"
+    folder.mkdir()
+    (folder / "patrol.xml").write_text("<root/>")
+    (folder / "keep.xml").write_text("<root/>")
+    engine.on_ws_message("ws", {"DELETE_synced_files": {"folder": "custom_aiml", "names": ["patrol", "../../etc/passwd"]}})
+    assert not (folder / "patrol.xml").exists() and (folder / "keep.xml").exists()
+
+
+def test_node_discovery_never_runs_the_file():
+    """V14: discovering node files imported (ran) every stray .py file."""
+    from xparo.bt_engine.plugin_loader import static_node_tags
+    source = (
+        "raise SystemExit('this must never run')\n"
+        "class Grip(CustomBTNode):\n    XML_TAG = 'Grip'\n"
+        "class Helper:\n    XML_TAG = 'NotANode'\n"
+    )
+    assert static_node_tags(source) == {"Grip": "Grip"}
+    assert static_node_tags("def broken(:") == {}
+
+
+def test_a_second_copy_waits_for_the_lock_instead_of_exiting(tmp_path):
+    """V28: the second copy exited and launch respawned it every 3 s."""
+    from xparo.xparo_ros import acquire_single_instance_lock, wait_for_instance_lock
+    path = str(tmp_path / "xparo.lock")
+    first = acquire_single_instance_lock(path)
+    waits = []
+
+    def sleep(s):
+        waits.append(s)
+        first.close()          # the first copy stops
+    handle = wait_for_instance_lock(path, retry_s=30, sleep=sleep)
+    assert handle is not None and waits == [30]
+
+
+def test_update_recovery_gives_up_after_a_few_failures(tmp_path):
+    """V21: every launch repeated a failing 30-minute rebuild."""
+    import os
+    from xparo import ota
+    from test_breakage_robot import _launch_module
+    launch = _launch_module()
+    journal = str(tmp_path / "ota_journal.json")
+    ota.write_journal({"repo": "/ws/src/xparo", "workspace": "/ws", "from": "aaaa1111", "to": "bbbb2222"}, path=journal)
+    for _ in range(launch.MAX_RECOVERY_ATTEMPTS):
+        assert launch.recover_interrupted_update(journal, run=lambda argv, cwd: 1, log=lambda m: None) is False
+        assert os.path.exists(journal)
+    assert launch.recover_interrupted_update(journal, run=lambda argv, cwd: 1, log=lambda m: None) is False
+    assert not os.path.exists(journal)

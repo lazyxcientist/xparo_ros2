@@ -48,11 +48,15 @@ MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK = 5
 # poll (0.2s) -- this only runs during a websocket outage, and polling that
 # fast from every affected robot at once is exactly the kind of thing that
 # turns a brief server hiccup into a thundering-herd pile-on.
-HYBRID_REST_FALLBACK_POLL_INTERVAL_SECONDS = 2
+# 10 s, not 2: each poll downloads the whole project sync, and an
+# unchanged one is skipped anyway (_on_rest_body).
+HYBRID_REST_FALLBACK_POLL_INTERVAL_SECONDS = 10
 # Every HTTP call has a time limit: (connect, read) seconds. Without one, a
 # request on a half-dead Wi-Fi link could block forever -- the heartbeat
 # thread stopped and the robot showed offline until rebooted.
 HTTP_TIMEOUT = (5, 20)
+# Where the robot's secret / credential goes (see DjangoWsTransport.__init__).
+SECRET_HEADER = "X-Xparo-Secret"
 # WebSocket keep-alive: a ping every 20 s, and a socket that doesn't answer
 # within 10 s is treated as dead and reconnected. Without it a silently
 # dropped connection still looked "connected" and task results sent into
@@ -92,7 +96,11 @@ class DjangoWsTransport(Transport):
         # (and harmless) for the other connection_type values.
         self.rest_fallback_active = False
         self._rest_running = False
-        self._closed = True
+        # True once close() ran: every background loop below stops. (It
+        # started out True, so the credential watchdog exited at once.)
+        self._closed = False
+        # The last REST sync body processed: an unchanged one is skipped.
+        self._last_rest_body = None
         # Set by engine.py only when secret_key here came from a persisted
         # ROBOT_CREDENTIAL (config/credential.json), never for a raw
         # xparo_secret_key launch argument -- see on_ws_error below for why
@@ -108,8 +116,13 @@ class DjangoWsTransport(Transport):
         # separately for XP_Database's BlackboxOrchestrator, which uploads
         # against a different path on the same host.
         self.website_base_url = website_url
-        self.website_full_url = website_url +'/chatbot_api/'+secret_key+'/'+project_id+'/'
-        self.socket_full_url = socket_url + '/ws/chatbot_api/'+str(secret_key)+'/'+str(project_id)+'/'
+        # The secret travels in a header, not the URL: URLs end up in server
+        # and proxy access logs (every 30 s heartbeat), headers don't. "_"
+        # in the path tells the server to read SECRET_HEADER instead.
+        # (Needs a server that knows the header: update the server first.)
+        self.auth_headers = {SECRET_HEADER: str(secret_key)}
+        self.website_full_url = website_url +'/chatbot_api/_/'+str(project_id)+'/'
+        self.socket_full_url = socket_url + '/ws/chatbot_api/_/'+str(project_id)+'/'
 
     @property
     def websocket_connected(self):
@@ -162,6 +175,7 @@ class DjangoWsTransport(Transport):
         if self.connection_type=="websocket" or self.connection_type=="hybrid":
             if not self.websocket_connected:
                 self.ws = Xparo_socket(str(self.socket_full_url),
+                                header=[f"{k}: {v}" for k, v in self.auth_headers.items()],
                                 on_message=self.on_message,
                                 on_error=self.on_ws_error,
                                 on_open=self.on_ws_open,
@@ -188,7 +202,9 @@ class DjangoWsTransport(Transport):
                 print("already connected to xparo remote")
         elif self.connection_type=="rest":
             # In the background: offline at boot used to raise here and
-            # crash the whole node.
+            # crash the whole node. _rest_running must be set first: it
+            # started False, so polling ended before its first request.
+            self._rest_running = True
             threading.Thread(target=self.start_reset_framework, daemon=True).start()
         elif self.connection_type=="offline":
             print("offline mode with custom llm is comming soon...")
@@ -204,6 +220,7 @@ class DjangoWsTransport(Transport):
         # that's being retired before its first connect() attempt).
         self.rest_fallback_active = False
         self._rest_running = False
+        self._closed = True
         if getattr(self, "ws", None) is not None:
             self.ws.close()
         self.websocket_connected = False
@@ -239,7 +256,7 @@ class DjangoWsTransport(Transport):
             if command_for=="websocket":
                 self.ws.send(message)
             elif command_for=="rest":
-                response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json'},
+                response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json', **getattr(self, 'auth_headers', {})},
                                          timeout=HTTP_TIMEOUT)
                 if response.status_code == 201:
                     self.on_message('rest', response.json())
@@ -262,7 +279,8 @@ class DjangoWsTransport(Transport):
     def _credential_rejected(self):
         """One handshake attempt: True only for an explicit 403."""
         try:
-            conn = websocket.create_connection(self.socket_full_url, timeout=15)
+            conn = websocket.create_connection(self.socket_full_url, timeout=15,
+                                               header=[f"{k}: {v}" for k, v in getattr(self, 'auth_headers', {}).items()])
             conn.close()
             return False
         except websocket.WebSocketBadStatusException as e:
@@ -338,6 +356,12 @@ class DjangoWsTransport(Transport):
 
     def on_ws_close(self, ws, *args):
         self.websocket_connected = False
+        code = args[0] if args else None
+        if code == 4404:
+            print("[xparo] The server doesn't know this project id: check xparo_project_id "
+                  "(copy it again from the dashboard's Keys page).")
+        elif code == 4403:
+            print("[xparo] The server closed the connection: this robot's key or credential was revoked or frozen.")
         print('''
 
             xparo brain is
@@ -359,7 +383,7 @@ class DjangoWsTransport(Transport):
         """
         fallback_threshold_seconds = MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK * RECONNECT_DELAY_SECONDS
         disconnected_since = None
-        while True:
+        while not getattr(self, '_closed', False):
             time.sleep(RECONNECT_DELAY_SECONDS)
             if self.websocket_connected:
                 disconnected_since = None
@@ -373,15 +397,26 @@ class DjangoWsTransport(Transport):
     def _hybrid_rest_fallback_loop(self):
         print(f"hybrid mode: websocket has been down for over {MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK} "
               "reconnect attempts -- falling back to REST polling until it recovers")
-        while self.rest_fallback_active:
+        while self.rest_fallback_active and not getattr(self, '_closed', False):
             try:
-                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT)
+                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT, headers=getattr(self, 'auth_headers', {}))
                 if response.status_code == 201:
-                    self.on_message('rest', response.json())
+                    self._on_rest_body(response)
             except Exception as e:
                 print(e)
             time.sleep(HYBRID_REST_FALLBACK_POLL_INTERVAL_SECONDS)
         print("hybrid mode: websocket recovered -- stopping REST fallback")
+
+    def _on_rest_body(self, response):
+        """Hands a polled sync to the engine only when it changed: every
+        poll returns the whole project, and processing it rewrote every
+        tree/map on the SD card and re-imported every node each time."""
+        body = response.content
+        if body == getattr(self, '_last_rest_body', None):
+            return False
+        self._last_rest_body = body
+        self.on_message('rest', response.json())
+        return True
 
     def start_reset_framework(self, sleep=time.sleep):
         """connection_type "rest": fetch the initial sync, then poll. Never
@@ -394,12 +429,12 @@ class DjangoWsTransport(Transport):
             try:
                 if not initialized:
                     self.send(json.dumps({"initiliaze": True}), command_for="rest")
-                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT)
+                response = requests.get(self.website_full_url, timeout=HTTP_TIMEOUT, headers=getattr(self, 'auth_headers', {}))
                 if response.status_code == 201:
                     if not initialized:
                         initialized = True
                         self.on_connected()
-                    self.on_message('rest', response.json())
+                    self._on_rest_body(response)
                     delay = REST_POLL_INTERVAL_SECONDS
                 else:
                     print(f"XPARO server answered {response.status_code}; check xparo_secret_key / xparo_project_id")

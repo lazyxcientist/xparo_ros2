@@ -333,7 +333,7 @@ def test_engine_routes_ads_messages():
     engine.ad_manager.update_schedule.assert_called_once_with({"ads": []})
     engine.ad_manager.on_ack.assert_called_once_with({"ack": [1]})
     with patch.object(engine.local_database, "dashboard_receive"):
-        engine.send_initial_data()
+        engine._send_initial_data_now()   # send_initial_data runs this in a thread
     engine.ad_manager.on_connected.assert_called_once()
 
 

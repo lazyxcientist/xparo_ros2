@@ -114,6 +114,7 @@ class Engine():
         self.joy_publish = joy_publish or (lambda axes, buttons: None)
         # Every TELEOP goes through this: it stops the robot (centred stick)
         # when commands stop arriving, and drops delayed, out-of-order ones.
+        self._initial_data_lock = threading.Lock()
         self.teleop = remote_ops.TeleopDeadman(lambda axes, buttons: self.joy_publish(axes, buttons))
         # bt_engine.executor.BehaviorTreeExecutor -- set post-construction
         # by xparo_ros.py, same reasoning as call_message/files just below
@@ -324,9 +325,16 @@ class Engine():
         # from the moment the file is created (no window where a default-
         # permission file briefly exists), and the umask can only narrow
         # it further, never widen it.
-        fd = os.open(self.xparo_credential_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Written to a temp file and swapped in (V9): truncating the real
+        # file first left it empty after a power cut, and the robot then
+        # never got a credential again.
+        tmp = self.xparo_credential_path + '.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as file:
             json.dump({'value': raw_value, 'project_id': self.project_id}, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, self.xparo_credential_path)
 
     def _fall_back_to_raw_secret(self):
         """Called at most once, from the transport's on_ws_error, the
@@ -351,6 +359,11 @@ class Engine():
             os.remove(self.xparo_credential_path)
         except FileNotFoundError:
             pass
+        # the uploader still held the rejected credential: it got 401s forever
+        orchestrator = getattr(getattr(self, "local_database", None), "orchestrator", None)
+        if orchestrator is not None:
+            orchestrator.API_TOKEN = ""
+            orchestrator.AUTH_SCHEME = "Token"
         self.transport.close()
         self.transport = DjangoWsTransport(
             self._raw_secret_key, self.project_id,
@@ -585,7 +598,12 @@ class Engine():
         """
         try:
             self.private_send(json.dumps(payload))
-            return bool(getattr(self.transport, 'websocket_connected', True))
+            transport = self.transport
+            # REST (and hybrid's REST fallback) delivered it too: judging by
+            # the websocket alone queued it again and sent it twice later.
+            return bool(getattr(transport, 'websocket_connected', True)
+                        or getattr(transport, 'connection_type', '') == 'rest'
+                        or getattr(transport, 'rest_fallback_active', False))
         except Exception as e:
             print(f"[Engine] send failed, queued for retry on reconnect: {e}")
             return False
@@ -618,6 +636,12 @@ class Engine():
         """
         with self._pending_important_sends_lock:
             pending, self._pending_important_sends = self._pending_important_sends, []
+        for payload in pending:
+            # Sent late (after an outage or a power cut): the server must not
+            # treat a stale failure as fresh and restart the task by itself.
+            for value in (payload.values() if isinstance(payload, dict) else ()):
+                if isinstance(value, dict):
+                    value["replayed"] = True
         still_pending = [p for p in pending if not self._try_send_dict(p)]
         with self._pending_important_sends_lock:
             if still_pending:
@@ -1197,7 +1221,10 @@ class Engine():
             live_control = getattr(self.bt_executor.node, 'rosbag_control', None)
             if live_control is not None:
                 live_control.start_mode = config.get('start_mode', live_control.start_mode)
-                live_control.start_delay_seconds = max(0, config.get('start_delay_seconds', live_control.start_delay_seconds) or 0)
+                try:   # a "5" (string) from the dashboard used to fail the whole rosbag_config sync
+                    live_control.start_delay_seconds = max(0, int(float(config.get('start_delay_seconds', live_control.start_delay_seconds) or 0)))
+                except (TypeError, ValueError):
+                    pass
         print(f"[rosbag_control] synced config: {config}")
 
     def sync_custom_tasks(self, tasks):
@@ -1429,6 +1456,10 @@ class Engine():
                     "synced_at": datetime.utcnow().isoformat(),
                 }
             self._write_sync_state(custom_aiml_dir, aiml_sync_state)
+        elif k=="DELETE_synced_files":
+            # A tree / environment deleted (or renamed) on the dashboard:
+            # remove this robot's copy too (it stayed runnable before).
+            self._delete_synced_files(val or {})
         elif k=="custom_maps":
             # Same fix, same reasoning as custom_aiml just above --
             # its own subfolder under xparo_custom_evns_folder_path,
@@ -1756,6 +1787,29 @@ class Engine():
             print(f"[xparo] no handler for {k!r}; ignored")
 
 
+    def _delete_synced_files(self, val):
+        folder = val.get("folder")
+        if folder == "custom_aiml":
+            base = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
+            ext = '.xml'
+        elif folder == "custom_maps":
+            base = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
+            ext = '.env'
+        else:
+            return
+        state = self._read_sync_state(base) if os.path.isdir(base) else {}
+        for name in val.get("names") or []:
+            path = remote_ops.safe_path_in(base, str(name) + ext)
+            if path is None:
+                continue
+            try:
+                os.remove(str(path))
+            except FileNotFoundError:
+                pass
+            state.pop(name, None)
+        if os.path.isdir(base):
+            self._write_sync_state(base, state)
+
     def get_initial_local_env_data(self):
         try:
             with open(self.files["local_env"], 'r') as file:
@@ -1787,7 +1841,7 @@ class Engine():
         # ---- Read main aiml (behavior tree) ----
         behavior_path = self.files["behavior"]
         if os.path.exists(behavior_path):
-            with open(behavior_path, 'r') as f:
+            with open(behavior_path, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                 content = f.read()
                 # Extract the content between <BehaviorTree ID="MainTree"> and </BehaviorTree>
                 start = content.find('<BehaviorTree ID="MainTree">')
@@ -1803,19 +1857,19 @@ class Engine():
         # ---- Read maps (env file) ----
         env_path = self.files["env"]
         if os.path.exists(env_path):
-            with open(env_path, 'r') as f:
+            with open(env_path, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                 result["maps"] = f.read()
 
         # ---- Read Sets (file) ----
         sets_path = self.files["file"]
         if os.path.exists(sets_path):
-            with open(sets_path, 'r') as f:
+            with open(sets_path, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                 result["Sets"] = f.read()
 
         # ---- Read properties ----
         properties_path = self.files["properties"]
         if os.path.exists(properties_path):
-            with open(properties_path, 'r') as f:
+            with open(properties_path, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                 result["properties"] = f.read()
 
         # ---- Read custom_aiml (all .xml files in custom_behaviors/custom_aiml) ----
@@ -1824,7 +1878,7 @@ class Engine():
             for filename in os.listdir(custom_behaviors_path):
                 if filename.endswith('.xml'):
                     filepath = os.path.join(custom_behaviors_path, filename)
-                    with open(filepath, 'r') as f:
+                    with open(filepath, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                         content = f.read()
                         # Extract inner content like for main aiml
                         start = content.find('<BehaviorTree ID="MainTree">')
@@ -1844,7 +1898,7 @@ class Engine():
             for filename in os.listdir(custom_envs_path):
                 if filename.endswith('.env'):
                     filepath = os.path.join(custom_envs_path, filename)
-                    with open(filepath, 'r') as f:
+                    with open(filepath, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                         result["custom_maps"][filename[:-4]] = f.read()
 
         # ---- Read custom_sets (all files in custom_files folder) ----
@@ -1853,7 +1907,7 @@ class Engine():
             for filename in os.listdir(custom_files_path):
                 filepath = os.path.join(custom_files_path, filename)
                 if os.path.isfile(filepath):
-                    with open(filepath, 'r') as f:
+                    with open(filepath, 'r', errors='replace') as f:  # a binary file used to stop sync for good
                         result["custom_sets"][filename] = f.read()
 
         return result
@@ -1875,19 +1929,8 @@ class Engine():
 
     def _looks_like_a_node_file(self, language, source):
         if language == 'python':
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
-            try:
-                return bool(plugin_loader.load_plugins([tmp_path]))
-            except Exception:
-                return False
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+            # read, never imported (that ran any stray file's code)
+            return bool(plugin_loader.static_node_tags(source))
         if language == 'cpp':
             return bool(runners._CPP_CLASS_RE.search(source))
         if language == 'javascript':
@@ -1959,22 +2002,8 @@ class Engine():
         entry's metadata.
         """
         if language == 'python':
-            import tempfile
-            xml_tag = self._pascal_case(name)
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
-            try:
-                found = plugin_loader.load_plugins([tmp_path])
-                if found:
-                    xml_tag = next(iter(found.keys()))
-            except Exception:
-                pass
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+            found = plugin_loader.static_node_tags(source)
+            xml_tag = next(iter(found.keys())) if found else self._pascal_case(name)
             return {"xml_tag": xml_tag, "node_type": "action", "ports": []}
 
         if language == 'cpp':
@@ -2189,6 +2218,18 @@ class Engine():
         return response
 
     def send_initial_data(self):
+        """The transport's on_connected. Runs in its own thread: gathering
+        robot info (public-IP lookups, nmcli, bluetoothctl, a 1 s CPU sample)
+        took several seconds on the websocket thread, so Cancel and teleop
+        waited after every Wi-Fi roam."""
+        threading.Thread(target=self._send_initial_data_now, daemon=True, name="xparo-initial-data").start()
+
+    def _send_initial_data_now(self):
+        lock = self.__dict__.setdefault('_initial_data_lock', threading.Lock())
+        with lock:   # a quick reconnect waits for the previous round
+            self._send_initial_data_body()
+
+    def _send_initial_data_body(self):
         # self.private_send(json.dumps({"initisilaze_api":{}}))
         self.local_database.dashboard_receive({"needed_robot_data":{"sent":True}},self.private_send)
         # This is the transport's on_connected callback (wired at

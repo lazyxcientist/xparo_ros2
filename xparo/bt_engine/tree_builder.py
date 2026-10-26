@@ -410,6 +410,10 @@ def build_tree(xml_fragment, blackboard, ros_node=None, subtrees=None, subtree_r
     return build_node(root_element, blackboard, ros_node, context)
 
 
+STUB_TAGS = frozenset({"PlayAudio", "DockRobot", "CheckBatteryLevel", "SpeakText", "NotifyPatient",
+                       "LoadNextDelivery", "NavigateTo"})
+
+
 def validate_tree(xml_fragment, subtrees=None, subtree_resolver=None):
     """Checks a tree without building it. Returns a list of problems:
     {"level": "error"|"warning", "message", "path", "tag", "node"}.
@@ -443,6 +447,12 @@ def validate_tree(xml_fragment, subtrees=None, subtree_resolver=None):
                 add("error", f"tree is nested more than {MAX_TREE_DEPTH} levels deep -- flatten it or use a SubTree", path, element)
             return
         tag = element.tag
+        if tag in STUB_TAGS:
+            # These do nothing yet on this robot and report SUCCESS: a
+            # delivery "succeeded" without the robot moving.
+            add("warning", f"{tag} is a placeholder on this robot: it does nothing and reports success. "
+                           f"Use a custom node that drives your robot instead "
+                           f"(or set XPARO_STUB_NODES=fail on the robot to make it fail)", path, element)
         for attr in _CONDITIONAL_ATTRS:
             source = element.attrib.get(attr)
             if source and not _parses(source):

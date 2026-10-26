@@ -8,6 +8,7 @@ blackboard values can change between ticks, e.g. a Script node earlier in
 the same Sequence assigning a value a later sibling reads.
 """
 import re
+import os
 import time
 
 import py_trees
@@ -96,6 +97,9 @@ class StubActionNode(py_trees.behaviour.Behaviour):
             self.feedback_message = f"[STUB] {self.TAG}: {resolved}"
             print(f"[bt_engine STUB] {self.TAG} ({self.name}): {resolved}")
 
+        if os.environ.get("XPARO_STUB_NODES", "").lower() == "fail":
+            self.feedback_message = f"{self.TAG} isn't implemented on this robot (placeholder node)"
+            return common.Status.FAILURE
         if time.monotonic() - self._started_at < self.SIMULATED_DELAY_S:
             return common.Status.RUNNING
         return common.Status.SUCCESS

@@ -94,7 +94,7 @@ class TestStaleness:
         node = FakeNode()
         aggregator = DiagnosticsAggregator(node)
         aggregator.record_self_status('xparo.disk_usage', 'ok', '10% used')
-        aggregator._latest['xparo.disk_usage']['last_seen'] = time.time() - (STALE_TIMEOUT_SEC + 5)
+        aggregator._latest['xparo.disk_usage']['seen_mono'] = time.monotonic() - (STALE_TIMEOUT_SEC + 5)   # staleness uses the monotonic clock
 
         snapshot = aggregator.snapshot()
 

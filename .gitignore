@@ -30,3 +30,6 @@ config/credential.json
 # breakage review #58: per-project marker and set-aside files of a previous project
 custom_behaviors/.xparo_project_id
 custom_behaviors/.previous_projects/
+
+# per-robot runtime env (written by the server)
+config/local.env

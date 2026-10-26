@@ -24,6 +24,7 @@ from sensor_msgs.msg import Joy
 from ament_index_python.packages import get_package_share_directory
 import json
 import os
+import time
 import yaml
 from datetime import datetime
 
@@ -74,8 +75,12 @@ class Xparo(Node):
         # Pasted keys often carry spaces, quotes or a newline: those used to
         # end up in the connection URL and fail with a misleading
         # "check your internet connection" loop.
-        self.xparo_project_id = clean_setting(self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value)
-        self.xparo_secret_key = clean_setting(self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value)
+        # An empty parameter means "not set": ros2 launch always passes ""
+        # for these, which used to hide ~/xparo_config.json completely.
+        self.xparo_project_id = clean_setting(self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value) \
+            or clean_setting(xparo_config.get("xparo_project_id", ""))
+        self.xparo_secret_key = clean_setting(self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value) \
+            or clean_setting(xparo_config.get("xparo_secret_key", ""))
         for problem in check_connection_settings(self.xparo_project_id, self.xparo_secret_key):
             self.get_logger().error(problem)
 
@@ -99,13 +104,18 @@ class Xparo(Node):
         # One xparo per project on a robot: a second copy (started by
         # accident) fought the first for the server connection and ran
         # every topic-triggered task twice.
-        self._instance_lock = acquire_single_instance_lock(
-            os.path.join(os.environ.get("XPARO_STATE_DIR") or os.path.join(self.xparo_folder, "xparo", self.xparo_project_id or "no-project"),
-                         "xparo.lock"))
+        self._instance_lock_path = os.path.join(
+            os.environ.get("XPARO_STATE_DIR") or os.path.join(self.xparo_folder, "xparo", self.xparo_project_id or "no-project"),
+            "xparo.lock")
+        self._instance_lock = acquire_single_instance_lock(self._instance_lock_path)
         if self._instance_lock is None:
+            # Wait instead of exiting: launch's respawn=True restarted an
+            # exiting copy every 3 s forever, filling the logs. This one
+            # takes over if the other stops.
             self.get_logger().error("Another xparo node is already running for this project on this robot. "
-                                    "Stop it first (ros2 node list / ps aux | grep xparo). Exiting.")
-            raise SystemExit(1)
+                                    "This copy waits and takes over if that one stops "
+                                    "(to stop it: ros2 node list / ps aux | grep xparo).")
+            self._instance_lock = wait_for_instance_lock(self._instance_lock_path)
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
         self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
         self.xparo_env_path = self.declare_parameter("xparo_env_path",os.path.join(self.xparo_folder,'config','default.env')).value
@@ -574,6 +584,14 @@ def acquire_single_instance_lock(path):
     return handle
 
 
+def wait_for_instance_lock(path, retry_s=30, sleep=time.sleep):
+    while True:
+        handle = acquire_single_instance_lock(path)
+        if handle is not None:
+            return handle
+        sleep(retry_s)
+
+
 def main(args=None):
     rclpy.init(args=args)
     xparo = Xparo()
@@ -583,6 +601,13 @@ def main(args=None):
         # SIGINT (Ctrl+C, ros2 launch's first stop signal) or SIGTERM /
         # another shutdown -- either way, finish below and exit.
         pass
+    # Zero the sticks before anything else: a base that keeps its last
+    # cmd_vel would otherwise keep driving after Ctrl+C, a launch stop or
+    # an update restart (the deadman thread dies with the process).
+    try:
+        xparo.xparo_engine.teleop.stop()
+    except Exception as e:
+        xparo.get_logger().warn(f"Couldn't send the final teleop stop: {e}")
     # Sends this session's final Logs_history update (total runtime,
     # average CPU/RAM/disk/GPU consumption across the whole session) while
     # the transport can still actually send it -- only reachable from a

@@ -108,9 +108,12 @@ def resolve_blackboard(blackboard_mapping, params, override_params, files):
         if mapping_type == "default":
             resolved[var_name] = entry.get("value", "")
         elif mapping_type == "env":
-            env_path = os.path.join(
-                files["xparo_custom_evns_folder_path"], f"{entry.get('env_file', '')}.env"
-            )
+            # synced env files live in custom_maps/ (engine.py); this read the
+            # folder above it, so the values were silently missing
+            env_name = f"{entry.get('env_file', '')}.env"
+            env_path = os.path.join(files["xparo_custom_evns_folder_path"], "custom_maps", env_name)
+            if not os.path.exists(env_path):
+                env_path = os.path.join(files["xparo_custom_evns_folder_path"], env_name)
             content = ""
             if os.path.exists(env_path):
                 with open(env_path, "r") as file:

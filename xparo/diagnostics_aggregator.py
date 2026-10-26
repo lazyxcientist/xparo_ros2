@@ -49,12 +49,14 @@ class DiagnosticsAggregator:
 
     def _on_diagnostics(self, msg):
         now = time.time()
+        mono = time.monotonic()
         for status in msg.status:
             level = _LEVEL_NAMES.get(status.level, 'error')
             self._latest[status.name] = {
                 "level": level,
                 "message": status.message,
-                "last_seen": now,
+                "last_seen": now,       # shown on the dashboard
+                "seen_mono": mono,      # staleness: immune to clock jumps (NTP at boot)
                 "hardware_id": status.hardware_id,
             }
             if self.tracker is not None:
@@ -64,7 +66,8 @@ class DiagnosticsAggregator:
         """xparo's own self-reported entries, for when nothing publishes
         them on /diagnostics (Engine outside a live node) -- same storage/
         staleness handling either way."""
-        self._latest[name] = {"level": level, "message": message, "last_seen": time.time()}
+        self._latest[name] = {"level": level, "message": message, "last_seen": time.time(),
+                              "seen_mono": time.monotonic()}
         if self.tracker is not None:
             self.tracker.record_diagnostic(name, level, message)
 
@@ -73,19 +76,19 @@ class DiagnosticsAggregator:
         once when it goes quiet (called periodically by xparo_ros.py)."""
         if self.tracker is None:
             return
-        now = time.time()
+        now = time.monotonic()
         for name, entry in self._latest.items():
-            if (now - entry["last_seen"]) > STALE_TIMEOUT_SEC:
+            if (now - entry["seen_mono"]) > STALE_TIMEOUT_SEC:
                 self.tracker.record_diagnostic(
                     name, 'stale', f"no status for over {STALE_TIMEOUT_SEC:.0f}s", entry.get("hardware_id", ''))
 
     def snapshot(self):
         """{"components": {name: {level, message, stale}}, "overall_level": str}."""
-        now = time.time()
+        now = time.monotonic()
         components = {}
         overall = 'ok'
         for name, entry in self._latest.items():
-            stale = (now - entry["last_seen"]) > STALE_TIMEOUT_SEC
+            stale = (now - entry["seen_mono"]) > STALE_TIMEOUT_SEC
             level = 'stale' if stale else entry["level"]
             components[name] = {"level": level, "message": entry["message"], "stale": stale,
                                  "last_seen": entry["last_seen"]}

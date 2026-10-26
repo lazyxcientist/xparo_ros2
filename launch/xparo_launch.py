@@ -77,6 +77,9 @@ def _rosbag_record_topic_args(custom_behaviors_folder_path):
 OTA_JOURNAL_PATH = os.environ.get("XPARO_OTA_JOURNAL") or os.path.join(os.path.expanduser("~"), ".xparo", "ota_journal.json")
 
 
+MAX_RECOVERY_ATTEMPTS = 3
+
+
 def recover_interrupted_update(journal_path=OTA_JOURNAL_PATH, run=None, log=print):
     """An OTA update whose journal is still here never finished (power cut
     or crash mid-update): the checkout or the build may be half-new and the
@@ -96,15 +99,39 @@ def recover_interrupted_update(journal_path=OTA_JOURNAL_PATH, run=None, log=prin
     if not entry.get("repo") or not entry.get("from"):
         os.remove(journal_path)
         return False
+    attempts = int(entry.get("recovery_attempts") or 0) + 1
+    if attempts > MAX_RECOVERY_ATTEMPTS:
+        # Every launch used to repeat a failing (up to 30 min) rebuild
+        # before the node started at all.
+        os.remove(journal_path)
+        log(f"[xparo] Restoring after an interrupted update failed {MAX_RECOVERY_ATTEMPTS} times; giving up. "
+            f"Fix the checkout in {entry['repo']} and run colcon build by hand.")
+        return False
+    entry["recovery_attempts"] = attempts
+    try:
+        with open(journal_path, "w") as f:
+            json.dump(entry, f)
+    except OSError:
+        pass
     log(f"[xparo] An update to {entry.get('to', '?')[:8]} was interrupted -- restoring {entry['from'][:8]} first...")
-    ok = run(["git", "reset", "--hard", entry["from"]], entry["repo"]) == 0
+    # --keep, not --hard: other uncommitted edits in the checkout survive.
+    # Only if they'd clash is everything stashed first (git stash list has
+    # them back), never just thrown away.
+    ok = run(["git", "reset", "--keep", entry["from"]], entry["repo"]) == 0
+    if not ok:
+        stashed = run(["git", "stash", "push", "--include-untracked", "-m", "xparo: edits saved before update recovery"],
+                      entry["repo"]) == 0
+        if stashed:
+            log("[xparo] Your uncommitted edits were saved with git stash ('git stash list' / 'git stash pop').")
+        ok = stashed and run(["git", "reset", "--hard", entry["from"]], entry["repo"]) == 0
     build = ["colcon", "build", "--packages-select", "xparo"] + (["--symlink-install"] if entry.get("symlink_install") else [])
     ok = ok and run(build, entry.get("workspace") or entry["repo"]) == 0
     if ok:
         os.remove(journal_path)
         log("[xparo] Previous version restored. Start the update again from the dashboard when ready.")
     else:
-        log(f"[xparo] Restoring the previous version failed; see {journal_path} and rebuild by hand.")
+        log(f"[xparo] Restoring the previous version failed (attempt {attempts} of {MAX_RECOVERY_ATTEMPTS}); "
+            f"see {journal_path} and rebuild by hand.")
     return ok
 
 
@@ -139,7 +166,9 @@ def generate_launch_description():
     xparo_behavior_path =               LaunchConfiguration('xparo_behavior_path',                  default=os.path.join(current_dir,'config','default.xml'))
     xparo_file_path =                   LaunchConfiguration('xparo_file_path',                      default=os.path.join(current_dir,'config','default.yaml'))
     xparo_env_path =                    LaunchConfiguration('xparo_env_path',                       default=os.path.join(current_dir,'config','default.env'))
-    xparo_local_env_path =              LaunchConfiguration('xparo_local_env_path',                 default=os.path.join(current_dir, 'config', 'default.env'))
+    # its own file (it was default.env too, so the robot's local env and the
+    # project's maps overwrote each other)
+    xparo_local_env_path =              LaunchConfiguration('xparo_local_env_path',                 default=os.path.join(current_dir, 'config', 'local.env'))
     xparo_properties_path =             LaunchConfiguration('xparo_properties_path',                default=os.path.join(current_dir,'properties','properties.txt'))
     # Bidirectional file sync -- xparo_environment=="local" (developing
     # against a local Django server, this exact machine/checkout) means

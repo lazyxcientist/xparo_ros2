@@ -98,6 +98,31 @@ def _load_module(path_or_dotted):
     return importlib.import_module(path_or_dotted)
 
 
+def static_node_tags(source):
+    """{XML_TAG: class name} for classes in `source` that subclass
+    CustomBTNode and set XML_TAG, found WITHOUT running the file. Used to
+    discover node files the dashboard doesn't know yet: importing every
+    stray .py file in the folder ran its code (an endless loop at import
+    kept a CPU busy after every reconnect)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    found = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {getattr(b, "id", None) or getattr(b, "attr", None) for b in node.bases}
+        if "CustomBTNode" not in bases:
+            continue
+        for item in node.body:
+            if isinstance(item, ast.Assign) and any(getattr(t, "id", None) == "XML_TAG" for t in item.targets) \
+                    and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str) and item.value.value:
+                found[item.value.value] = node.name
+    return found
+
+
 def load_plugins(paths):
     """Returns {XML_TAG: class} for every CustomBTNode subclass found
     across every given path. A path that fails to load, or loads cleanly
