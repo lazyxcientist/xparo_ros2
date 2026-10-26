@@ -278,35 +278,61 @@ class BlackboxOrchestrator:
                 sensor_data = build_sensor_data(bag_path)
                 print(f"[UPLOAD] Metadata status for {filename}: {sensor_data.get('metadata_status')}")
 
-                with open(bag_path, 'rb') as f:
-                    payload = {
-                        'robot_id': self.ROBOT_ID,
-                        'data': json.dumps(sensor_data),
-                        'sensor_type': 'rosbag'
-                    }
-                    headers = {'Authorization': f'{self.AUTH_SCHEME} {self.API_TOKEN}'}
-
-                    response = requests.post(
-                        self.xparo_website_url+"/api/upload_rosbag/",
-                        files={'bag_file': f},
-                        data=payload,
-                        headers=headers,
-                        timeout=300
-                    )
-
-                    # 201 is DRF's default for 'Created'
-                    if response.status_code in [200, 201]:
-                        self._remove_bag_and_metadata(bag_path)
-                        self._upload_failures = 0
-                        print(f"[SUCCESS] Server confirmed receipt. Deleted: {filename}")
-                    else:
-                        print(f"[FAILED] Server status {response.status_code}: {response.text[:300]}")
-                        self._note_upload_failure()
-                        break
+                ok, message = self._upload_bag(bag_path, sensor_data)
+                if ok:
+                    self._remove_bag_and_metadata(bag_path)
+                    self._upload_failures = 0
+                    print(f"[SUCCESS] Server confirmed receipt. Deleted: {filename}")
+                else:
+                    print(f"[FAILED] {message}")
+                    self._note_upload_failure()
+                    break
             except Exception as e:
                 print(f"[NETWORK ERROR] Could not reach server: {e}")
                 self._note_upload_failure()
                 break # Stop loop to retry next interval
+
+    # Through Django (multipart) only when the server has no bucket for
+    # direct uploads: requests builds a multipart body in memory, so a
+    # multi-GB bag took all of a small robot's RAM.
+    LEGACY_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+
+    def _upload_bag(self, bag_path, sensor_data):
+        """(ok, message). Streams the file straight to storage with the
+        server's presigned URL (init -> PUT -> complete)."""
+        headers = {'Authorization': f'{self.AUTH_SCHEME} {self.API_TOKEN}'}
+        size = os.path.getsize(bag_path)
+        init = requests.post(self.xparo_website_url + "/api/upload_rosbag/init/",
+                             data={'filename': os.path.basename(bag_path), 'size': size},
+                             headers=headers, timeout=30)
+        if init.status_code == 201:
+            ticket = init.json()
+            with open(bag_path, 'rb') as f:
+                # a file object is streamed from disk, not read into memory
+                put = requests.put(ticket['upload_url'], data=f, headers={'Content-Length': str(size)},
+                                   timeout=(30, 600))
+            if put.status_code not in (200, 201):
+                return False, f"Storage refused the upload ({put.status_code}): {put.text[:200]}"
+            done = requests.post(self.xparo_website_url + "/api/upload_rosbag/complete/",
+                                 data={'object_key': ticket['object_key'], 'data': json.dumps(sensor_data)},
+                                 headers=headers, timeout=60)
+            if done.status_code in (200, 201):
+                return True, ""
+            return False, f"Server status {done.status_code}: {done.text[:300]}"
+        if init.status_code not in (404, 405, 503):      # credits, too many, too big...
+            return False, f"Server status {init.status_code}: {init.text[:300]}"
+        if size > self.LEGACY_UPLOAD_MAX_BYTES:
+            return False, (f"{os.path.basename(bag_path)} is {size // (1024 * 1024)} MB and the server has no "
+                           f"direct storage upload; kept on the robot.")
+        with open(bag_path, 'rb') as f:
+            response = requests.post(
+                self.xparo_website_url + "/api/upload_rosbag/",
+                files={'bag_file': f},
+                data={'robot_id': self.ROBOT_ID, 'data': json.dumps(sensor_data), 'sensor_type': 'rosbag'},
+                headers=headers, timeout=300)
+        if response.status_code in (200, 201):
+            return True, ""
+        return False, f"Server status {response.status_code}: {response.text[:300]}"
 
 def handle_exit(signum, frame):
     orchestrator.running = False

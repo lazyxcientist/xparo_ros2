@@ -283,3 +283,50 @@ def test_ads_pause_when_the_robot_has_not_heard_from_the_server_for_days(tmp_pat
     manager.schedule_at = _time.time()
     manager.tick(MON_10AM)
     assert len(player.started) == 1
+
+
+def test_rosbags_stream_to_storage_instead_of_loading_into_memory(tmp_path):
+    """V10: requests built a multipart body of the whole bag in RAM."""
+    import io
+    from xparo.blackbox_manager import BlackboxOrchestrator
+    bag = tmp_path / "s" / "s_0.mcap"
+    bag.parent.mkdir()
+    bag.write_bytes(b"x" * 1000)
+    o = BlackboxOrchestrator(ROBOT_ID="r", xparo_website_url="https://srv", BAG_DIR=str(tmp_path))
+    o.API_TOKEN = "tok"
+    calls = []
+
+    def post(url, **kw):
+        calls.append(url)
+        if url.endswith("/init/"):
+            assert kw["data"]["size"] == 1000
+            return MagicMock(status_code=201, json=lambda: {"upload_url": "https://r2/put", "object_key": "k"})
+        assert json.loads(kw["data"]["data"]) == {"m": 1}
+        return MagicMock(status_code=201)
+    with patch("xparo.blackbox_manager.requests.post", side_effect=post), \
+            patch("xparo.blackbox_manager.requests.put", return_value=MagicMock(status_code=200)) as put:
+        assert o._upload_bag(str(bag), {"m": 1}) == (True, "")
+    assert isinstance(put.call_args.kwargs["data"], io.BufferedReader)      # a file, streamed
+    assert calls == ["https://srv/api/upload_rosbag/init/", "https://srv/api/upload_rosbag/complete/"]
+
+    # No bucket on the server: big bags stay on the robot rather than going through RAM.
+    o.LEGACY_UPLOAD_MAX_BYTES = 10
+    with patch("xparo.blackbox_manager.requests.post", return_value=MagicMock(status_code=503)) as legacy:
+        ok, message = o._upload_bag(str(bag), {})
+    assert not ok and legacy.call_count == 1 and "kept on the robot" in message
+
+
+def test_the_credential_lives_outside_the_install_tree(tmp_path):
+    """V19/V20: credential.json sat in install/share/xparo/config -- a clean
+    rebuild deleted it and the robot could no longer sign in."""
+    from test_engine import _make_engine
+    engine = _make_engine()
+    assert not engine.xparo_credential_path.startswith(engine.xparo_folder)
+    engine.xparo_credential_path = str(tmp_path / "new" / "credential-proj.json")
+    engine._legacy_credential_path = str(tmp_path / "old" / "credential.json")
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "credential.json").write_text(json.dumps({"value": "cred-1", "project_id": engine.project_id}))
+    assert engine._load_persisted_credential() == "cred-1"
+    assert json.loads((tmp_path / "new" / "credential-proj.json").read_text())["value"] == "cred-1"
+    engine._forget_credential_files()
+    assert not (tmp_path / "old" / "credential.json").exists() and engine._load_persisted_credential() is None

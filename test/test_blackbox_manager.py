@@ -4,6 +4,7 @@ subprocess.Popen("ros2 bag record", ...), and _process_uploads()'s "is a
 session currently open" check reads RosbagControl.state instead of a
 Popen object's truthiness.
 """
+import contextlib
 import json
 import os
 import time
@@ -30,6 +31,22 @@ pytestmark = pytest.mark.usefixtures('_no_real_reindex_subprocess')
 def _no_real_reindex_subprocess():
     with patch('xparo.rosbag_metadata.try_reindex', return_value=False):
         yield
+
+
+@contextlib.contextmanager
+def _fake_server(status=201):
+    """The server's direct-upload flow (init -> PUT to storage -> complete).
+    Yields the mock that receives the final "complete" request, which
+    carries the bag's metadata and whose status decides success."""
+    complete = MagicMock(return_value=MagicMock(status_code=status, text='server error' if status >= 400 else ''))
+
+    def post(url, **kwargs):
+        if url.endswith('/init/'):
+            return MagicMock(status_code=201, json=lambda: {'upload_url': 'https://r2.example/put', 'object_key': 'k'})
+        return complete(url, **kwargs)
+    with patch('xparo.blackbox_manager.requests.post', side_effect=post), \
+            patch('xparo.blackbox_manager.requests.put', return_value=MagicMock(status_code=200)):
+        yield complete
 
 
 def _make_orchestrator(tmp_path, rosbag_control=None):
@@ -95,8 +112,7 @@ def test_process_uploads_excludes_newest_file_while_session_open(tmp_path):
     orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(WRITING))
     orchestrator.API_TOKEN = "tok"
 
-    with patch('xparo.blackbox_manager.requests.post') as mock_post:
-        mock_post.return_value = MagicMock(status_code=201)
+    with _fake_server(201) as mock_post:
         orchestrator._process_uploads()
 
     mock_post.assert_called_once()
@@ -109,8 +125,7 @@ def test_process_uploads_includes_all_files_when_session_closed(tmp_path):
     orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
     orchestrator.API_TOKEN = "tok"
 
-    with patch('xparo.blackbox_manager.requests.post') as mock_post:
-        mock_post.return_value = MagicMock(status_code=201)
+    with _fake_server(201) as mock_post:
         orchestrator._process_uploads()
 
     assert mock_post.call_count == 2
@@ -123,8 +138,7 @@ def test_process_uploads_includes_all_files_when_no_rosbag_control(tmp_path):
     orchestrator = _make_orchestrator(tmp_path, rosbag_control=None)
     orchestrator.API_TOKEN = "tok"
 
-    with patch('xparo.blackbox_manager.requests.post') as mock_post:
-        mock_post.return_value = MagicMock(status_code=201)
+    with _fake_server(201) as mock_post:
         orchestrator._process_uploads()
 
     assert mock_post.call_count == 2
@@ -155,8 +169,7 @@ class TestFindBagFilesMatchesRealCompressedOutput:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         mock_post.assert_called_once()
@@ -189,8 +202,7 @@ class TestFindBagFilesMatchesRealCompressedOutput:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(WRITING))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         mock_post.assert_called_once()
@@ -236,8 +248,7 @@ class TestUploadSendsRealMetadata:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         sent_data = json.loads(mock_post.call_args.kwargs['data']['data'])
@@ -251,8 +262,7 @@ class TestUploadSendsRealMetadata:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         # Previously only the bag data file was removed -- metadata.yaml
@@ -267,8 +277,7 @@ class TestUploadSendsRealMetadata:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=500, text='server error')
+        with _fake_server(500) as mock_post:
             orchestrator._process_uploads()
 
         assert bag_file.exists()
@@ -300,8 +309,7 @@ class TestUploadSendsRealMetadata:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         mock_post.assert_called_once()
@@ -368,18 +376,16 @@ class TestDiscardBootSessionBags:
         production's real loop always calls _discard_boot_session_bags
         first -- a caller that (like this test) invokes it directly must
         never see a boot-session throwaway treated as real data."""
-        self._finalized_bag(tmp_path, 'boot_session_20260816_010000', 'boot_session_20260816_010000_0.mcap.zstd')
+        _, boot_file = self._finalized_bag(tmp_path, 'boot_session_20260816_010000', 'boot_session_20260816_010000_0.mcap.zstd')
         real_dir, real_file = self._finalized_bag(tmp_path, 'bag_2026_08_16-01_05_00', 'bag_2026_08_16-01_05_00_0.mcap.zstd')
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._process_uploads()
 
         mock_post.assert_called_once()
-        uploaded_filename = mock_post.call_args.kwargs['files']['bag_file'].name
-        assert 'boot_session' not in uploaded_filename
+        assert boot_file.exists()       # never uploaded (so never deleted as uploaded)
         assert not real_file.exists()  # the real session WAS uploaded and cleaned up
 
     def test_a_full_cycle_uploads_exactly_one_bag_per_real_session(self, tmp_path):
@@ -392,8 +398,7 @@ class TestDiscardBootSessionBags:
         orchestrator = _make_orchestrator(tmp_path, rosbag_control=_FakeRosbagControl(CLOSED))
         orchestrator.API_TOKEN = "tok"
 
-        with patch('xparo.blackbox_manager.requests.post') as mock_post:
-            mock_post.return_value = MagicMock(status_code=201)
+        with _fake_server(201) as mock_post:
             orchestrator._discard_boot_session_bags()
             orchestrator._process_uploads()
 

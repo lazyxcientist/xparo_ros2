@@ -199,7 +199,14 @@ class Engine():
         # the ROBOT_CREDENTIAL branch in on_ws_message below for where it's
         # written, and the loader right after this dict for where it's read
         # back on startup.
-        self.xparo_credential_path = os.path.join(self.xparo_folder,'config','credential.json')
+        # Kept outside the colcon install tree (V19): `rm -rf install` or a
+        # clean rebuild deleted it, and a robot whose project then requires
+        # its own credential could no longer sign in. The old location is
+        # still read once and copied over.
+        self._legacy_credential_path = os.path.join(self.xparo_folder,'config','credential.json')
+        credential_home = os.environ.get("XPARO_STATE_DIR") or os.path.join(
+            os.path.expanduser(os.environ.get("XPARO_HOME") or "~/.xparo"), "credentials")
+        self.xparo_credential_path = os.path.join(credential_home, f"credential-{project_id or 'none'}.json")
         self.record_bags = record_bags
         self.files = {'behavior'         : self.xparo_behavior_path,
                     'file'         : self.xparo_file_path,
@@ -227,10 +234,7 @@ class Engine():
         if moved:
             print("[xparo] this SD card was set up on a different robot: registering as a new robot "
                   "(the copied credential is not used)")
-            try:
-                os.remove(self.xparo_credential_path)
-            except FileNotFoundError:
-                pass
+            self._forget_credential_files()
         persisted_credential = self._load_persisted_credential()
         effective_secret = persisted_credential or secret_key
 
@@ -306,14 +310,33 @@ class Engine():
         argument for an unrelated project, producing a confusing 403 with
         no indication the supplied secret was never actually tried.
         """
-        try:
-            with open(self.xparo_credential_path, 'r') as file:
-                stored = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-        if stored.get('project_id') != self.project_id:
-            return None
-        return stored.get('value') or None
+        for path in (self.xparo_credential_path, getattr(self, '_legacy_credential_path', None)):
+            if not path:
+                continue
+            try:
+                with open(path, 'r') as file:
+                    stored = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(stored, dict) or stored.get('project_id') != self.project_id:
+                continue
+            value = stored.get('value') or None
+            if value and path != self.xparo_credential_path:
+                try:
+                    self._persist_credential(value)     # moved out of the install tree
+                except OSError:
+                    pass
+            return value
+        return None
+
+    def _forget_credential_files(self):
+        for path in (self.xparo_credential_path, getattr(self, '_legacy_credential_path', None)):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
     def _persist_credential(self, raw_value):
         os.makedirs(os.path.dirname(self.xparo_credential_path), exist_ok=True)
@@ -355,10 +378,7 @@ class Engine():
         keep failing normally.
         """
         print("persisted ROBOT_CREDENTIAL was rejected (403) -- clearing it and retrying with the original secret_key")
-        try:
-            os.remove(self.xparo_credential_path)
-        except FileNotFoundError:
-            pass
+        self._forget_credential_files()
         # the uploader still held the rejected credential: it got 401s forever
         orchestrator = getattr(getattr(self, "local_database", None), "orchestrator", None)
         if orchestrator is not None:
@@ -2222,6 +2242,9 @@ class Engine():
         robot info (public-IP lookups, nmcli, bluetoothctl, a 1 s CPU sample)
         took several seconds on the websocket thread, so Cancel and teleop
         waited after every Wi-Fi roam."""
+        # Set now, not in the thread: a health flush right after connecting
+        # must already send the full report.
+        self._health_full_report_due = True
         threading.Thread(target=self._send_initial_data_now, daemon=True, name="xparo-initial-data").start()
 
     def _send_initial_data_now(self):
