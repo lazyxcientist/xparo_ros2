@@ -29,6 +29,7 @@ import yaml
 from datetime import datetime
 
 
+from xparo import data_home
 from xparo.engine import Engine
 from xparo.task_call import TaskCallOffer
 from xparo.project_files import retire_other_project_files
@@ -105,7 +106,7 @@ class Xparo(Node):
         # accident) fought the first for the server connection and ran
         # every topic-triggered task twice.
         self._instance_lock_path = os.path.join(
-            os.environ.get("XPARO_STATE_DIR") or os.path.join(self.xparo_folder, "xparo", self.xparo_project_id or "no-project"),
+            os.environ.get("XPARO_STATE_DIR") or data_home.project_dir(self.xparo_project_id),
             "xparo.lock")
         self._instance_lock = acquire_single_instance_lock(self._instance_lock_path)
         if self._instance_lock is None:
@@ -125,7 +126,12 @@ class Xparo(Node):
         self.xparo_custom_files_folder_path = self.declare_parameter("xparo_custom_files_folder_path",os.path.join(self.xparo_folder,'custom_files')).value
         self.xparo_custom_evns_folder_path = self.declare_parameter("xparo_custom_evns_folder_path",os.path.join(self.xparo_folder,'custom_envs')).value
         self.record_bags = self.declare_parameter("record_bags",False).value
-        self.BAG_DIR = self.declare_parameter("BAG_DIR",os.path.join(self.xparo_folder,"xparo",self.xparo_project_id,'ros_bags')).value
+        # outside the install tree (data_home.py): bags not uploaded yet
+        # were lost to a clean rebuild
+        self.BAG_DIR = self.declare_parameter("BAG_DIR",os.path.join(data_home.project_dir(self.xparo_project_id),'ros_bags')).value
+        for old in (os.path.join(self.xparo_folder, "xparo", self.xparo_project_id, 'ros_bags'),
+                    os.path.join(base_path_for_package, 'ros_bags')):
+            data_home.adopt(old, self.BAG_DIR)
         # "django_ws" (networked robots, against the Django backend -- the
         # only option before Phase 4) or "tethered_tcp" (a physically-
         # tethered ROV with no path to Django at all). See

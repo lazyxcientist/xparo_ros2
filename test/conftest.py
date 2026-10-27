@@ -82,4 +82,5 @@ def _isolated_state(tmp_path_factory, monkeypatch):
     tests or into the source tree."""
     state = tmp_path_factory.mktemp("xparo_state")
     monkeypatch.setenv("XPARO_STATE_DIR", str(state))
+    monkeypatch.setenv("XPARO_HOME", str(state / "home"))
     monkeypatch.setenv("XPARO_OTA_JOURNAL", str(state / "ota_journal.json"))

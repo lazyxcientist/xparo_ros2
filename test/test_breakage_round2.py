@@ -368,3 +368,26 @@ def test_the_ad_player_opens_only_when_there_is_an_ad():
     headless.env = {}
     headless.start("manager")
     assert not headless.available
+
+
+def test_run_time_data_moves_out_of_the_install_tree(tmp_path, monkeypatch):
+    """V20: bags not yet uploaded, the outbox and the ad play log lived in
+    install/; a clean rebuild deleted them."""
+    from xparo import data_home
+    monkeypatch.setenv("XPARO_HOME", str(tmp_path / "home"))
+    old = tmp_path / "install" / "xparo" / "p1"
+    (old / "ros_bags" / "s1").mkdir(parents=True)
+    (old / "ros_bags" / "s1" / "s1_0.mcap").write_bytes(b"bag")
+    (old / "ads").mkdir()
+    (old / "ads" / "plays.db").write_bytes(b"log")
+    new = data_home.project_dir("p1")
+    assert new.startswith(str(tmp_path / "home"))
+    assert data_home.adopt(str(old), new) == 2
+    assert (tmp_path / "home" / "xparo" / "p1" / "ros_bags" / "s1" / "s1_0.mcap").read_bytes() == b"bag"
+    assert not old.exists()
+    assert data_home.adopt(str(old), new) == 0          # nothing left, nothing breaks
+
+    from test_engine import _make_engine
+    engine = _make_engine()
+    assert engine.tmp_folder == str(tmp_path / "home")
+    assert engine.transfer_dir.startswith(str(tmp_path / "home"))

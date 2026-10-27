@@ -34,8 +34,9 @@ def test_database_path_and_default_bag_dir_are_absolute_regardless_of_cwd():
 
     assert os.path.isabs(engine.local_database.xparo_database_path)
     assert os.path.isabs(engine.BAG_DIR)
-    assert not engine.local_database.xparo_database_path.startswith("/tmp")
-    assert not engine.BAG_DIR.startswith("/tmp")
+    # not relative to the cwd ("/tmp" here): /tmp/xparo/... would be
+    assert not engine.local_database.xparo_database_path.startswith("/tmp/xparo")
+    assert not engine.BAG_DIR.startswith("/tmp/xparo")
 
 
 def test_database_path_is_the_same_regardless_of_which_cwd_launched_it():

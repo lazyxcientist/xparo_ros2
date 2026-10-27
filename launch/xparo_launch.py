@@ -197,7 +197,10 @@ def generate_launch_description():
     # agree on it. Declared as its own launch arg (rather than left to
     # xparo_ros.py's internal per-project default) specifically so that
     # agreement is guaranteed rather than coincidental.
-    bag_dir =                           LaunchConfiguration('BAG_DIR',                               default=os.path.join(current_dir,'ros_bags'))
+    # Outside the install tree (xparo/data_home.py): a clean rebuild
+    # deleted recordings not uploaded yet. The node moves old ones over.
+    bag_dir =                           LaunchConfiguration('BAG_DIR',                               default=os.path.join(
+        os.path.expanduser(os.environ.get('XPARO_HOME') or '~/.xparo'), 'ros_bags'))
     # "django_ws" (networked robots) or "tethered_tcp" (a physically-
     # tethered ROV with no path to Django) -- see
     # transports/tethered_tcp.py's module docstring.

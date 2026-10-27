@@ -8,6 +8,7 @@ import psutil
 from datetime import datetime
 from .database import XP_Database
 from .transports.django_ws import DjangoWsTransport
+from . import data_home
 from . import remote_ops
 from . import robot_identity
 from . import connectivity
@@ -96,7 +97,10 @@ class Engine():
         # per-robot data path -- transfer_dir, custom_behaviors, etc) is
         # absolute and independent of the caller's cwd, so it's used here
         # too instead of a fresh ad-hoc relative base.
-        self.tmp_folder = self.xparo_folder
+        # Run-time data lives in ~/.xparo now (data_home.py): inside the
+        # install tree a clean rebuild deleted it. Moved over once.
+        self.tmp_folder = data_home.root()
+        data_home.adopt(os.path.join(self.xparo_folder, "xparo", project_id), data_home.project_dir(project_id))
         xparo_database_path = os.path.join(self.tmp_folder,"xparo",project_id,'database')
         # BAG_DIR must arrive through the constructor, same reasoning as
         # record_bags just below -- XP_Database (and, if recording, the
@@ -146,7 +150,8 @@ class Engine():
         # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
         # separate from BAG_DIR (rosbag sessions) and the xparo_* config
         # paths below (behavior trees/env/properties, a different concept).
-        self.transfer_dir = os.path.join(self.xparo_folder, 'transferred_files')
+        self.transfer_dir = os.path.join(data_home.project_dir(project_id), 'transferred_files')
+        data_home.adopt(os.path.join(self.xparo_folder, 'transferred_files'), self.transfer_dir)
         self.file_transfer = remote_ops.FileTransferSession(self.transfer_dir)
 
         # 2026-09-28 stress test finding F5 (HIGH): a task's own TASK_RESULT
