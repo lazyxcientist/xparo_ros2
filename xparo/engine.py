@@ -233,6 +233,9 @@ class Engine():
         # any RUN_TASK dispatch -- see xparo_ros.py's own declare_parameter
         # for the "production" default rationale.
         self.xparo_stage = xparo_stage
+        # Placeholder BT nodes only pretend to work off the production stage.
+        from .bt_engine.nodes import base as _bt_nodes
+        _bt_nodes.STUB_MODE = "fail" if (xparo_stage or "production") == "production" else "simulate"
         # Stable id for this machine; a cloned SD card on other hardware
         # gets a new one and must not reuse the original robot's credential.
         self.device_id, moved = robot_identity.resolve(self._state_dir, XP_Database.compute_device_uuid)

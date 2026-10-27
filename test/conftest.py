@@ -84,3 +84,10 @@ def _isolated_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("XPARO_STATE_DIR", str(state))
     monkeypatch.setenv("XPARO_HOME", str(state / "home"))
     monkeypatch.setenv("XPARO_OTA_JOURNAL", str(state / "ota_journal.json"))
+    # an Engine on the production stage makes placeholder nodes fail
+    # process-wide; each test starts from the plain default
+    try:
+        from xparo.bt_engine.nodes import base as _bt_nodes
+        monkeypatch.setattr(_bt_nodes, "STUB_MODE", "simulate")
+    except ImportError:
+        pass

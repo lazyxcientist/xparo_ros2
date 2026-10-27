@@ -59,6 +59,13 @@ def write_output(raw_attrs, blackboard, key, value):
         blackboard[target] = value
 
 
+# What a placeholder node does when XPARO_STUB_NODES isn't set: "simulate"
+# (wait, then SUCCESS) or "fail". A robot on the production stage sets it
+# to "fail" (engine.py): a task that "delivered" through a placeholder
+# MoveTo was reported as done while the robot never moved.
+STUB_MODE = "simulate"
+
+
 class StubActionNode(py_trees.behaviour.Behaviour):
     """Honest-scoping base for every leaf tag this repo has zero real
     subsystem to hook into yet (confirmed by grep at planning time: no
@@ -97,7 +104,7 @@ class StubActionNode(py_trees.behaviour.Behaviour):
             self.feedback_message = f"[STUB] {self.TAG}: {resolved}"
             print(f"[bt_engine STUB] {self.TAG} ({self.name}): {resolved}")
 
-        if os.environ.get("XPARO_STUB_NODES", "").lower() == "fail":
+        if (os.environ.get("XPARO_STUB_NODES", "") or STUB_MODE).lower() == "fail":
             self.feedback_message = f"{self.TAG} isn't implemented on this robot (placeholder node)"
             return common.Status.FAILURE
         if time.monotonic() - self._started_at < self.SIMULATED_DELAY_S:

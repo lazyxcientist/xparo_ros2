@@ -391,3 +391,13 @@ def test_run_time_data_moves_out_of_the_install_tree(tmp_path, monkeypatch):
     engine = _make_engine()
     assert engine.tmp_folder == str(tmp_path / "home")
     assert engine.transfer_dir.startswith(str(tmp_path / "home"))
+
+
+def test_placeholder_nodes_fail_on_a_production_robot():
+    """V15: a placeholder MoveTo "succeeded" and the task was reported done."""
+    from test_engine import _make_engine
+    from xparo.bt_engine.nodes import base
+    _make_engine(xparo_stage="production")
+    assert base.STUB_MODE == "fail"
+    _make_engine(xparo_stage="development")
+    assert base.STUB_MODE == "simulate"
