@@ -145,7 +145,7 @@ class Xparo(Node):
         # "xpshell" (hand them to XP-shell's Kivy player over ROS 2) or
         # "off". See xparo/ads/backends/.
         self.xparo_ads_display = self.declare_parameter(
-            "xparo_ads_display", xparo_config.get("xparo_ads_display", "native")
+            "xparo_ads_display", xparo_config.get("xparo_ads_display", "auto")
         ).value
 
 

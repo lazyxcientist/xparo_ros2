@@ -1,6 +1,7 @@
 """Display backends for AdManager.
 
-    native   xparo's own player (Tk + ffplay) -- public robots
+    auto     xparo's own player, opened only once there is an ad to show (default)
+    native   xparo's own player (Tk + ffplay), opened at start -- public robots
     xpshell  hand the schedule to XP-shell's Kivy player over ROS2 -- robots running XP-shell
     off      no ads on this robot
 """
@@ -9,13 +10,16 @@ import logging
 from .base import DisplayBackend, OffBackend
 
 log = logging.getLogger("xparo.ads")
-CHOICES = ("native", "xpshell", "off")
+CHOICES = ("auto", "native", "xpshell", "off")
 
 
 def make_backend(name, node=None):
     """The backend for the xparo_ads_display launch argument. Falls back to
     "off" (with a warning) when the chosen one can't run here."""
     name = (name or "off").strip().lower()
+    if name == "auto":
+        from .native import AutoNativeBackend
+        return AutoNativeBackend()
     if name == "native":
         from .native import NativeBackend
         return NativeBackend()

@@ -208,7 +208,8 @@ def generate_launch_description():
     tethered_channels_config_path =     LaunchConfiguration('tethered_channels_config_path',         default="")
     # Ads Center: "native" (xparo's own always-on-top player), "xpshell"
     # (XP-shell's Kivy player over ROS 2) or "off". See xparo/ads/backends/.
-    xparo_ads_display =                 LaunchConfiguration('xparo_ads_display',                     default="native")
+    # "auto": xparo's own player, opened only once this robot has an ad to show
+    xparo_ads_display =                 LaunchConfiguration('xparo_ads_display',                     default="auto")
 
 
     ####################################
@@ -236,7 +237,7 @@ def generate_launch_description():
             DeclareLaunchArgument('BAG_DIR',                            default_value=bag_dir,                          description='where rosbag sessions are written; shared with the rosbag2 recorder process.'),
             DeclareLaunchArgument('xparo_transport',                    default_value=xparo_transport,                  description='"django_ws" or "tethered_tcp"'),
             DeclareLaunchArgument('tethered_channels_config_path',      default_value=tethered_channels_config_path,    description='path to a tethered_channels.yaml, only used when xparo_transport=="tethered_tcp"'),
-            DeclareLaunchArgument('xparo_ads_display',                  default_value=xparo_ads_display,                description='who shows Ads Center ads: "native" (xparo\'s own player), "xpshell" (XP-shell over ROS 2) or "off"'),
+            DeclareLaunchArgument('xparo_ads_display',                  default_value=xparo_ads_display,                description='who shows Ads Center ads: "auto" (xparo\'s own player, opened when there is an ad), "native" (opened at start), "xpshell" (XP-shell over ROS 2) or "off"'),
 
 
 

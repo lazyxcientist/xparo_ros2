@@ -347,3 +347,24 @@ def test_ads_follow_the_venue_clock_not_the_os_zone(tmp_path):
     assert manager._utc_offset() == 330 == utc_offset_minutes("Asia/Kolkata")
     again = AdManager(str(tmp_path / "ads"), send=lambda p: True, backend=FakePlayer(), capture=FakeCapture())
     assert again.site_timezone == "Asia/Kolkata"      # kept across restarts
+
+
+def test_the_ad_player_opens_only_when_there_is_an_ad():
+    """V36: every robot with a screen got an always-on-top player window,
+    with or without ads (developers' desktops too)."""
+    from xparo.ads.backends import make_backend
+    from xparo.ads.backends import native
+    opened = []
+    with patch.object(native.NativeBackend, "start", lambda self, m: opened.append(m) or setattr(self, "available", True)):
+        backend = make_backend("auto")
+        backend.env = {"DISPLAY": ":0"}
+        backend.start("manager")
+        assert opened == [] and backend.available
+        backend.play({"id": "xparo-1"}, "bottom", lambda *a: None)
+        assert opened == ["manager"]
+        backend.play({"id": "xparo-2"}, "bottom", lambda *a: None)
+        assert opened == ["manager"]          # once
+    headless = make_backend("auto")
+    headless.env = {}
+    headless.start("manager")
+    assert not headless.available

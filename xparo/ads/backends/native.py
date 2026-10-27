@@ -325,3 +325,41 @@ class NativeBackend(DisplayBackend):
             play.after(delay * 1000, show)
         else:
             show()
+
+
+class AutoNativeBackend(NativeBackend):
+    """The native player, opened only when there is an ad to show.
+
+    The plain native backend opened a Tk window (and kept raising it to the
+    top) on every robot with a screen, including robots with no ad listing
+    and developers' own desktops. Here nothing opens until the first play;
+    with no display at all it stays off."""
+    name = "auto"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._started = False
+        self._start_lock = threading.Lock()
+
+    def start(self, manager):
+        DisplayBackend.start(self, manager)
+        self.manager = manager
+        # "able to show ads" without a window yet: the first play opens it
+        self.available = bool(self.env.get("DISPLAY") or self.env.get("WAYLAND_DISPLAY"))
+
+    def _open(self):
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+            self.available = False
+            NativeBackend.start(self, self.manager)
+
+    def play(self, item, placement, on_finished):
+        if not self._started:
+            self._open()
+        super().play(item, placement, on_finished)
+
+    def close(self):
+        if self._started:
+            super().close()
