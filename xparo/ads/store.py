@@ -88,7 +88,10 @@ class ScheduleStore:
                     missing.append({"id": entry.get("id"), "error": str(exc)})
                     continue
             ready.append(item)
-        return {"generated_at": schedule.get("generated_at"), "ads": ready}, missing
+        out = {"generated_at": schedule.get("generated_at"), "ads": ready}
+        if schedule.get("timezone"):
+            out["timezone"] = str(schedule["timezone"])   # the venue's clock (see AdManager)
+        return out, missing
 
     def prune(self, schedule):
         keep = {os.path.abspath(e["path"]) for e in schedule.get("ads") or [] if e.get("path")}

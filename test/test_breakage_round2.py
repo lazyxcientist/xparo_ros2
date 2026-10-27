@@ -330,3 +330,20 @@ def test_the_credential_lives_outside_the_install_tree(tmp_path):
     assert json.loads((tmp_path / "new" / "credential-proj.json").read_text())["value"] == "cred-1"
     engine._forget_credential_files()
     assert not (tmp_path / "old" / "credential.json").exists() and engine._load_persisted_credential() is None
+
+
+def test_ads_follow_the_venue_clock_not_the_os_zone(tmp_path):
+    """N16: a robot left on UTC played the 9am ad at 2:30pm in India."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from test_ads import FakePlayer
+    from xparo.ads.manager import AdManager, utc_offset_minutes
+    from test_ads import FakeCapture
+    manager = AdManager(str(tmp_path / "ads"), send=lambda p: True, backend=FakePlayer(), capture=FakeCapture())
+    manager.store.localize = lambda schedule: ({"ads": [], "timezone": schedule.get("timezone")}, [])
+    manager.update_schedule({"ads": [], "timezone": "Asia/Kolkata"}, wait=True)
+    venue_now = _dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+    assert abs((manager.now() - venue_now).total_seconds()) < 5
+    assert manager._utc_offset() == 330 == utc_offset_minutes("Asia/Kolkata")
+    again = AdManager(str(tmp_path / "ads"), send=lambda p: True, backend=FakePlayer(), capture=FakeCapture())
+    assert again.site_timezone == "Asia/Kolkata"      # kept across restarts

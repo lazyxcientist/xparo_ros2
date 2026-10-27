@@ -57,7 +57,21 @@ PROOF_DELAY_SECONDS = 2.0
 PROOF_RETRY_REASONS = ("play not found",)
 
 
-def utc_offset_minutes():
+def _zone(name):
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def utc_offset_minutes(timezone_name=None):
+    """The venue's UTC offset when the server named its time zone, else the OS's."""
+    zone = _zone(timezone_name)
+    if zone is not None:
+        return int(datetime.datetime.now(zone).utcoffset().total_seconds() // 60)
     return int(time.localtime().tm_gmtoff // 60)
 
 
@@ -74,7 +88,7 @@ MAX_SCHEDULE_AGE_S = 36 * 3600
 
 
 class AdManager:
-    def __init__(self, folder, send, backend, base_url=None, now=datetime.datetime.now, capture=None):
+    def __init__(self, folder, send, backend, base_url=None, now=None, capture=None):
         """folder: where the schedule, ad files and play log live.
         send(dict) -> bool: send a message to the server (True if it went out).
         backend: a backends.* display backend.
@@ -89,8 +103,13 @@ class AdManager:
         self._slots_checked = set()
         self.send = send
         self.backend = backend
-        self.now = now
-        self.items = self.store.load().get("ads") or []
+        # Ads follow the venue's clock (the schedule's "timezone", set by
+        # the team per robot): a robot whose OS was left on UTC played the
+        # 9am ad at 2:30pm in India.
+        self.now = now or self._site_now
+        saved = self.store.load()
+        self.items = saved.get("ads") or []
+        self.site_timezone = saved.get("timezone") or ""
         try:
             self.schedule_at = os.path.getmtime(self.store.schedule_path)
         except OSError:
@@ -127,7 +146,7 @@ class AdManager:
         """(Re)connected to the server: ask for the current schedule and
         send any plays the server hasn't acknowledged yet."""
         # utc_offset_min: ad dates are this robot's own calendar dates.
-        self.send({"GET_ads_schedule": {"utc_offset_min": utc_offset_minutes()}})
+        self.send({"GET_ads_schedule": {"utc_offset_min": self._utc_offset()}})
         self.log.mark_unsent()
         self._upload_wake.set()
 
@@ -150,6 +169,7 @@ class AdManager:
             self.store.prune(localized)
             with self._lock:
                 self.items = localized["ads"]
+                self.site_timezone = localized.get("timezone") or ""
                 self.schedule_at = time.time()
                 self._stale_logged = False
             if not self.backend.plays_itself:
@@ -208,6 +228,16 @@ class AdManager:
                 item = due[slot["index"] % len(due)]
                 slot["index"] = (slot["index"] + 1) % len(due)
                 self._start(placement, slot, item, now)
+
+    def _site_now(self):
+        """Now on the venue's wall clock (naive, like the schedule's times)."""
+        zone = _zone(getattr(self, "site_timezone", ""))
+        if zone is None:
+            return datetime.datetime.now()
+        return datetime.datetime.now(zone).replace(tzinfo=None)
+
+    def _utc_offset(self):
+        return utc_offset_minutes(getattr(self, "site_timezone", ""))
 
     def schedule_is_stale(self):
         return self.schedule_at is not None and time.time() - self.schedule_at > MAX_SCHEDULE_AGE_S
@@ -334,7 +364,7 @@ class AdManager:
         rows = [r for r in self.log.due_for_upload() if str(r.get("ad_id") or "").startswith("xparo-")]
         if not rows:
             return 0
-        if not self.send({"ADS_PLAYS": {"plays": rows, "utc_offset_min": utc_offset_minutes()}}):
+        if not self.send({"ADS_PLAYS": {"plays": rows, "utc_offset_min": self._utc_offset()}}):
             self.log.mark_unsent()
             return 0
         return len(rows)
@@ -352,7 +382,7 @@ class AdManager:
             ok = self.send({"ADS_PROOF": {"local_id": row["id"], "ad_id": row["ad_id"],
                                           "play_started_at": row["play_started_at"],
                                           "captured_at": row["proof_captured_at"], "image": image,
-                                          "utc_offset_min": utc_offset_minutes()}})
+                                          "utc_offset_min": self._utc_offset()}})
             if not ok:
                 self.log.proof_unsent(row["id"])
                 break
@@ -366,7 +396,7 @@ class AdManager:
         proof = bool(self.backend.plays_itself and self.backend.available and self.capture.available)
         return {"available": bool(self.backend.available), "backend": self.backend.name,
                 "playing": [p for p in playing if str(p or "").startswith("xparo-")], "proof": proof,
-                "utc_offset_min": utc_offset_minutes()}
+                "utc_offset_min": self._utc_offset()}
 
     def status_once(self):
         return self.send({"ADS_STATUS": self.status()})
