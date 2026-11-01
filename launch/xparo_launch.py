@@ -202,7 +202,14 @@ def generate_launch_description():
                             'xparo_ads_display':                    xparo_ads_display,
 
                             }],
-                output='screen'),
+                output='screen',
+                # Start it again if it ever exits on its own (a crash, a
+                # kill): a robot at a client site has to come back without
+                # a visit. Ctrl+C / `ros2 launch` shutting down still stops
+                # it, and an OTA update restarts in place without exiting
+                # (ota.py), so neither triggers this.
+                respawn=True,
+                respawn_delay=5.0),
             ###############################################
 
             # rosbag2's own recorder process -- RosbagControl

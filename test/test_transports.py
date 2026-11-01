@@ -45,29 +45,6 @@ def test_effective_transport_hybrid_tracks_fallback_state():
     assert transport._effective_transport() == "rest"
 
 
-def test_connect_passes_reconnect_delay_to_run_forever():
-    """websocket-client's own run_forever(reconnect=...) is now the single
-    reconnect mechanism -- this is what actually fixes "reconnect on clean
-    idle close, not just a failed send" (item 6), so it must be wired up on
-    every connect() call.
-    """
-    from xparo.transports import django_ws
-
-    captured = {}
-
-    def fake_thread(target=None, kwargs=None, **_):
-        captured['target'] = target
-        captured['kwargs'] = kwargs or {}
-        return MagicMock()
-
-    with patch.object(django_ws, 'Xparo_socket', return_value=MagicMock()), \
-         patch.object(django_ws.threading, 'Thread', side_effect=fake_thread):
-        transport = _make_transport(connection_type="websocket")
-        transport.connect()
-
-    assert captured['kwargs'] == {"reconnect": django_ws.RECONNECT_DELAY_SECONDS}
-
-
 def test_send_failure_does_not_trigger_manual_reconnect():
     """Old behavior called self.connect() again from inside send()'s except
     block -- that raced with run_forever(reconnect=...)'s own retry loop
@@ -264,3 +241,147 @@ def test_hybrid_rest_fallback_loop_polls_and_dispatches_until_recovered():
         transport._hybrid_rest_fallback_loop()
 
     on_message.assert_called_once_with('rest', {"some": "payload"})
+
+
+# ---- 2026-10-31 field test: the reconnect loop and its messages -------------
+
+class _ClosingSocket:
+    """A fake Xparo_socket whose run_forever returns at once -- what
+    websocket-client's does after a refused handshake or a server-side
+    close now that its own reconnect= retry isn't used."""
+    created = []
+
+    def __init__(self, url, on_message=None, on_error=None, on_open=None, on_close=None):
+        self.url = url
+        self.sock = None
+        self.on_open = on_open
+        self.on_close = on_close
+        _ClosingSocket.created.append(self)
+
+    def run_forever(self, **kwargs):
+        self.on_close(self)
+
+    def close(self):
+        pass
+
+
+def _loop_with_fake_socket(transport, fake_socket, stop_after):
+    """Runs _run_websocket_loop with the waits recorded instead of slept;
+    closes the transport after stop_after waits."""
+    from xparo.transports import django_ws
+    _ClosingSocket.created = []
+    delays = []
+
+    def fake_wait(delay):
+        delays.append(delay)
+        if len(delays) >= stop_after:
+            transport.close()
+        return transport._closed
+
+    with patch.object(django_ws, 'Xparo_socket', fake_socket), \
+         patch.object(transport._stop, 'wait', side_effect=fake_wait):
+        transport._run_websocket_loop()
+    return delays
+
+
+def test_connect_starts_the_supervised_websocket_loop():
+    """_run_websocket_loop is the reconnect mechanism (websocket-client's
+    own run_forever(reconnect=...) was dropped -- see the loop's
+    docstring), so connect() must start it, once."""
+    from xparo.transports import django_ws
+    targets = []
+
+    with patch.object(django_ws.threading, 'Thread',
+                      side_effect=lambda target=None, **_: targets.append(target) or MagicMock()):
+        transport = _make_transport(connection_type="websocket")
+        transport.connect()
+
+    assert targets == [transport._run_websocket_loop]
+
+
+def test_loop_reopens_the_socket_with_backoff_while_the_server_keeps_refusing():
+    """SANDEEP-5 / CHAOS-7: after the server dropped a robot (key freeze)
+    websocket-client retried the same doomed handshake silently every 5 s
+    -- no on_error, no fallback, nothing in the log. Every attempt is now
+    a fresh socket (so every failure reaches on_ws_error), and the wait
+    between failed attempts doubles up to MAX_RECONNECT_DELAY_SECONDS."""
+    from xparo.transports import django_ws
+    transport = _make_transport(connection_type="websocket")
+
+    delays = _loop_with_fake_socket(transport, _ClosingSocket, stop_after=6)
+
+    assert len(_ClosingSocket.created) == 6
+    assert delays == [5, 10, 20, 40, 60, 60]
+    assert delays[-1] == django_ws.MAX_RECONNECT_DELAY_SECONDS
+
+
+def test_backoff_resets_after_a_connection_that_actually_opened():
+    """A Wi-Fi blip after hours online must still recover in 5 s."""
+    class _OpensThenCloses(_ClosingSocket):
+        def run_forever(self, **kwargs):
+            self.on_open(self)
+            self.on_close(self)
+
+    transport = _make_transport(connection_type="websocket")
+    assert _loop_with_fake_socket(transport, _OpensThenCloses, stop_after=3) == [5, 5, 5]
+
+
+def test_close_stops_the_loop_for_good():
+    from xparo.transports import django_ws
+    transport = _make_transport(connection_type="websocket")
+    transport.close()
+    _ClosingSocket.created = []
+    with patch.object(django_ws, 'Xparo_socket', _ClosingSocket):
+        transport._run_websocket_loop()
+    assert _ClosingSocket.created == []
+
+
+def test_a_403_names_the_key_not_the_internet(capsys):
+    """AARAV-3 / CHAOS-7: a wrong, frozen or deleted key printed "check
+    your internet connection / download the latest version / switch to
+    rest" and sent operators chasing the network."""
+    transport = _make_transport()
+    transport.on_ws_error(None, MagicMock(status_code=403))
+    out = capsys.readouterr().out
+    assert "rejected the project secret key" in out
+    assert "403" in out and "Secret Key Manager" in out
+    assert "internet" not in out and "Truble" not in out
+
+
+def test_a_403_while_using_a_persisted_credential_says_so(capsys):
+    transport = _make_transport(on_persisted_credential_rejected=MagicMock())
+    transport.on_ws_error(None, MagicMock(status_code=403))
+    assert "rejected this robot's own credential" in capsys.readouterr().out
+
+
+def test_a_network_error_still_points_at_the_connection(capsys):
+    transport = _make_transport()
+    transport.on_ws_error(None, ConnectionRefusedError(111, "Connection refused"))
+    out = capsys.readouterr().out
+    assert "Can't reach the XPARO server at xparo.in" in out
+    assert "internet connection" in out
+
+
+def test_a_send_before_the_socket_exists_is_dropped_quietly(capsys):
+    """CHAOS-3 / RO-6: every start printed "'DjangoWsTransport' object has
+    no attribute 'ws'" -- Engine's own threads send before connect() has
+    opened the socket."""
+    transport = _make_transport(connection_type="websocket")
+    assert transport.send('{"k": "v"}') is False
+    assert capsys.readouterr().out == ""
+
+
+def test_a_send_while_reconnecting_is_dropped_quietly(capsys):
+    transport = _make_transport(connection_type="websocket")
+    transport.ws = MagicMock()
+    transport.ws.sock = MagicMock(connected=False)
+    assert transport.send('{"k": "v"}') is False
+    transport.ws.send.assert_not_called()
+    assert capsys.readouterr().out == ""
+
+
+def test_success_banner_is_spelled_right(capsys):
+    transport = _make_transport()
+    transport.on_ws_open(None)
+    out = capsys.readouterr().out
+    assert "Connection Successful" in out and "Sussessfull" not in out

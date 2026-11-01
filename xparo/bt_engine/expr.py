@@ -80,6 +80,15 @@ def _number(value):
     return value
 
 
+def _boolean(value):
+    """The text "true"/"false" as a bool -- _number's counterpart: a flag
+    set from an XML attribute or a task param arrives as text, and
+    `flag == true` must match it the way bare `flag` (truthy) already did."""
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return value
+
+
 def _coerce_pair(left, right):
     left_num = isinstance(left, (int, float)) and not isinstance(left, bool)
     right_num = isinstance(right, (int, float)) and not isinstance(right, bool)
@@ -87,6 +96,10 @@ def _coerce_pair(left, right):
         return left, _number(right)
     if right_num and isinstance(left, str):
         return _number(left), right
+    if isinstance(left, bool) and isinstance(right, str):
+        return left, _boolean(right)
+    if isinstance(right, bool) and isinstance(left, str):
+        return _boolean(left), right
     return left, right
 
 

@@ -45,6 +45,24 @@ NO_EXECUTOR_ERROR = (
 )
 
 
+# Server replies that mean "this connection isn't being served" -- printed
+# with the server's explanation (on_ws_message), and the two with a
+# robot-side remedy act on it: _retry_with_persisted_credential and
+# _reconnect_later.
+SERVER_REJECTION_KEYS = frozenset({"error", "robot_credential_required", "robot_retired"})
+CREDENTIAL_RETRY_BASE_SECONDS = 5
+CREDENTIAL_RETRY_MAX_SECONDS = 300
+RETIRED_RECHECK_SECONDS = 300
+# A server-message key with any of these in its name never goes out on
+# /xparo/response (see on_ws_message's republish step).
+_PRIVATE_KEY_WORDS = ("token", "credential", "secret", "password", "env", "api_key")
+
+
+def _safe_for_ros_graph(key):
+    low = str(key).lower()
+    return not any(word in low for word in _PRIVATE_KEY_WORDS)
+
+
 class Engine():
     def __init__(self,secret_key,project_id,connection_type = "websocket",record_bags=record_bags,BAG_DIR=None,environment=None,rosbag_control=None,joy_publish=None,xparo_transport="django_ws",tethered_channels_config=None,xparo_stage="production"):
         global xparo_database_size
@@ -173,6 +191,10 @@ class Engine():
         # to be stale.
         self._raw_secret_key = secret_key
         self._environment = environment
+        # _retry_with_persisted_credential's wait: doubled on every swap
+        # back to the credential, reset once the server serves it.
+        self._credential_retry_delay = CREDENTIAL_RETRY_BASE_SECONDS
+        self._using_persisted_credential = False
         # Read by run_task.py's ALLOWED_TASK_STAGES check before ticking
         # any RUN_TASK dispatch -- see xparo_ros.py's own declare_parameter
         # for the "production" default rationale.
@@ -198,20 +220,10 @@ class Engine():
                 channels_config=tethered_channels_config,
             )
         else:
-            self.transport = DjangoWsTransport(
-                effective_secret, project_id,
-                on_message=self.on_ws_message,
-                on_connected=self.send_initial_data,
-                connection_type=connection_type,
-                environment=environment,
-                # Only give the transport a way to fall back if this
-                # attempt is actually using a *persisted* credential, not
-                # a raw xparo_secret_key -- see _fall_back_to_raw_secret's
-                # own docstring for why the distinction matters.
-                on_persisted_credential_rejected=(
-                    self._fall_back_to_raw_secret if persisted_credential else None
-                ),
-            )
+            # Only a *persisted* credential gets a way to fall back on a
+            # 403, not a raw xparo_secret_key -- see
+            # _fall_back_to_raw_secret's own docstring for why.
+            self.transport = self._make_django_transport(effective_secret, persisted=bool(persisted_credential))
 
         # tethered_tcp has no Django to talk to at all (that's the whole
         # reason it exists) -- website_base_url only exists on
@@ -291,20 +303,69 @@ class Engine():
         secret typed by an operator has nothing to fall back to and should
         keep failing normally.
         """
-        print("persisted ROBOT_CREDENTIAL was rejected (403) -- clearing it and retrying with the original secret_key")
-        try:
-            os.remove(self.xparo_credential_path)
-        except FileNotFoundError:
-            pass
+        # The credential file is kept (it used to be deleted here): a key
+        # freeze rejects it only for as long as the key is frozen, and the
+        # server replaces it on the next connection if the robot's
+        # credential was really reset. Deleting it turned every temporary
+        # freeze into a robot that could only sign in with a secret key
+        # typed on site (CHAOS-6/7).
+        print("This robot's own credential was rejected (403) -- retrying with the project secret key this launch "
+              "was given. config/credential.json is kept: if its key was only frozen it works again once the key "
+              "is unfrozen, and the server replaces it if the robot's credential was reset.")
         self.transport.close()
-        self.transport = DjangoWsTransport(
-            self._raw_secret_key, self.project_id,
+        self.transport = self._make_django_transport(self._raw_secret_key, persisted=False)
+        self.transport.connect()
+
+    def _make_django_transport(self, secret, persisted):
+        """persisted: secret is this robot's own ROBOT_CREDENTIAL (a 403
+        then falls back to the launch's xparo_secret_key), not that key."""
+        self._using_persisted_credential = persisted
+        return DjangoWsTransport(
+            secret, self.project_id,
             on_message=self.on_ws_message,
             on_connected=self.send_initial_data,
             connection_type=self.connection_type,
             environment=self._environment,
+            on_persisted_credential_rejected=self._fall_back_to_raw_secret if persisted else None,
         )
-        self.transport.connect()
+
+    def _retry_with_persisted_credential(self):
+        """The server answered robot_credential_required: this robot has
+        its own credential but signed in with the project secret key --
+        right after _fall_back_to_raw_secret (the key the credential was
+        issued with was frozen, say), or credential.json was put back.
+        Swap back to the credential, waiting longer each time, so a
+        credential that is rejected again doesn't flip-flop every few
+        seconds -- and so the robot comes back by itself once the key is
+        unfrozen, instead of sitting on a connection the server ignores
+        until someone restarts it on site (SANDEEP-5)."""
+        credential = self._load_persisted_credential()
+        if not credential or self._using_persisted_credential:
+            return
+        delay = self._credential_retry_delay
+        self._credential_retry_delay = min(delay * 2, CREDENTIAL_RETRY_MAX_SECONDS)
+        print(f"Signing in again with this robot's own credential in {delay} s.")
+
+        def swap():
+            self.transport.close()
+            self.transport = self._make_django_transport(credential, persisted=True)
+            self.transport.connect()
+        timer = threading.Timer(delay, swap)
+        timer.daemon = True
+        timer.start()
+
+    def _reconnect_later(self, seconds):
+        """A fresh handshake after `seconds`: a retired robot the owner
+        restores comes back on its own (the server only re-checks a robot
+        when it connects), instead of showing Online on a connection that
+        ignores every command until a restart on site."""
+        reconnect = getattr(self.transport, 'force_reconnect', None)
+        if reconnect is None:
+            return
+        print(f"Will check with the server again in {seconds} s.")
+        timer = threading.Timer(seconds, reconnect)
+        timer.daemon = True
+        timer.start()
 
     def _logging_update_loop(self):
         # Heartbeat runs unconditionally, every HEARTBEAT_INTERVAL_SECONDS,
@@ -1103,6 +1164,10 @@ class Engine():
         (Django's TASK_RESULT handler) keeps working unchanged too.
         """
         from .bt_engine import task_sync
+        problem = task_sync.validate_run_task_request(task_id, override_params)
+        if problem:
+            self.reject_task_request(task_id if isinstance(task_id, str) else None, problem)
+            return
         if not allow_parallel and run_task.is_running(task_id):
             # A double tap on a kiosk used to start the same delivery twice at once.
             self._task_finished(run_task.result_message(
@@ -1127,6 +1192,16 @@ class Engine():
             ))
             return
         self._start_task_thread(val)
+
+    def reject_task_request(self, task_id, reason):
+        """invalid_request on /xparo/task_result (and in the log) for a
+        /xparo/run_task message that can't be served -- a caller used to
+        wait forever with only a robot-log line to show for it. ROS-side
+        only: the dashboard never asked for this run, so no TASK_RESULT
+        goes up (a null task_id there would just be another error)."""
+        print(f"[run_task_from_topic] rejected: {reason}")
+        info = run_task.result_message(task_id, None, "invalid_request", reason, trigger="ros_topic")["TASK_RESULT"]
+        self._emit_task_event("finished", info)
 
     def _start_task_thread(self, val):
         """One thread per task run (RUN_COMMAND's pattern). SubTrees the
@@ -1211,6 +1286,9 @@ class Engine():
         # Only the keys: messages carry ROBOT_CREDENTIAL / REST_API_TOKEN and
         # whole projects (trees, code), which don't belong in a robot's log.
         print(f"server message: {', '.join(map(str, message.keys())) if isinstance(message, dict) else type(message).__name__}")
+        if self._using_persisted_credential and not SERVER_REJECTION_KEYS.intersection(message):
+            self._credential_retry_delay = CREDENTIAL_RETRY_BASE_SECONDS  # the credential is being served again
+        unhandled = {}
         for k,val in message.items():
             if k=="title":
                 pass
@@ -1606,11 +1684,35 @@ class Engine():
                 }})
             elif k=="GET_RUNNING_TASKS":
                 self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
+            elif k in SERVER_REJECTION_KEYS:
+                # The server's explanation, not just the key: a frozen key
+                # or a retired robot used to log "server message: error"
+                # and nothing else (CHAOS-7).
+                print(f"XPARO server: {k}: {val}")
+                unhandled[k] = val  # a kiosk on the ROS graph may want to show it
+                if k=="robot_credential_required":
+                    self._retry_with_persisted_credential()
+                elif k=="robot_retired":
+                    self._reconnect_later(RETIRED_RECHECK_SECONDS)
             else:
-                self.call_message(message)
+                unhandled[k] = val
+        # /xparo/response gets the keys nothing above handled -- the AI's
+        # answers ("message") and the like -- and only those. The WHOLE
+        # message used to go out whenever any one key was unhandled, which
+        # put REST_API_TOKEN and local.env on the LAN at every connect
+        # (ROSAPI-4); credentials, tokens and env files never belong there.
+        republish = {kk: vv for kk, vv in unhandled.items() if _safe_for_ros_graph(kk)}
+        if republish:
+            self.call_message(republish)
 
 
     def get_initial_local_env_data(self):
+        # A fresh install has no config/local.env until the dashboard sends
+        # one -- that's normal, not an error. Printing the raw
+        # "[Errno 2] No such file or directory" on every first start read
+        # as a broken install to new developers (2026-10-31 field test).
+        if not os.path.exists(self.files["local_env"]):
+            return ""
         try:
             with open(self.files["local_env"], 'r') as file:
                 content = file.read()

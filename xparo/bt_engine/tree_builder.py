@@ -481,6 +481,10 @@ def validate_tree(xml_fragment, subtrees=None, subtree_resolver=None):
                 add("error", problem, path, element)
             elif NODE_ARITY.get(tag, (0, 0))[1] is None and len(element) == 0:
                 add("warning", f"<{tag}> has no children, so it does nothing", path, element)
+            from .builtins import REQUIRED_PORTS
+            for port in REQUIRED_PORTS.get(tag, ()):
+                if not element.attrib.get(port, "").strip():
+                    add("error", f"<{tag}> is missing its required port {port!r}", path, element)
             if tag == "Script" and element.attrib.get("code", "").strip():
                 bad = _bad_script(element.attrib["code"])
                 if bad:

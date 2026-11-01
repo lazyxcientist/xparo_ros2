@@ -22,10 +22,14 @@ from .base import Transport
 # xparo.in, not a dev sandbox that doesn't exist for it.
 DEFAULT_ENVIRONMENT = "production"
 
-# Passed to websocket-client's own run_forever(reconnect=...) -- the single
-# reconnect mechanism (see send()'s except block for why a second, ad hoc
-# one used to race with it).
+# First retry delay of _run_websocket_loop, the single reconnect mechanism
+# (see send()'s except block for why a second, ad hoc one used to race
+# with it). Doubles on every failed attempt in a row, up to
+# MAX_RECONNECT_DELAY_SECONDS, and drops back to this after a connection
+# that actually opened -- a Wi-Fi blip still recovers in 5 s, while a
+# wrong/frozen key doesn't hit the server every 5 s forever.
 RECONNECT_DELAY_SECONDS = 5
+MAX_RECONNECT_DELAY_SECONDS = 60
 
 # "hybrid" connection_type: roughly how many of websocket-client's own
 # reconnect cycles (each RECONNECT_DELAY_SECONDS apart) to let pass before
@@ -75,11 +79,24 @@ class DjangoWsTransport(Transport):
         # that distinction matters. None means "nothing to fall back to,
         # a 403 here is just a genuinely wrong/revoked secret."
         self.on_persisted_credential_rejected = on_persisted_credential_rejected
+        # What the handshake presents, for on_ws_error's 403 message --
+        # engine.py only wires the callback above for a persisted
+        # ROBOT_CREDENTIAL, so its presence is that distinction.
+        self.secret_kind = "this robot's own credential" if on_persisted_credential_rejected else "the project secret key"
+        self.project_id = project_id
+        # _run_websocket_loop bookkeeping: close() sets _closed and _stop
+        # (the loop's between-attempts wait is interruptible, so a close()
+        # during a long backoff doesn't leave a thread sleeping); on_ws_open
+        # sets _opened so the loop knows whether to reset its backoff.
+        self._closed = False
+        self._stop = threading.Event()
+        self._opened = False
 
         environment = environment or DEFAULT_ENVIRONMENT
         is_local = environment == "local"
-        website_url = ("http" if is_local else "https") + '://'+('127.0.0.1:8000' if is_local else 'xparo.in')
-        socket_url = ("ws" if is_local else "wss") + '://'+('127.0.0.1:8000' if is_local else 'xparo.in')
+        self.server_host = '127.0.0.1:8000' if is_local else 'xparo.in'
+        website_url = ("http" if is_local else "https") + '://'+self.server_host
+        socket_url = ("ws" if is_local else "wss") + '://'+self.server_host
         # Bare origin (no /chatbot_api/... suffix) -- engine.py needs this
         # separately for XP_Database's BlackboxOrchestrator, which uploads
         # against a different path on the same host.
@@ -89,26 +106,16 @@ class DjangoWsTransport(Transport):
 
     @property
     def websocket_connected(self):
-        # websocket-client's run_forever(reconnect=N) only calls on_error
-        # and on_close for the very first failed attempt / the socket's
-        # very first open -- every disconnect after that (whether the
-        # established connection drops, or a later reconnect attempt
-        # itself fails) is retried silently with neither callback firing
-        # (confirmed against websocket-client 1.9.0's handleDisconnect,
-        # which only invokes on_error when the *initialize_socket* call
-        # that failed was not itself already a reconnect). Chaos testing
-        # this against a real killed Daphne process showed that relying on
-        # on_ws_open/on_ws_error/on_ws_close alone leaves this flag stuck
-        # True through a second, real outage even though the socket is
-        # down and silently retrying -- exactly the signal
-        # _hybrid_watchdog_loop needs to be correct. WebSocket.connected
-        # (the *raw* per-attempt flag inside websocket-client's own
-        # WebSocket object, distinct from this property) is updated
-        # directly by that library on every state change regardless of
-        # which callbacks it decides to fire, so read it straight from
-        # there once it exists; fall back to the manually-tracked value
-        # for "rest"/"offline" modes (which never create self.ws) and for
-        # the brief window before self.ws.sock exists.
+        # Once self.ws.sock exists, read websocket-client's own per-socket
+        # .connected flag straight from it -- the library keeps it accurate
+        # on every state change regardless of which callbacks fire (chaos
+        # testing against a real killed Daphne process showed a flag
+        # maintained only from on_ws_open/on_ws_error/on_ws_close going
+        # stale through a real outage -- exactly the signal
+        # _hybrid_watchdog_loop needs to be correct). Fall back to the
+        # manually-tracked value for "rest"/"offline" modes (which never
+        # create self.ws) and for the brief window before self.ws.sock
+        # exists.
         sock = getattr(getattr(self, "ws", None), "sock", None)
         if sock is not None:
             return bool(getattr(sock, "connected", False))
@@ -137,23 +144,14 @@ class DjangoWsTransport(Transport):
         # falls back to REST polling if it stays down too long.
         if self.connection_type=="websocket" or self.connection_type=="hybrid":
             if not self.websocket_connected:
-                self.ws = Xparo_socket(str(self.socket_full_url),
-                                on_message=self.on_message,
-                                on_error=self.on_ws_error,
-                                on_open=self.on_ws_open,
-                                on_close=self.on_ws_close,
-                                )
+                self._closed = False
+                self._stop.clear()
                 self.websocket_connected = True
-                # reconnect=RECONNECT_DELAY_SECONDS makes this loop retry on
-                # ANY disconnect (clean idle close included, not just a
-                # failed send) -- the single reconnect mechanism now; see
-                # send()'s except block.
                 # daemon: this loop must never keep the process alive
                 # after the node shuts down (Ctrl+C / ros2 launch stop) --
                 # as a plain thread it did, still connected and
                 # heartbeating, until something SIGKILLed it.
-                threading.Thread(target=self.ws.run_forever,
-                                  kwargs={"reconnect": RECONNECT_DELAY_SECONDS}, daemon=True).start()
+                threading.Thread(target=self._run_websocket_loop, daemon=True).start()
                 if self.connection_type=="hybrid":
                     threading.Thread(target=self._hybrid_watchdog_loop, daemon=True).start()
             else:
@@ -171,13 +169,50 @@ class DjangoWsTransport(Transport):
         ###################################################
         #### getting initial data..
 
+    def _run_websocket_loop(self):
+        """The reconnect mechanism. Opens the websocket and reopens it
+        whenever it closes -- the server dropping it (a deploy, a key
+        change), a refused handshake (wrong/frozen key: 403), the network
+        going away -- until close() is called.
+
+        websocket-client's own run_forever(reconnect=N) used to do this
+        and was dropped for a reason confirmed in the 2026-10-31 field
+        test: it retries silently (on_error fires for the very first
+        failure only), so a credential rejected mid-session -- the key it
+        was issued with got frozen -- was retried with the same 403 every
+        5 s forever, the fallback to the project secret key never ran, and
+        the log showed nothing but "socket is already closed." until
+        someone restarted the robot. Here every attempt is a fresh
+        run_forever(), so every failure reaches on_ws_error, and the wait
+        between attempts backs off while they keep failing.
+        """
+        failures = 0
+        while not self._closed:
+            self._opened = False
+            self.ws = Xparo_socket(str(self.socket_full_url),
+                            on_message=self.on_message,
+                            on_error=self.on_ws_error,
+                            on_open=self.on_ws_open,
+                            on_close=self.on_ws_close,
+                            )
+            self.ws.run_forever()
+            if self._closed:
+                break
+            failures = 0 if self._opened else failures + 1
+            delay = min(RECONNECT_DELAY_SECONDS * 2 ** max(failures - 1, 0), MAX_RECONNECT_DELAY_SECONDS)
+            print(f"reconnecting to the XPARO server in {delay} s ...")
+            if self._stop.wait(delay):
+                break
+
     def close(self):
-        # Stops run_forever's own retry loop (sets its keep_running flag
-        # and closes the underlying socket) -- websocket-client has no
-        # separate "stop reconnecting" call, closing is the one mechanism.
-        # Safe to call whether or not connect() ever actually got as far as
-        # creating self.ws (e.g. "rest"/"offline" modes, or a transport
-        # that's being retired before its first connect() attempt).
+        # Stops _run_websocket_loop (and the attempt it's in the middle
+        # of: closing the socket is how websocket-client's run_forever is
+        # made to return). Safe to call whether or not connect() ever
+        # actually got as far as creating self.ws (e.g. "rest"/"offline"
+        # modes, or a transport that's being retired before its first
+        # connect() attempt).
+        self._closed = True
+        self._stop.set()
         self.rest_fallback_active = False
         if getattr(self, "ws", None) is not None:
             self.ws.close()
@@ -212,7 +247,18 @@ class DjangoWsTransport(Transport):
             command_for=self._effective_transport()
         try:
             if command_for=="websocket":
-                self.ws.send(message)
+                ws = getattr(self, "ws", None)
+                if ws is None or not getattr(getattr(ws, "sock", None), "connected", False):
+                    # Not connected (yet, or right now): dropped quietly.
+                    # This used to print "'DjangoWsTransport' object has no
+                    # attribute 'ws'" at every start (Engine's own threads
+                    # send before connect() opened the socket) and "socket
+                    # is already closed." for every send during a
+                    # reconnect -- noise that reads as errors. The caller
+                    # already treats a not-connected transport as "not
+                    # delivered" (engine.py's _try_send_dict).
+                    return False
+                ws.send(message)
             elif command_for=="rest":
                 response = requests.post(self.website_full_url, data=message,headers={'Content-type': 'application/json'})
                 if response.status_code == 201:
@@ -234,48 +280,61 @@ class DjangoWsTransport(Transport):
             # message is lost, same as it would be mid-reconnect either way.
 
     def on_ws_error(self, ws, error):
-        # websocket-client's run_forever(reconnect=N) only calls on_error
-        # once, for the very first failed attempt -- every silent retry
-        # after that calls neither on_error nor on_close (see the
-        # websocket_connected property's docstring for how that's actually
-        # handled now). This assignment is harmless best-effort bookkeeping
-        # for the "rest"/"offline"/pre-connect fallback value; it is not
-        # relied on for websocket/hybrid liveness once self.ws.sock exists.
+        # Harmless best-effort bookkeeping for the "rest"/"offline"/
+        # pre-connect fallback value of websocket_connected; not relied on
+        # for websocket/hybrid liveness once self.ws.sock exists.
         self.websocket_connected = False
-        print(error)
-
-        # A 403 on the very first attempt, specifically while using a
-        # persisted ROBOT_CREDENTIAL, means that credential is no longer
-        # valid server-side (its robot/credential row was deleted or
-        # rotated) but the stale config/credential.json is still on disk,
-        # silently overriding whatever xparo_secret_key was actually passed
-        # to this launch. Without this, run_forever(reconnect=N) just keeps
-        # retrying the same doomed URL forever -- confirmed happening for
-        # real: a perfectly valid secret_key argument produced a permanent
-        # 403 loop with no indication it was never actually tried. Only
-        # fire once (on_ws_error's own "first attempt only" behavior
-        # already gives us that), and only when engine.py told us this
-        # secret came from the persisted file in the first place -- a
-        # genuinely wrong/revoked project secret typed by a user should
-        # still just fail normally, nothing to fall back to there.
-        if self.on_persisted_credential_rejected is not None and getattr(error, 'status_code', None) == 403:
-            callback = self.on_persisted_credential_rejected
-            self.on_persisted_credential_rejected = None
-            callback()
+        # Say what actually went wrong. Every failure used to print the
+        # same "check your internet connection / download the latest
+        # version / switch to rest" advice -- for a 403 (a wrong, frozen or
+        # deleted key, a retired robot) that sent operators chasing the
+        # network instead of the key (2026-10-31 field test, AARAV-3/
+        # CHAOS-7).
+        status = getattr(error, 'status_code', None)
+        if status == 403:
+            print(f"The XPARO server rejected {self.secret_kind} for project {self.project_id} "
+                  f"(403 Forbidden): the secret key is wrong, frozen or deleted, or this robot was "
+                  f"retired. Check Secret Key Manager and the Robots page on the dashboard -- "
+                  f"this is not a network problem. ({error})")
+            # A 403 while using a persisted ROBOT_CREDENTIAL means that
+            # credential is no longer valid server-side (its row was reset
+            # or rotated, or the key it was issued with is frozen) --
+            # engine.py then retries with the xparo_secret_key this launch
+            # was actually given, which the stale credential.json was
+            # silently overriding. Once per transport: the swap retires
+            # this one.
+            if self.on_persisted_credential_rejected is not None:
+                callback = self.on_persisted_credential_rejected
+                self.on_persisted_credential_rejected = None
+                callback()
             return
-
-        print(f'''
-        Truble shooting:
-            1. check your internet connection
-            2. if that not working download latest version of xparo or from github = https://github.com/lazyxcientist/xparo
-            3. try to switch to websocket connection or rest framework
-        ''')
+        if status is not None:
+            hint = ("check xparo_project_id -- the server knows no such project." if status == 404
+                    else "it is probably being deployed or is overloaded; retrying.")
+            print(f"The XPARO server answered {status} during the handshake: {hint} ({error})")
+            return
+        if not isinstance(error, BaseException):
+            # websocket-client hands the server's own close frame here
+            # when the server ends the connection (a deploy, a key change).
+            print("The XPARO server closed the connection -- reconnecting.")
+            return
+        if isinstance(error, websocket.WebSocketConnectionClosedException):
+            print(f"Lost the connection to the XPARO server ({error}) -- reconnecting.")
+            return
+        if isinstance(error, (websocket.WebSocketException, OSError)):
+            print(f"Can't reach the XPARO server at {self.server_host} ({error}). Check the robot's "
+                  f"internet connection; for a local Django server launch with xparo_environment:=local.")
+            return
+        # Anything else was raised inside on_message/on_open (websocket-
+        # client routes those here too): a bug in a handler, not the network.
+        print(f"Error while handling a server message: {error!r}")
 
     def on_ws_open(self, ws, *args):
         self.websocket_connected = True
+        self._opened = True  # resets _run_websocket_loop's backoff
         self.rest_fallback_active = False  # no-op unless hybrid fallback was active
         print('''
-        \\\\Connection Sussessfull//
+        \\\\Connection Successful//
            \\\\X.P.A.R.O remote//
             \\\\is 🄻🄸🅅🄴 now//
         ''')
@@ -283,13 +342,16 @@ class DjangoWsTransport(Transport):
 
     def on_ws_close(self, ws, *args):
         self.websocket_connected = False
-        print('''
+        # (close_status_code, close_reason) when the server sent a close
+        # frame -- e.g. 4403 is "your key/credential was revoked".
+        code = args[0] if args else None
+        print(f'''
 
             xparo brain is
         █▀▀ █── █▀▀█ █▀▀ █▀▀ █▀▀▄
         █── █── █──█ ▀▀█ █▀▀ █──█
         ▀▀▀ ▀▀▀ ▀▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀─
-            retry again !!!
+            {"stopped" if self._closed else "reconnecting ..."}{f" (server close code {code})" if code else ""}
 
         ''')
 

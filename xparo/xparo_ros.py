@@ -34,6 +34,8 @@ from xparo.diagnostics_aggregator import DiagnosticsAggregator
 from xparo.rosout_watcher import RosoutWatcher
 from xparo.health import ProblemTracker
 from xparo.engine import HEALTH_FLUSH_SEC
+from xparo.bt_engine import task_sync
+from xparo.node_params import declare_identity_parameter, declare_secret_parameter
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
 SELF_DIAGNOSTICS_PERIOD_SEC = 1.0
@@ -68,23 +70,25 @@ class Xparo(Node):
         # xparo_config.get("", "")
         ################################################
         ## parameters
-        self.xparo_project_id = self.declare_parameter("xparo_project_id", xparo_config.get("xparo_project_id", "")  ).value
-        self.xparo_secret_key = self.declare_parameter("xparo_secret_key", xparo_config.get("xparo_secret_key", "") ).value
-        self.xparo_connection_type = self.declare_parameter("xparo_connection_type", xparo_config.get("xparo_connection_type", "websocket")  ).value
+        # Identity parameters are read-only and the secret key is not kept
+        # on the parameter server at all -- see node_params.py.
+        self.xparo_project_id = declare_identity_parameter(self, "xparo_project_id", xparo_config.get("xparo_project_id", ""))
+        self.xparo_secret_key = declare_secret_parameter(self, "xparo_secret_key", xparo_config.get("xparo_secret_key", ""))
+        self.xparo_connection_type = declare_identity_parameter(self, "xparo_connection_type", xparo_config.get("xparo_connection_type", "websocket"))
         # "production" (xparo.in, https/wss) or "local" (127.0.0.1:8000,
         # http/ws, for developing against a local Django server). Defaults
         # to production -- a real robot that never sets this now reaches
         # the real server instead of a dev sandbox that doesn't exist for
         # it (see transports/django_ws.py's DEFAULT_ENVIRONMENT for the old
         # hardcoded `local = True` this replaces).
-        self.xparo_environment = self.declare_parameter("xparo_environment", xparo_config.get("xparo_environment", "production")  ).value
+        self.xparo_environment = declare_identity_parameter(self, "xparo_environment", xparo_config.get("xparo_environment", "production"))
         # Which Task stages (apps/analytics/models.py's TaskStageChoices,
         # outer repo) this robot may run a RUN_TASK dispatch for -- see
         # bt_engine/run_task.py's ALLOWED_TASK_STAGES for the actual
         # cascade. Defaults to "production", matching xparo_environment's
         # own safety-first default just above.
-        self.xparo_stage = self.declare_parameter("xparo_stage", xparo_config.get("xparo_stage", "production")  ).value
-        self.xparo_folder = self.declare_parameter("xparo_folder", base_path_for_package  ).value
+        self.xparo_stage = declare_identity_parameter(self, "xparo_stage", xparo_config.get("xparo_stage", "production"))
+        self.xparo_folder = declare_identity_parameter(self, "xparo_folder", base_path_for_package)
         self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
         self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
         self.xparo_env_path = self.declare_parameter("xparo_env_path",os.path.join(self.xparo_folder,'config','default.env')).value
@@ -381,25 +385,33 @@ class Xparo(Node):
             self.get_logger().error(f'Failed to process task history: {str(e)}')
 
     def ask_question_fun(self, msg):
-        user_input = str(msg.data)
-        self.xparo_engine.send(user_input.upper())
+        try:
+            self.xparo_engine.send(str(msg.data).upper())
+        except Exception as e:
+            self.get_logger().error(f'Failed to send /xparo/ask question: {e}')
 
     def run_task_topic_cb(self, msg):
+        # Anything on the ROS domain can publish here, so a bad message
+        # must never end the node: one malformed override_params used to
+        # raise out of this callback, and rclpy.spin takes the whole
+        # process down with it (ROSAPI-6). Every rejection also answers
+        # invalid_request on /xparo/task_result, so a caller isn't left
+        # waiting with only a robot-log line to show for it (ROSAPI-8).
         try:
-            payload = json.loads(msg.data)
+            payload, problem = task_sync.parse_run_task_message(msg.data)
+            if problem:
+                self.get_logger().error(f'/xparo/run_task rejected: {problem}')
+                self.xparo_engine.reject_task_request(None, problem)
+                return
+            target = payload.get("robot") or payload.get("device_id")
+            if not self.xparo_engine.is_this_robot(target):
+                self.get_logger().info(f'/xparo/run_task for robot {target!r} ignored: that is not this robot')
+                return
+            self.xparo_engine.run_task_from_topic(payload.get("task_id"), payload.get("override_params"),
+                                                  allow_parallel=bool(payload.get("allow_parallel")))
         except Exception as e:
-            self.get_logger().error(f'Failed to parse /xparo/run_task message: {str(e)}')
-            return
-        task_id = payload.get("task_id")
-        if not task_id:
-            self.get_logger().error('/xparo/run_task message missing "task_id"')
-            return
-        target = payload.get("robot") or payload.get("device_id")
-        if not self.xparo_engine.is_this_robot(target):
-            self.get_logger().info(f'/xparo/run_task for robot {target!r} ignored: that is not this robot')
-            return
-        self.xparo_engine.run_task_from_topic(task_id, payload.get("override_params"),
-                                              allow_parallel=bool(payload.get("allow_parallel")))
+            self.get_logger().error(f'/xparo/run_task failed: {e!r}')
+            self.xparo_engine.reject_task_request(None, f"{type(e).__name__}: {e}")
     ####################################################
     ####################################################
 
@@ -418,6 +430,15 @@ def main(args=None):
         # SIGINT (Ctrl+C, ros2 launch's first stop signal) or SIGTERM /
         # another shutdown -- either way, finish below and exit.
         pass
+    except Exception:
+        # SIGTERM can shut the context down under a running spin, which
+        # then raises RCLError ("the given context is not valid") instead
+        # of ExternalShutdownException -- seen on every `robot.sh stop` in
+        # the 2026-10-31 field test: a traceback and none of the clean
+        # shutdown below. A context that is already gone is a shutdown,
+        # not a crash.
+        if rclpy.ok():
+            raise
     # Sends this session's final Logs_history update (total runtime,
     # average CPU/RAM/disk/GPU consumption across the whole session) while
     # the transport can still actually send it -- only reachable from a

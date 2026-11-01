@@ -172,3 +172,50 @@ def build_run_task_val(task_id, override_params, custom_tasks, files):
         "tree_name": task.get("behaviour_tree_name", ""),
         "trigger": "ros_topic",
     }
+
+
+# Anything on the ROS domain can publish /xparo/run_task (default
+# ROS_DOMAIN_ID 0 reaches the whole site LAN), so a request is checked
+# before anything touches it: a list where a dict was expected used to
+# raise inside resolve_blackboard and take the whole node down (ROSAPI-6),
+# and a 2 MB override value ran and was stored twice in the task's history
+# report (ROSAPI-10). Task params are short text (a goal name, a number).
+MAX_OVERRIDE_PARAMS = 50
+MAX_OVERRIDE_VALUE_CHARS = 10_000
+_EXPECTED_SHAPE = 'expected JSON {"task_id": "<task id>", "override_params": {"name": "value"}} or a bare task id'
+
+
+def parse_run_task_message(data):
+    """A /xparo/run_task std_msgs/String payload -> (payload dict, problem).
+    Problem is "" when the message is usable. JSON {"task_id": ...} as
+    documented; a bare task id (what the docs prose suggests, and what
+    /xparo/cancel_task takes) is accepted too."""
+    text = (data or "").strip()
+    if text and text[0] not in '{["' and " " not in text:
+        return {"task_id": text}, ""
+    try:
+        payload = json.loads(text)
+    except ValueError as e:
+        return None, f"could not parse the message as JSON ({e}) -- {_EXPECTED_SHAPE}"
+    if not isinstance(payload, dict):
+        return None, f"the message is JSON but not an object -- {_EXPECTED_SHAPE}"
+    return payload, ""
+
+
+def validate_run_task_request(task_id, override_params):
+    """Why a parsed /xparo/run_task request can't be served, or "" when it
+    can -- the caller answers invalid_request on /xparo/task_result."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        return f'missing "task_id" -- {_EXPECTED_SHAPE}'
+    if override_params is None:
+        return ""
+    if not isinstance(override_params, dict):
+        return f'"override_params" must be a JSON object of name: value pairs, not {type(override_params).__name__}'
+    if len(override_params) > MAX_OVERRIDE_PARAMS:
+        return f'"override_params" has {len(override_params)} entries; at most {MAX_OVERRIDE_PARAMS} are allowed'
+    for name, value in override_params.items():
+        size = len(value) if isinstance(value, str) else len(json.dumps(value, default=str))
+        if size > MAX_OVERRIDE_VALUE_CHARS:
+            return (f'override_params[{name!r}] is {size} characters; at most {MAX_OVERRIDE_VALUE_CHARS} are allowed '
+                    f'(the value is stored in the task history)')
+    return ""

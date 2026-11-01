@@ -485,3 +485,14 @@ class TestEngineCancel:
         ack = [m["TASK_CANCEL_ACK"] for m in sent if "TASK_CANCEL_ACK" in m][0]
         assert ack["found"] is False
         assert "isn't running" in ack["message"]
+
+
+class TestRequiredPorts:
+    def test_timeout_without_msec_is_an_invalid_tree_not_a_runtime_failure(self):
+        """ROSAPI-5 (2026-10-31 field test): <Timeout> with no msec passed
+        the pre-run check and then failed with "timed out after 0 ms"."""
+        from xparo.bt_engine import tree_builder
+        problems = tree_builder.validate_tree('<Timeout><Sleep msec="10"/></Timeout>')
+        assert [p["message"] for p in problems if p["level"] == "error"] == [
+            "<Timeout> is missing its required port 'msec'"]
+        assert tree_builder.validate_tree('<Timeout msec="50"><Sleep msec="10"/></Timeout>') == []

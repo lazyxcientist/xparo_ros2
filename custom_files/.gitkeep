@@ -1,0 +1,2 @@
+# Keeps custom_files/ in git: CMakeLists.txt installs this directory, and a fresh
+# clone without it failed `colcon build` ("file INSTALL cannot find").

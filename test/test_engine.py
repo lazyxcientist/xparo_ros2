@@ -560,16 +560,19 @@ def test_raw_secret_key_does_not_wire_the_fallback_callback():
     assert engine.transport.on_persisted_credential_rejected is None
 
 
-def test_fall_back_to_raw_secret_clears_the_file_and_replaces_the_transport(tmp_path):
+def test_fall_back_to_raw_secret_keeps_the_file_and_replaces_the_transport(tmp_path):
     """Regression test for a bug confirmed live: a persisted ROBOT_CREDENTIAL
-    left over from before its Robots/RobotCredential row was deleted (or
-    rotated) server-side gets rejected with a 403 forever -- since
-    run_forever(reconnect=N) just keeps retrying the same doomed URL, a
-    perfectly valid xparo_secret_key argument would never actually get
-    tried without this recovering on its own. Covers the actual recovery:
-    the stale file is removed, the dead transport is closed (not left
-    retrying alongside the new one), and a fresh transport is built from
-    the *original* secret_key argument and told to connect.
+    that the server no longer accepts (its row reset/rotated, or -- the
+    2026-10-31 field test's case -- the key it was issued with frozen)
+    gets a 403, and a perfectly valid xparo_secret_key argument would never
+    get tried without this recovering on its own. Covers the actual
+    recovery: the dead transport is closed (not left retrying alongside
+    the new one), and a fresh transport is built from the *original*
+    secret_key argument and told to connect. The file is KEPT (it used to
+    be deleted here, which turned a temporary key freeze into a robot that
+    could only sign in with a key typed on site -- CHAOS-6): a frozen key
+    is accepted again once unfrozen, and a reset credential is replaced by
+    the server's next ROBOT_CREDENTIAL.
     """
     import os
 
@@ -586,7 +589,8 @@ def test_fall_back_to_raw_secret_clears_the_file_and_replaces_the_transport(tmp_
         engine._fall_back_to_raw_secret()
 
     old_transport.close.assert_called_once()
-    assert not os.path.exists(engine.xparo_credential_path)
+    assert os.path.exists(engine.xparo_credential_path)
+    assert engine._using_persisted_credential is False
     mock_transport_cls.assert_called_once()
     # "secret" is _make_engine()'s raw secret_key -- the whole point is
     # this must be the constructor argument, never the stale persisted one.
@@ -875,3 +879,84 @@ def test_no_new_task_starts_while_an_ota_update_runs():
         ota._update_lock.release()
     result = results[0]["TASK_RESULT"]
     assert result["outcome"] == "updating" and result["success"] is False and result["retryable"] is True
+
+
+# ---- 2026-10-31 field test: ROSAPI-4, CHAOS-6/7, SANDEEP-5 -----------------
+
+def test_only_unhandled_keys_reach_the_response_topic_never_tokens_or_env(tmp_path):
+    """ROSAPI-4: `ros2 topic echo /xparo/response` during a connect showed
+    the account's REST_API_TOKEN and the local.env contents -- the WHOLE
+    server message went out whenever any one of its keys had no handler."""
+    engine = _make_engine()
+    engine.files["local_env"] = str(tmp_path / "local.env")
+    received = []
+    engine.call_message = lambda message, **kwargs: received.append(message)
+
+    engine.on_ws_message('ws', {"status": "ok", "local_env": "SECRET=1", "REST_API_TOKEN": "tok-123",
+                                "message": {"bot_response": "hi"}})
+
+    assert received == [{"status": "ok", "message": {"bot_response": "hi"}}]
+
+
+def test_a_key_that_looks_private_is_never_republished_even_without_a_handler():
+    engine = _make_engine()
+    received = []
+    engine.call_message = lambda message, **kwargs: received.append(message)
+
+    engine.on_ws_message('ws', {"NEW_API_TOKEN": "x", "robot_env": "y", "message": "m"})
+
+    assert received == [{"message": "m"}]
+
+
+def test_server_rejections_are_printed_with_their_explanation(capsys):
+    """CHAOS-7: a retired robot / frozen key logged "server message: error"
+    and nothing else."""
+    engine = _make_engine()
+    engine.call_message = lambda message, **kwargs: None
+    engine.on_ws_message('ws', {"robot_retired": "This robot was retired from the project. Ask the owner."})
+    assert "robot_retired: This robot was retired from the project" in capsys.readouterr().out
+
+
+def test_a_rejected_persisted_credential_is_kept_on_disk(tmp_path):
+    """CHAOS-6: the robot deleted its own credential.json on a 403, so a
+    temporary key freeze left it able to sign in only with a secret key
+    typed on site. It must fall back to the launch's key and keep the
+    file for when the key is unfrozen."""
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine._persist_credential("cred-abc")
+    engine.transport = MagicMock()
+
+    with patch("xparo.engine.DjangoWsTransport") as transport_cls:
+        engine._fall_back_to_raw_secret()
+
+    assert json.loads((tmp_path / "credential.json").read_text())["value"] == "cred-abc"
+    assert transport_cls.call_args.args[0] == "secret"  # the launch's xparo_secret_key
+    assert transport_cls.call_args.kwargs["on_persisted_credential_rejected"] is None
+    transport_cls.return_value.connect.assert_called_once()
+
+
+def test_robot_credential_required_swaps_back_to_the_saved_credential(tmp_path):
+    """SANDEEP-5: on the secret-key fallback the server answers
+    robot_credential_required and then ignores the connection, and the
+    robot sat there until someone restarted it. It now signs in again
+    with its own credential after a wait that grows on every repeat."""
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine._persist_credential("cred-abc")
+    engine.call_message = lambda message, **kwargs: None
+    timers = []
+
+    with patch("xparo.engine.threading.Timer",
+               side_effect=lambda delay, fn: timers.append((delay, fn)) or MagicMock()):
+        engine.on_ws_message('ws', {"robot_credential_required": "This robot signs in with its own credential"})
+        engine.on_ws_message('ws', {"robot_credential_required": "again"})
+    assert [delay for delay, _ in timers] == [5, 10]
+
+    engine.transport = MagicMock()
+    with patch("xparo.engine.DjangoWsTransport") as transport_cls:
+        timers[0][1]()  # the swap itself
+    assert transport_cls.call_args.args[0] == "cred-abc"
+    assert transport_cls.call_args.kwargs["on_persisted_credential_rejected"] == engine._fall_back_to_raw_secret
+    assert engine._using_persisted_credential is True
+    transport_cls.return_value.connect.assert_called_once()

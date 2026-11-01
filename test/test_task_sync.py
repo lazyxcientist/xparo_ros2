@@ -319,3 +319,97 @@ class TestRunTaskTopicSafety:
                 run_task._active_runs.pop("already", None)
         assert finished and finished[0]["TASK_RESULT"]["outcome"] == "busy"
         assert finished[0]["TASK_RESULT"]["retryable"] is False
+
+
+# ---- 2026-10-31 field test: ROSAPI-6/8/10, RO-15 ---------------------------
+
+class TestParseRunTaskMessage:
+    def test_json_with_task_id(self):
+        assert task_sync.parse_run_task_message('{"task_id": "t1", "override_params": {"goal": "w3"}}') == (
+            {"task_id": "t1", "override_params": {"goal": "w3"}}, "")
+
+    def test_a_bare_task_id_is_accepted(self):
+        """RO-15: the docs prose says "publishing a task's ID runs it"."""
+        assert task_sync.parse_run_task_message("50a12826-aaaa") == ({"task_id": "50a12826-aaaa"}, "")
+
+    def test_bad_json_says_what_was_expected(self):
+        payload, problem = task_sync.parse_run_task_message('{task_id: oops')
+        assert payload is None
+        assert 'expected JSON {"task_id"' in problem
+
+    def test_a_json_list_is_rejected(self):
+        payload, problem = task_sync.parse_run_task_message('["t1"]')
+        assert payload is None and "not an object" in problem
+
+
+class TestValidateRunTaskRequest:
+    def test_a_good_request_passes(self):
+        assert task_sync.validate_run_task_request("t1", {"goal": "ward_3", "n": 2}) == ""
+        assert task_sync.validate_run_task_request("t1", None) == ""
+
+    def test_null_or_missing_task_id(self):
+        for task_id in (None, "", "   ", 5):
+            assert 'missing "task_id"' in task_sync.validate_run_task_request(task_id, {})
+
+    def test_override_params_must_be_an_object(self):
+        """ROSAPI-6: a list here raised AttributeError inside
+        resolve_blackboard and took the whole node down."""
+        problem = task_sync.validate_run_task_request("t1", ["x"])
+        assert "override_params" in problem and "list" in problem
+
+    def test_oversize_values_are_rejected(self):
+        """ROSAPI-10: a 2 MB value ran and was stored twice in the history."""
+        problem = task_sync.validate_run_task_request("t1", {"goal": "W" * 2_000_000})
+        assert "goal" in problem and str(task_sync.MAX_OVERRIDE_VALUE_CHARS) in problem
+
+    def test_too_many_entries_are_rejected(self):
+        too_many = {f"p{i}": "x" for i in range(task_sync.MAX_OVERRIDE_PARAMS + 1)}
+        assert "entries" in task_sync.validate_run_task_request("t1", too_many)
+
+
+class TestRunTaskFromTopicRejections:
+    """ROSAPI-6/8: a malformed request must neither raise (rclpy.spin would
+    end the node) nor go unanswered -- invalid_request goes out on
+    /xparo/task_result through on_task_event, and not up to the dashboard."""
+
+    def _engine_with_events(self, tmp_path):
+        engine = _make_engine(tmp_path, xparo_stage="development")
+        engine.bt_executor = BehaviorTreeExecutor(node=MagicMock(), engine=engine)
+        engine.sync_custom_tasks({"t1": {
+            "behaviour_tree_name": "", "save_task_history": False,
+            "blackboard_mapping": {"goal": {"mapping_type": "task_param", "param_id": "p1"}},
+            "params": [{"id": "p1", "name": "goal", "default_value": "a"}],
+        }})
+        events = []
+        engine.on_task_event = lambda kind, info: events.append((kind, info))
+        sent = []
+        engine.transport.send = lambda message, command_for=None: sent.append(message)
+        return engine, events, sent
+
+    def test_a_list_for_override_params_answers_invalid_request_instead_of_raising(self, tmp_path):
+        engine, events, sent = self._engine_with_events(tmp_path)
+
+        engine.run_task_from_topic("t1", ["x"])  # used to raise: 'list' object has no attribute 'get'
+
+        assert [(kind, info["outcome"]) for kind, info in events] == [("finished", "invalid_request")]
+        assert events[0][1]["task_id"] == "t1"
+        assert events[0][1]["retryable"] is False
+        assert "override_params" in events[0][1]["error"]
+        assert not any("TASK_RESULT" in raw for raw in sent)  # nothing went up to the dashboard
+
+    def test_a_null_task_id_answers_invalid_request(self, tmp_path):
+        engine, events, _ = self._engine_with_events(tmp_path)
+        engine.run_task_from_topic(None, {})
+        assert events[0][1]["outcome"] == "invalid_request" and "task_id" in events[0][1]["error"]
+
+    def test_an_oversize_override_value_never_runs(self, tmp_path):
+        engine, events, _ = self._engine_with_events(tmp_path)
+        engine.run_task_from_topic("t1", {"goal": "W" * 2_000_000})
+        assert [(kind, info["outcome"]) for kind, info in events] == [("finished", "invalid_request")]
+
+    def test_reject_task_request_is_what_the_node_uses_for_unparseable_messages(self, tmp_path):
+        engine, events, _ = self._engine_with_events(tmp_path)
+        engine.reject_task_request(None, "could not parse the message as JSON")
+        assert len(events) == 1
+        assert events[0][1]["outcome"] == "invalid_request" and events[0][1]["task_id"] is None
+        assert events[0][1]["error"] == "could not parse the message as JSON"

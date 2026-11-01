@@ -48,7 +48,7 @@ DEFAULT_TIMEOUT_S = 900  # Services.timeout's own default (Django)
 
 # Outcomes a retry can't fix -- Django's restart_on_failure skips these
 # instead of re-dispatching the same broken task in a tight loop.
-NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled", "busy"}
+NOT_RETRYABLE = {"stage_mismatch", "invalid_tree", "no_executor", "unknown_task", "cancelled", "busy", "invalid_request"}
 
 _active_lock = threading.Lock()
 _active_runs = {}  # run_id -> {"task_id", "event", "started", "reason"}

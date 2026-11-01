@@ -408,3 +408,24 @@ class TestExecutor:
             '<Script code="x := 1 + 2" />', blackboard={}, tick_rate_hz=0
         )
         assert blackboard["x"] == 3
+
+
+class TestBooleanTextCoercion:
+    """ROSAPI-5 (2026-10-31 field test): `flag == true` with flag="true"
+    (how a task param or XML value arrives) was False, while bare `flag`
+    was already coerced through truthy()."""
+
+    def test_true_false_text_compares_equal_to_the_literals(self):
+        from xparo.bt_engine import expr
+        assert expr.evaluate("flag == true", {"flag": "true"}) is True
+        assert expr.evaluate("flag == false", {"flag": "false"}) is True
+        assert expr.evaluate("flag == true", {"flag": "false"}) is False
+        assert expr.evaluate("flag != true", {"flag": "False"}) is True
+        assert expr.evaluate("true == flag", {"flag": "TRUE"}) is True
+        assert expr.evaluate_condition("flag == true", {"flag": "true"}) is True
+
+    def test_other_text_and_real_booleans_are_untouched(self):
+        from xparo.bt_engine import expr
+        assert expr.evaluate("flag == true", {"flag": "yes"}) is False
+        assert expr.evaluate("flag == true", {"flag": True}) is True
+        assert expr.evaluate("a == b", {"a": "true", "b": "true"}) is True

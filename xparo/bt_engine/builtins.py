@@ -707,6 +707,11 @@ NODE_ARITY.update({tag: (0, 0) for tag in _LEAVES})
 NODE_ARITY.update({tag: (1, 1) for tag in _DECORATORS})
 NODE_ARITY.update({"IfThenElse": (2, 3), "WhileDoElse": (2, 3)})
 NODE_ARITY.update({f"Switch{n}": (n + 1, n + 1) for n in range(2, 7)})
+# Ports a node can't do anything sensible without: validate_tree rejects
+# the tree before it runs, like a missing child. A <Timeout> with no msec
+# used to pass the pre-run check and then fail at run time with "timed
+# out after 0 ms" (2026-10-31 field test).
+REQUIRED_PORTS = {"Timeout": ("msec",)}
 for _tag in ("Sequence", "Fallback", "Selector", "ReactiveSequence", "ReactiveFallback", "Parallel", "ParallelAll",
              "SequenceWithMemory", "SequenceStar", "AsyncSequence", "AsyncFallback"):
     # 0, not 1: an empty control is harmless (it just succeeds) and older
