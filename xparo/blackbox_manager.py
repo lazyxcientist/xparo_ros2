@@ -264,7 +264,7 @@ if __name__ == "__main__":
     orchestrator = BlackboxOrchestrator(
         ROBOT_ID="827a8f7f-0875-533e-8759-5e56971072a3"
         ,xparo_website_url="http://127.0.0.1:8000"
-        ,BAG_DIR='/home/scientist/Documents/nave/xparo/d6f86221-67c4-4068-9ac4-05c95e9b5ca9/ros_bags'
+        ,BAG_DIR=os.path.expanduser('~/ros_bags')
     )
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)

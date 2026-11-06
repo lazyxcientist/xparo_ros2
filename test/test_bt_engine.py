@@ -1,5 +1,4 @@
-"""Behaviour Tree redesign Phase 9 (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): xml_parser/expr/node_registry/tree_builder/
+"""Behaviour Tree redesign Phase 9: xml_parser/expr/node_registry/tree_builder/
 executor. QUICK_DELIVERY_TREE_FRAGMENT is the real example tree's inner
 content (custom_behaviors/quick_delivery_tree.xml), embedded rather than
 read from disk so this test doesn't depend on that file's current state.

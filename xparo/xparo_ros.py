@@ -35,7 +35,7 @@ from xparo.rosout_watcher import RosoutWatcher
 from xparo.health import ProblemTracker
 from xparo.engine import HEALTH_FLUSH_SEC
 from xparo.bt_engine import task_sync
-from xparo.node_params import declare_identity_parameter, declare_secret_parameter
+from xparo.node_params import declare_identity_parameter, declare_launch_parameter, declare_secret_parameter
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 
 SELF_DIAGNOSTICS_PERIOD_SEC = 1.0
@@ -89,37 +89,37 @@ class Xparo(Node):
         # own safety-first default just above.
         self.xparo_stage = declare_identity_parameter(self, "xparo_stage", xparo_config.get("xparo_stage", "production"))
         self.xparo_folder = declare_identity_parameter(self, "xparo_folder", base_path_for_package)
-        self.xparo_behavior_path = self.declare_parameter("xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml')).value
-        self.xparo_file_path = self.declare_parameter("xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt')).value
-        self.xparo_env_path = self.declare_parameter("xparo_env_path",os.path.join(self.xparo_folder,'config','default.env')).value
-        self.xparo_local_env_path = self.declare_parameter("xparo_local_env_path",os.path.join(self.xparo_folder,'config','local.env')).value
-        self.xparo_properties_path = self.declare_parameter("xparo_properties_path",os.path.join(self.xparo_folder,'config',"properties.txt")).value
-        self.xparo_custom_behaviors_folder_path = self.declare_parameter("xparo_custom_behaviors_folder_path",os.path.join(self.xparo_folder,'custom_behaviors')).value
-        self.xparo_custom_files_folder_path = self.declare_parameter("xparo_custom_files_folder_path",os.path.join(self.xparo_folder,'custom_files')).value
-        self.xparo_custom_evns_folder_path = self.declare_parameter("xparo_custom_evns_folder_path",os.path.join(self.xparo_folder,'custom_envs')).value
-        self.record_bags = self.declare_parameter("record_bags",False).value
-        self.BAG_DIR = self.declare_parameter("BAG_DIR",os.path.join(self.xparo_folder,"xparo",self.xparo_project_id,'ros_bags')).value
+        self.xparo_behavior_path = declare_launch_parameter(self, "xparo_behavior_path",os.path.join(self.xparo_folder,'config','default.xml'))
+        self.xparo_file_path = declare_launch_parameter(self, "xparo_file_path",os.path.join(self.xparo_folder,'config','default.txt'))
+        self.xparo_env_path = declare_launch_parameter(self, "xparo_env_path",os.path.join(self.xparo_folder,'config','default.env'))
+        self.xparo_local_env_path = declare_launch_parameter(self, "xparo_local_env_path",os.path.join(self.xparo_folder,'config','local.env'))
+        self.xparo_properties_path = declare_launch_parameter(self, "xparo_properties_path",os.path.join(self.xparo_folder,'config',"properties.txt"))
+        self.xparo_custom_behaviors_folder_path = declare_launch_parameter(self, "xparo_custom_behaviors_folder_path",os.path.join(self.xparo_folder,'custom_behaviors'))
+        self.xparo_custom_files_folder_path = declare_launch_parameter(self, "xparo_custom_files_folder_path",os.path.join(self.xparo_folder,'custom_files'))
+        self.xparo_custom_evns_folder_path = declare_launch_parameter(self, "xparo_custom_evns_folder_path",os.path.join(self.xparo_folder,'custom_envs'))
+        self.record_bags = declare_launch_parameter(self, "record_bags",False)
+        self.BAG_DIR = declare_launch_parameter(self, "BAG_DIR",os.path.join(self.xparo_folder,"xparo",self.xparo_project_id,'ros_bags'))
         # "django_ws" (networked robots, against the Django backend -- the
         # only option before Phase 4) or "tethered_tcp" (a physically-
         # tethered ROV with no path to Django at all). See
         # transports/tethered_tcp.py's module docstring.
-        self.xparo_transport = self.declare_parameter("xparo_transport", xparo_config.get("xparo_transport", "django_ws")).value
+        self.xparo_transport = declare_launch_parameter(self, "xparo_transport", xparo_config.get("xparo_transport", "django_ws"))
         # Only read/relevant when xparo_transport=="tethered_tcp" -- path
         # to a copy of config/tethered_channels.yaml with this
         # deployment's actual RS-485<->Ethernet bridge host/port pairs.
         # Empty (default) means transports/tethered_tcp.py's own
         # DEFAULT_CHANNELS_CONFIG (loopback test values, not a real link).
-        self.tethered_channels_config_path = self.declare_parameter(
-            "tethered_channels_config_path", xparo_config.get("tethered_channels_config_path", "")
-        ).value
+        self.tethered_channels_config_path = declare_launch_parameter(
+            self, "tethered_channels_config_path", xparo_config.get("tethered_channels_config_path", "")
+        )
         self.tethered_channels_config = self._load_tethered_channels_config(self.tethered_channels_config_path)
         # Ads Center: who draws this robot's ads on its screen -- "native"
         # (xparo's own always-on-top player, for robots without XP-shell),
         # "xpshell" (hand them to XP-shell's Kivy player over ROS 2) or
         # "off". See xparo/ads/backends/.
-        self.xparo_ads_display = self.declare_parameter(
-            "xparo_ads_display", xparo_config.get("xparo_ads_display", "native")
-        ).value
+        self.xparo_ads_display = declare_launch_parameter(
+            self, "xparo_ads_display", xparo_config.get("xparo_ads_display", "native")
+        )
 
 
         self.ask_question = self.create_subscription(String, '/xparo/ask', self.ask_question_fun, 10)
@@ -304,6 +304,15 @@ class Xparo(Node):
             return
         if info.get("success"):
             self.get_logger().info(f"Task '{title}' finished: SUCCESS in {float(info.get('duration_s') or 0):.1f}s ({run})")
+        elif info.get("outcome") in ("invalid_request", "unknown_task"):
+            # Every /xparo/run_task rejection (unparseable, wrong types, too
+            # big, inputs it can't fill, a task id it doesn't know) the same
+            # way on /rosout: parse errors were ERROR there, the rest only
+            # printed (ROSAPI-13) or a WARN "FAILED" (ROSAPI-18).
+            self.get_logger().error(f"/xparo/run_task rejected: {info.get('error') or 'invalid request'}")
+        elif info.get("outcome") == "busy":
+            # A double tap: the run already going on is fine, nothing failed.
+            self.get_logger().info(f"Task '{title}' not started: it is already running on this robot (busy)")
         else:
             why = info.get("explanation") or info.get("error") or info.get("outcome") or "failed"
             if info.get("error") and info["error"] not in why:
@@ -365,6 +374,12 @@ class Xparo(Node):
 
     ## the data can be used a voice speak
     def call_message(self,message,**kwargs):
+        # A dashboard message that arrives while the node is stopping
+        # (SIGTERM/Ctrl+C shut the context down before the websocket is
+        # closed) has nowhere to go -- skip it rather than print "Failed to
+        # publish: publisher's context is invalid", which read as a crash.
+        if not self.context.ok():
+            return
         try:
             vv = String()
             vv.data = json.dumps(message)
@@ -400,8 +415,9 @@ class Xparo(Node):
         try:
             payload, problem = task_sync.parse_run_task_message(msg.data)
             if problem:
-                self.get_logger().error(f'/xparo/run_task rejected: {problem}')
-                self.xparo_engine.reject_task_request(None, problem)
+                # Logged by _on_task_event, like every other rejection.
+                task_id = (payload or {}).get("task_id")
+                self.xparo_engine.reject_task_request(task_id if isinstance(task_id, str) else None, problem)
                 return
             target = payload.get("robot") or payload.get("device_id")
             if not self.xparo_engine.is_this_robot(target):

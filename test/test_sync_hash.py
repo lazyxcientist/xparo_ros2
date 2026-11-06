@@ -1,5 +1,4 @@
-"""Bidirectional file sync (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): normalize_for_hash/content_hash. Kept in
+"""Bidirectional file sync: normalize_for_hash/content_hash. Kept in
 lockstep with the identical Django-side copy at
 apps/analytics/sync_hash.py's own test file -- same three cases on both
 sides.

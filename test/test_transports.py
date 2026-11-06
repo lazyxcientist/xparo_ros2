@@ -222,6 +222,25 @@ def test_hybrid_rest_fallback_loop_exits_immediately_once_inactive():
     mock_get.assert_not_called()
 
 
+def test_a_closed_hybrid_transports_watchdog_stops_instead_of_polling_rest():
+    """The engine swaps transports (credential <-> project key) for as long
+    as both are refused (CHAOS-23). A swapped-out hybrid transport's watchdog
+    never stopped: it saw the closed socket as "down", started REST polling
+    on the old key and polled it every 2 s forever -- one more per swap."""
+    import threading
+
+    transport = _make_transport(connection_type="hybrid")
+    transport.close()
+    with patch('xparo.transports.django_ws.requests.get') as mock_get, \
+         patch('xparo.transports.django_ws.time.monotonic', side_effect=[0.0] + [1e6] * 1000):
+        watchdog = threading.Thread(target=transport._hybrid_watchdog_loop, daemon=True)
+        watchdog.start()
+        watchdog.join(timeout=2)
+        assert not watchdog.is_alive()
+    assert transport.rest_fallback_active is False
+    mock_get.assert_not_called()
+
+
 def test_hybrid_rest_fallback_loop_polls_and_dispatches_until_recovered():
     on_message = MagicMock()
     transport = _make_transport(connection_type="hybrid", on_message=on_message)
@@ -256,6 +275,7 @@ class _ClosingSocket:
         self.sock = None
         self.on_open = on_open
         self.on_close = on_close
+        self.on_error = on_error
         _ClosingSocket.created.append(self)
 
     def run_forever(self, **kwargs):
@@ -326,6 +346,50 @@ def test_backoff_resets_after_a_connection_that_actually_opened():
     assert _loop_with_fake_socket(transport, _OpensThenCloses, stop_after=3) == [5, 5, 5]
 
 
+def test_a_connection_the_server_refuses_still_backs_off():
+    """The server opens the socket, answers robot_retired /
+    robot_credential_required and closes it with 4403. That opened, but
+    resetting the backoff on it made a retired robot re-handshake every
+    5 s forever."""
+    from xparo.transports import django_ws
+
+    class _OpensThenRefuses(_ClosingSocket):
+        def run_forever(self, **kwargs):
+            self.on_open(self)
+            self.on_close(self, django_ws.SERVER_REFUSED_CLOSE_CODE, "refused")
+
+    transport = _make_transport(connection_type="websocket")
+    transport.on_connected = lambda: None
+    assert _loop_with_fake_socket(transport, _OpensThenRefuses, stop_after=4) == [5, 10, 20, 40]
+
+
+def test_a_refusal_delivered_as_a_close_frame_still_backs_off():
+    """websocket-client 1.9 hands the server's close frame to on_error and
+    then calls on_close(None, None): the 4403 must be read from the frame,
+    or a retired robot re-handshakes every 5 s (2026-11-03)."""
+    import websocket
+    from xparo.transports import django_ws
+
+    class _OpensThenRefusesByFrame(_ClosingSocket):
+        def run_forever(self, **kwargs):
+            self.on_open(self)
+            frame = websocket.ABNF(opcode=websocket.ABNF.OPCODE_CLOSE,
+                                   data=django_ws.SERVER_REFUSED_CLOSE_CODE.to_bytes(2, "big") + b"refused")
+            self.on_error(self, frame)
+            self.on_close(self, None, None)
+
+    transport = _make_transport(connection_type="websocket")
+    transport.on_connected = lambda: None
+    assert _loop_with_fake_socket(transport, _OpensThenRefusesByFrame, stop_after=4) == [5, 10, 20, 40]
+
+
+def test_a_normal_close_frame_does_not_count_as_a_refusal():
+    import websocket
+    from xparo.transports import django_ws
+    assert django_ws._close_code_of(websocket.ABNF(opcode=websocket.ABNF.OPCODE_CLOSE, data=(1000).to_bytes(2, "big"))) == 1000
+    assert django_ws._close_code_of(websocket.ABNF(opcode=websocket.ABNF.OPCODE_TEXT, data=b"hi")) is None
+
+
 def test_close_stops_the_loop_for_good():
     from xparo.transports import django_ws
     transport = _make_transport(connection_type="websocket")
@@ -383,5 +447,39 @@ def test_a_send_while_reconnecting_is_dropped_quietly(capsys):
 def test_success_banner_is_spelled_right(capsys):
     transport = _make_transport()
     transport.on_ws_open(None)
+    transport.on_server_accepted()
     out = capsys.readouterr().out
     assert "Connection Successful" in out and "Sussessfull" not in out
+
+
+def test_the_live_banner_waits_for_the_server_to_accept_the_robot(capsys):
+    """AARAV-16 / SANDEEP-13: every retry of a refused robot (credential
+    required, serial in use) printed "Connection Successful ... is LIVE
+    now" when the socket opened, right before the server's refusal -- a
+    beginner read that as online."""
+    transport = _make_transport()
+    transport.on_ws_open(None)
+    out = capsys.readouterr().out
+    assert "Connection Successful" not in out and "waiting for it to accept this robot" in out
+
+    transport.on_server_accepted()
+    transport.on_server_accepted()  # later replies on the same connection
+    assert capsys.readouterr().out.count("Connection Successful") == 1
+
+
+def test_a_refused_connection_never_prints_the_live_banner(capsys):
+    transport = _make_transport()
+    transport.on_ws_open(None)
+    transport.on_ws_close(None, 4403, "")
+    transport.on_server_accepted()  # nothing may count once it closed
+    assert "Connection Successful" not in capsys.readouterr().out
+
+
+def test_startup_banner_has_no_typo_or_stray_line(capsys):
+    """AARAV-3: every start printed "connencting to ..." and a stray
+    "the AI Engine" line under the banner."""
+    transport = _make_transport(connection_type="offline")
+    transport.connect()
+    out = capsys.readouterr().out
+    assert "connecting to" in out
+    assert "connencting" not in out and "the AI Engine" not in out

@@ -1,5 +1,4 @@
-"""Behaviour Tree redesign Phase 11 (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): the robot-side half of RUN_TASK -> TASK_RESULT.
+"""Behaviour Tree redesign Phase 11: the robot-side half of RUN_TASK -> TASK_RESULT.
 _make_engine/on_ws_message-round-trip style mirrors test_engine.py's own
 RUN_COMMAND tests exactly.
 """
@@ -361,3 +360,85 @@ class TestUserMessage:
         finally:
             del NODE_REGISTRY["_SaysAndFails"]
         assert responses[0]["TASK_RESULT"]["user_message"] == "Navigation is down, serve table 5 by hand."
+
+
+class TestStageVersions:
+    """Dashboard stage versions (apps/analytics/bt_versions.py, History ->
+    Stages): the RUN_TASK / synced task says which saved version of the tree
+    runs; a task whose tree is gone, or whose marked copy is missing on this
+    robot, carries tree_error."""
+
+    def _run(self, val, xparo_stage="development", subtree_resolver=None):
+        executor = BehaviorTreeExecutor(node=MagicMock(), engine=MagicMock())
+        responses, history, started = [], [], []
+        handle_run_task(executor, val, responses.append, add_task_history=history.append,
+                        xparo_stage=xparo_stage, on_started=started.append, subtree_resolver=subtree_resolver)
+        return responses, history, started, executor
+
+    def test_report_and_history_carry_the_version_fields(self):
+        val = {"task_id": "t1", "tree_xml": "<LoadNextDelivery />", "blackboard": {}, "save_task_history": True,
+               "stage": "production", "tree_name": "patrol", "tree_stage": "production", "tree_version": "v-1",
+               "tree_version_at": "2026-11-02T14:05:00+00:00", "tree_hash": "abc123"}
+        responses, history, started, _ = self._run(val, xparo_stage="production")
+        expected = {"tree_stage": "production", "tree_version": "v-1", "tree_version_at": "2026-11-02T14:05:00+00:00",
+                    "tree_hash": "abc123"}
+        result = responses[0]["TASK_RESULT"]
+        assert result["success"] is True
+        assert {k: result[k] for k in expected} == expected
+        assert {k: started[0]["TASK_STARTED"][k] for k in expected} == expected
+        assert {k: history[0]["input_data"][k] for k in expected} == expected
+        assert history[0]["input_data"]["tree_name"] == "patrol"
+        assert "behaviour" not in result
+
+    def test_old_dashboards_send_none_of_them(self):
+        responses, _, _, _ = self._run({"task_id": "t1", "tree_xml": "<LoadNextDelivery />", "blackboard": {}})
+        result = responses[0]["TASK_RESULT"]
+        assert (result["tree_stage"], result["tree_version"], result["tree_version_at"], result["tree_hash"]) == \
+            ("", "", "", "")
+
+    def test_a_marked_run_never_loads_a_subtree_from_disk(self):
+        """The server sends every SubTree a marked version runs; a ref the
+        payload lacks must not be filled with the robot's working copy."""
+        loaded = []
+
+        def disk(name):
+            loaded.append(name)
+            return "<LoadNextDelivery />"
+        val = {"task_id": "t1", "tree_xml": '<SubTree ID="dock_seq"/>', "blackboard": {}, "stage": "development",
+               "tree_version": "v-1", "tree_stage": "development"}
+        responses, _, _, _ = self._run(val, subtree_resolver=disk)
+        assert loaded == []
+        assert responses[0]["TASK_RESULT"]["success"] is False
+        # a working-copy run still may (today's behaviour)
+        val = {"task_id": "t2", "tree_xml": '<SubTree ID="dock_seq"/>', "blackboard": {}, "stage": "development"}
+        responses, _, _, _ = self._run(val, subtree_resolver=disk)
+        assert set(loaded) == {"dock_seq"} and responses[0]["TASK_RESULT"]["success"] is True
+
+    def test_tree_error_reports_invalid_tree_with_the_dashboard_message(self):
+        message = ("Patrol has no Production version. Set one on the Behaviour page (Patrol -> Stage -> "
+                   "Production) or pick a specific tree for this task.")
+        val = {"task_id": "t1", "tree_xml": "", "blackboard": {}, "stage": "production", "save_task_history": True,
+               "tree_name": "Patrol: no production version", "tree_error": message}
+        responses, history, _, executor = self._run(val, xparo_stage="production")
+        result = responses[0]["TASK_RESULT"]
+        assert result["success"] is False
+        assert result["outcome"] == "invalid_tree"
+        assert result["retryable"] is False      # the server never restarts it
+        assert result["error"] == message
+
+    def test_tree_error_wins_even_when_a_file_was_found(self):
+        """An old Scratch Space fallback must never run in its place."""
+        val = {"task_id": "t1", "tree_xml": "<LoadNextDelivery />", "blackboard": {}, "stage": "development",
+               "tree_error": "Patrol has no Development version."}
+        responses, _, _, _ = self._run(val)
+        assert responses[0]["TASK_RESULT"]["outcome"] == "invalid_tree"
+        assert responses[0]["TASK_RESULT"]["success"] is False
+
+    def test_tree_error_comes_after_the_stage_check(self):
+        val = {"task_id": "t1", "tree_xml": "", "blackboard": {}, "stage": "development",
+               "tree_error": "Patrol has no Development version."}
+        responses, _, started, _ = self._run(val, xparo_stage="production")
+        result = responses[0]["TASK_RESULT"]
+        assert result["outcome"] == "stage_mismatch" and result["stage_mismatch"] is True
+        assert started == []
+

@@ -1,5 +1,4 @@
-"""Behaviour Tree redesign Phase 12 (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): the modular external plugin loader.
+"""Behaviour Tree redesign Phase 12: the modular external plugin loader.
 """
 import json
 

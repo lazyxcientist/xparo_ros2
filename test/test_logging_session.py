@@ -72,10 +72,12 @@ class TestSendRobotInfoSessionGuard:
 
 class TestGetGpuPercent:
     def test_returns_none_when_nvidia_smi_is_not_installed(self, tmp_path):
-        """Real, unmocked call -- this sandbox genuinely has no nvidia-smi,
-        so this exercises the actual FileNotFoundError path for real."""
+        """subprocess.run raises FileNotFoundError for a missing nvidia-smi.
+        Simulated: this used to make the real call and so failed on any
+        machine that does have an NVIDIA GPU."""
         db = _make_database(tmp_path)
-        assert db.get_gpu_percent() is None
+        with patch('xparo.database.subprocess.run', side_effect=FileNotFoundError('nvidia-smi')):
+            assert db.get_gpu_percent() is None
 
     def test_parses_a_real_looking_nvidia_smi_reply(self, tmp_path):
         db = _make_database(tmp_path)

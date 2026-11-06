@@ -496,3 +496,60 @@ class TestRequiredPorts:
         assert [p["message"] for p in problems if p["level"] == "error"] == [
             "<Timeout> is missing its required port 'msec'"]
         assert tree_builder.validate_tree('<Timeout msec="50"><Sleep msec="10"/></Timeout>') == []
+
+    def test_delay_retry_and_repeat_without_their_ports_are_invalid_trees(self):
+        """ROSAPI-15: <Delay> succeeded at once, <RetryUntilSuccessful> and
+        <Repeat> ran once, silently; BT.CPP requires these ports."""
+        from xparo.bt_engine import tree_builder
+        for tag, port in (("Delay", "delay_msec"), ("RetryUntilSuccessful", "num_attempts"), ("Repeat", "num_cycles")):
+            problems = tree_builder.validate_tree(f"<{tag}><AlwaysSuccess/></{tag}>")
+            assert [p["message"] for p in problems if p["level"] == "error"] == [
+                f"<{tag}> is missing its required port {port!r}"], tag
+            assert _run(f"<{tag}><AlwaysSuccess/></{tag}>")["outcome"] == "invalid_tree"
+            assert tree_builder.validate_tree(f'<{tag} {port}="1"><AlwaysSuccess/></{tag}>') == []
+
+    def test_a_required_port_from_a_missing_blackboard_entry_names_the_entry(self):
+        """<Timeout msec="{t}"> with no t said "timed out after 0 ms"."""
+        r = _run('<Timeout msec="{t}"><Sleep msec="10"/></Timeout>')
+        assert r["outcome"] == "failed"
+        assert r["failed_node"]["reason"] == "msec comes from blackboard entry 't', which isn't set"
+        assert _run('<Timeout msec="{t}"><Sleep msec="10"/></Timeout>', blackboard={"t": "500"})["outcome"] == "success"
+
+
+class TestNegativeNumbers:
+    """ROSAPI-19: <Delay delay_msec="-5"> succeeded at once with no error
+    (BT.CPP's times are unsigned) and num_cycles="-5" repeated forever,
+    while num_attempts="abc" already failed with the reason."""
+
+    @pytest.mark.parametrize("xml, reason", [
+        ('<Delay delay_msec="-5"><AlwaysSuccess/></Delay>', "<Delay> delay_msec='-5' can't be negative"),
+        ('<Timeout msec="-1"><AlwaysSuccess/></Timeout>', "<Timeout> msec='-1' can't be negative"),
+        ('<Repeat num_cycles="-5"><AlwaysSuccess/></Repeat>',
+         "<Repeat> num_cycles='-5' must be -1 (forever) or 0 or more"),
+        ('<RetryUntilSuccessful num_attempts="-2"><AlwaysFailure/></RetryUntilSuccessful>',
+         "<RetryUntilSuccessful> num_attempts='-2' must be -1 (forever) or 0 or more"),
+        ('<RetryUntilSuccessful num_attempts="abc"><AlwaysFailure/></RetryUntilSuccessful>',
+         "<RetryUntilSuccessful> num_attempts='abc' is not a whole number"),
+    ])
+    def test_a_negative_time_or_count_in_the_tree_never_starts(self, xml, reason):
+        problems = tree_builder.validate_tree(f"<Sequence><SetBlackboard output_key='ran' value='1'/>{xml}</Sequence>")
+        assert [p["message"] for p in problems if p["level"] == "error"] == [reason]
+        r = _run(f"<Sequence><SetBlackboard output_key='ran' value='1'/>{xml}</Sequence>", timeout_s=2)
+        assert r["outcome"] == "invalid_tree" and "ran" not in r["blackboard"]
+
+    @pytest.mark.parametrize("xml, blackboard, reason", [
+        ('<Delay delay_msec="{d}"><AlwaysSuccess/></Delay>', {"d": "-5"}, "delay_msec='-5' can't be negative"),
+        ('<Repeat num_cycles="{n}"><AlwaysSuccess/></Repeat>', {"n": -5},
+         "num_cycles=-5 must be -1 (forever) or 0 or more"),
+        ('<Sleep msec="-5"/>', None, "msec='-5' can't be negative"),
+    ])
+    def test_a_negative_value_known_only_at_run_time_fails_with_the_reason(self, xml, blackboard, reason):
+        r = _run(xml, blackboard=blackboard, timeout_s=2)
+        assert r["outcome"] == "failed"
+        assert r["failed_node"]["reason"] == reason
+
+    def test_zero_and_minus_one_still_mean_what_bt_cpp_says(self):
+        assert _run('<Delay delay_msec="0"><AlwaysSuccess/></Delay>')["success"] is True
+        r = _run('<Repeat num_cycles="-1"><Sequence><Script code="k := k + 1"/><ScriptCondition code="k &lt; 60"/>'
+                 '</Sequence></Repeat>', blackboard={"k": 0})
+        assert r["outcome"] == "failed" and r["blackboard"]["k"] == 60

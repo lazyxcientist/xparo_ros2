@@ -227,7 +227,8 @@ class BuildContext:
 
     def find_subtree(self, tree_id):
         """Returns the subtree's root ET.Element, or raises TreeBuildError
-        with a message saying what's wrong."""
+        with a message saying what's wrong. subtree_resolver(tree_id) returns
+        None when the robot has no such tree, else its XML ('' when empty)."""
         source = self.subtrees.get(tree_id)
         if source is None and self.subtree_resolver is not None:
             try:
@@ -236,10 +237,17 @@ class BuildContext:
                 raise TreeBuildError(f"couldn't load behaviour tree {tree_id!r}: {e}")
             if source:
                 self.subtrees[tree_id] = source
-        if source is None or (isinstance(source, str) and not source.strip()):
+        if source is None:
             raise TreeBuildError(
                 f"SubTree refers to behaviour tree {tree_id!r}, which doesn't exist on this robot "
                 f"(check the name, and that the robot has synced since that tree was created)"
+            )
+        if not _has_nodes(source):
+            # The tree is there (the dashboard sent it, or it synced) but
+            # has no node: it used to be reported as missing (NODESYNC-35).
+            raise TreeBuildError(
+                f"SubTree points at the tree {tree_id!r}, which is empty -- open {tree_id!r} in the "
+                f"Behaviour editor, add nodes and save it"
             )
         if isinstance(source, str):
             try:
@@ -250,6 +258,23 @@ class BuildContext:
                 self.subtrees.setdefault(other_id, other)
             return element
         return source
+
+
+def _has_nodes(source):
+    """False for a tree with no node to run: '' or only <root>/<BehaviorTree>
+    wrappers, a TreeNodesModel and comments (the dashboard's
+    bt_params.tree_has_nodes). An element, or text that can't be parsed
+    (find_subtree then says it can't be read), counts as having nodes."""
+    if not isinstance(source, str):
+        return True
+    if not source.strip():
+        return False
+    try:
+        root = parse_fragment(source)
+    except TreeParseError:
+        return True
+    models = {el for model in root.iter("TreeNodesModel") for el in model.iter()}
+    return any(el.tag not in ("root", "BehaviorTree") and el not in models for el in root.iter())
 
 
 def _select_main(root):
@@ -481,10 +506,15 @@ def validate_tree(xml_fragment, subtrees=None, subtree_resolver=None):
                 add("error", problem, path, element)
             elif NODE_ARITY.get(tag, (0, 0))[1] is None and len(element) == 0:
                 add("warning", f"<{tag}> has no children, so it does nothing", path, element)
-            from .builtins import REQUIRED_PORTS
+            from .builtins import REQUIRED_PORTS, required_port_problem
             for port in REQUIRED_PORTS.get(tag, ()):
-                if not element.attrib.get(port, "").strip():
+                raw = element.attrib.get(port, "").strip()
+                if not raw:
                     add("error", f"<{tag}> is missing its required port {port!r}", path, element)
+                elif not raw.startswith("{"):  # "{name}" is read when the node starts
+                    problem = required_port_problem(port, raw)
+                    if problem:
+                        add("error", f"<{tag}> {problem}", path, element)
             if tag == "Script" and element.attrib.get("code", "").strip():
                 bad = _bad_script(element.attrib["code"])
                 if bad:

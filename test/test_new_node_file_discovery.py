@@ -1,5 +1,4 @@
-"""Bidirectional file sync (see /home/scientist/.claude/plans/breezy-
-splashing-koala.md): the robot-side half of "why am I not able to see
+"""Bidirectional file sync: the robot-side half of "why am I not able to see
 already-added files in xparo_api got syncing with behaviour tree also" --
 a file dropped straight into custom_node_files/<language>/ (never synced
 from Django, not one of the shipped examples) previously never showed up
@@ -366,3 +365,40 @@ class TestGetLocalFileContentForNewlyDiscoveredFiles:
         response = engine.get_local_file_content({"custom_node_files": ["helpers"]})
 
         assert "helpers" not in response["custom_node_files"]
+
+
+class TestABrokenRobotSideNodeIsLoggedOnceByName:
+    """NODESYNC-29: a robot-side python file with a bad import logged
+    "failed to load '/tmp/tmpXXXX.py'" dozens of times on one start and more
+    on every sync, never naming the file."""
+
+    BROKEN = "from xparo.bt_engine import Status\n" + PYTHON_NODE_SOURCE
+
+    def test_one_line_per_file_version_naming_the_file(self, tmp_path, capsys):
+        engine = _make_engine(tmp_path)
+        python_dir = tmp_path / "custom_behaviors" / "custom_node_files" / "python"
+        python_dir.mkdir(parents=True)
+        (python_dir / "ward_offline_node.py").write_text(self.BROKEN)
+
+        for _ in range(3):
+            engine.get_local_file_state()
+            engine.get_local_file_content({"custom_node_files": ["ward_offline_node"]})
+
+        lines = [line for line in capsys.readouterr().out.splitlines() if "failed to load" in line]
+        assert len(lines) == 1
+        assert "custom_node_files/python/ward_offline_node.py" in lines[0] and "/tmp" not in lines[0]
+        assert "cannot import name 'Status'" in lines[0]
+
+        (python_dir / "ward_offline_node.py").write_text(self.BROKEN.replace("Status\n", "Status  # v2\n", 1))
+        engine.get_local_file_state()
+        assert len([line for line in capsys.readouterr().out.splitlines() if "failed to load" in line]) == 1
+
+    def test_a_fixed_file_is_found_again(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        python_dir = tmp_path / "custom_behaviors" / "custom_node_files" / "python"
+        python_dir.mkdir(parents=True)
+        (python_dir / "ward_offline_node.py").write_text(self.BROKEN)
+        assert "ward_offline_node" not in engine.get_local_file_state()["custom_node_files"]
+
+        (python_dir / "ward_offline_node.py").write_text(PYTHON_NODE_SOURCE)
+        assert "ward_offline_node" in engine.get_local_file_state()["custom_node_files"]

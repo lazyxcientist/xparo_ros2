@@ -12,6 +12,8 @@ test_runners.py.
 """
 import json
 
+import pytest
+
 from xparo.bt_engine.node_registry import NODE_REGISTRY
 
 NAVIGATE_SOURCE = '''
@@ -323,6 +325,33 @@ class TestEngineSyncCustomNodeFilesBash:
             NODE_REGISTRY.pop("Navigate", None)
 
 
+class TestEngineSyncCustomNodeFilesEmpty:
+    """R2 node-sync test: a JavaScript node exposed and saved before any
+    code was written reached the robot as a 0-byte file and its tag was
+    still registered -- no warning anywhere, it could only fail in a run."""
+
+    def test_an_empty_js_or_bash_file_is_a_sync_failure_not_a_registered_tag(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        NODE_REGISTRY.pop("EmptyJs", None)
+        NODE_REGISTRY.pop("EmptySh", None)
+
+        try:
+            failures = engine.sync_custom_node_files({
+                "empty_js": {"language": "javascript", "source": "", "xml_tag": "EmptyJs", "node_type": "action", "ports": []},
+                "empty_sh": {"language": "bash", "source": "  \n", "xml_tag": "EmptySh", "node_type": "action", "ports": []},
+                "navigate": {"language": "bash", "source": BASH_NAVIGATE_SOURCE, "xml_tag": "Navigate", "node_type": "action", "ports": []},
+            })
+
+            assert "EmptyJs" not in NODE_REGISTRY
+            assert "EmptySh" not in NODE_REGISTRY
+            assert "Navigate" in NODE_REGISTRY
+            assert sorted((f["name"], f["language"]) for f in failures) == [("empty_js", "javascript"), ("empty_sh", "bash")]
+            assert all("no code" in f["reason"] for f in failures)
+        finally:
+            for tag in ("EmptyJs", "EmptySh", "Navigate"):
+                NODE_REGISTRY.pop(tag, None)
+
+
 class TestEngineSyncCustomNodeFilesCpp:
     def test_resync_compiles_the_source_and_registers_the_real_xml_tag(self, tmp_path):
         engine = _make_engine(tmp_path)
@@ -386,3 +415,211 @@ class TestOnWsMessageCustomNodeFileSync:
         assert acks[0]["registered_tags"] == []
         assert len(acks[0]["failures"]) == 1
         assert acks[0]["failures"][0]["name"] == "navigate"
+
+
+ROOM_FREE_SOURCE = '''
+from xparo.bt_engine.plugin_loader import CustomBTNode
+from py_trees import common
+
+
+class RoomFree(CustomBTNode):
+    XML_TAG = "RoomFree"
+
+    def update(self):
+        return common.Status.SUCCESS
+'''
+
+
+class TestRobotSideEditsAreNotLostSilently:
+    """NODESYNC-16: a hotfix made on the robot went back to the project's
+    copy as soon as anyone saved another node (or the robot reconnected),
+    with no backup and nothing in the log."""
+
+    def _synced(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        engine.sync_custom_node_files({"room_free_check": {"language": "python", "source": ROOM_FREE_SOURCE}})
+        path = tmp_path / "custom_node_files" / "python" / "room_free_check.py"
+        path.write_text(ROOM_FREE_SOURCE + "# robot-side hotfix\n")
+        return engine, path
+
+    def test_a_re_sent_unchanged_project_copy_keeps_the_robots_edit(self, tmp_path):
+        engine, path = self._synced(tmp_path)
+        try:
+            engine.sync_custom_node_files({"room_free_check": {"language": "python", "source": ROOM_FREE_SOURCE}})
+
+            assert path.read_text().endswith("# robot-side hotfix\n")
+        finally:
+            NODE_REGISTRY.pop("RoomFree", None)
+
+    def test_the_kept_edit_is_reported_to_the_project_by_its_disk_hash(self, tmp_path):
+        from xparo.sync_hash import content_hash
+        engine, path = self._synced(tmp_path)
+        sent = []
+        engine.transport.send = lambda message, command_for=None: sent.append(json.loads(message))
+        try:
+            engine.on_ws_message('ws', {"custom_node_files": {
+                "room_free_check": {"language": "python", "source": ROOM_FREE_SOURCE}}})
+
+            states = [m["LOCAL_FILE_STATE"] for m in sent if "LOCAL_FILE_STATE" in m]
+            assert states, "the project must hear about the kept edit now, not at the next reconnect"
+            assert states[0]["custom_node_files"]["room_free_check"]["content_hash"] == \
+                content_hash(ROOM_FREE_SOURCE + "# robot-side hotfix\n", "")
+            # NODESYNC-27: and the copy it was edited from, so the project can
+            # tell a robot-only edit from a change on both sides.
+            assert states[0]["custom_node_files"]["room_free_check"]["synced_hash"] == content_hash(ROOM_FREE_SOURCE, "")
+        finally:
+            NODE_REGISTRY.pop("RoomFree", None)
+
+    def test_a_changed_project_copy_wins_and_the_robots_edit_is_backed_up_and_reported(self, tmp_path):
+        engine, path = self._synced(tmp_path)
+        new_source = ROOM_FREE_SOURCE + "# project v2\n"
+        try:
+            failures = engine.sync_custom_node_files({"room_free_check": {"language": "python", "source": new_source}})
+
+            assert path.read_text() == new_source
+            backups = list(path.parent.glob("room_free_check.py.robot-*"))
+            assert len(backups) == 1 and backups[0].read_text().endswith("# robot-side hotfix\n")
+            assert any(f["name"] == "room_free_check" and backups[0].name in f["reason"] for f in failures)
+            # NODESYNC-33: and what the edit was, for the dashboard's diff
+            assert [f["robot_copy"] for f in failures if f["name"] == "room_free_check"] == [backups[0].read_text()]
+        finally:
+            NODE_REGISTRY.pop("RoomFree", None)
+
+    def test_a_file_nobody_edited_on_the_robot_is_not_rewritten(self, tmp_path):
+        import os
+        engine = _make_engine(tmp_path)
+        try:
+            engine.sync_custom_node_files({"room_free_check": {"language": "python", "source": ROOM_FREE_SOURCE}})
+            path = tmp_path / "custom_node_files" / "python" / "room_free_check.py"
+            os.utime(path, (1_000_000, 1_000_000))
+
+            engine.sync_custom_node_files({"room_free_check": {"language": "python", "source": ROOM_FREE_SOURCE}})
+
+            assert path.stat().st_mtime == 1_000_000  # NODESYNC-22: no rewrite of unchanged files
+        finally:
+            NODE_REGISTRY.pop("RoomFree", None)
+
+
+class TestStaleNodeFilesAreRemoved:
+    def test_a_language_change_removes_the_old_language_file_and_its_bytecode(self, tmp_path):
+        """NODESYNC-21: created as Python (0-byte .py + __pycache__), saved
+        as Bash, renamed, deleted -- the .py and its .pyc stayed forever."""
+        engine = _make_engine(tmp_path)
+        python_dir = tmp_path / "custom_node_files" / "python"
+        engine.sync_custom_node_files({"ward_door_sh": {"language": "python", "source": ""}})
+        (python_dir / "__pycache__").mkdir(exist_ok=True)
+        (python_dir / "__pycache__" / "ward_door_sh.cpython-312.pyc").write_bytes(b"x")
+
+        engine.sync_custom_node_files({"ward_door_sh": {
+            "language": "bash", "source": BASH_NAVIGATE_SOURCE, "xml_tag": "WardDoor"}})
+        try:
+            assert not (python_dir / "ward_door_sh.py").exists()
+            assert not (python_dir / "__pycache__" / "ward_door_sh.cpython-312.pyc").exists()
+            assert (tmp_path / "custom_node_files" / "bash" / "ward_door_sh.sh").exists()
+        finally:
+            NODE_REGISTRY.pop("WardDoor", None)
+
+
+class TestNodeFileNamesStayInTheirFolder:
+    def test_a_traversal_name_is_refused_and_writes_nothing_outside(self, tmp_path):
+        """NODESYNC-26: the name came straight from the server into
+        os.path.join (custom_aiml already used safe_path_in)."""
+        engine = _make_engine(tmp_path)
+
+        failures = engine.sync_custom_node_files({
+            "../../escaped": {"language": "bash", "source": BASH_NAVIGATE_SOURCE, "xml_tag": "Escaped"},
+        })
+
+        assert not (tmp_path / "escaped.sh").exists()
+        assert not (tmp_path.parent / "escaped.sh").exists()
+        assert any(f["name"] == "../../escaped" for f in failures)
+        assert "Escaped" not in NODE_REGISTRY
+        manifest = json.loads((tmp_path / "custom_node_files" / "manifest.json").read_text())
+        assert "../../escaped" not in manifest
+
+    def test_no_file_in_the_repo_names_a_local_developer_path(self):
+        """NODESYNC-26b: the package source was cleaned, but .gitignore, the
+        launch file and ten test files still named a developer's local plan
+        file. Every file git would publish is checked (the needles are split
+        so this file doesn't match itself)."""
+        import pathlib
+        import subprocess
+        repo = pathlib.Path(__file__).resolve().parent.parent
+        try:
+            listed = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=repo,
+                                    capture_output=True, text=True)
+        except OSError:
+            pytest.skip("git isn't installed")
+        if listed.returncode != 0:
+            pytest.skip("not a git checkout")
+        needles = (".claude" + "/plans", "breezy-splashing" + "-koala", "/home/" + "scientist")
+        leaks = []
+        for name in listed.stdout.splitlines():
+            path = repo / name
+            if not path.is_file() or path.stat().st_size > 2_000_000:
+                continue
+            text = path.read_bytes().decode("utf-8", "ignore")
+            leaks += [f"{name}: {needle}" for needle in needles if needle in text]
+        assert leaks == []
+
+
+class TestCppNodesAreNotRebuiltNeedlessly:
+    """NODESYNC-22: every sync rebuilt every C++ node, and a 120 s g++
+    timeout dropped the node's tag until the next sync."""
+
+    def test_an_unchanged_node_is_not_compiled_again(self, tmp_path, monkeypatch):
+        import subprocess
+        engine = _make_engine(tmp_path)
+        payload = {"navigate": {"language": "cpp", "source": CPP_NAVIGATE_SOURCE, "xml_tag": "Navigate"}}
+        try:
+            assert engine.sync_custom_node_files(payload) == []
+            compiles = []
+            real_run = subprocess.run
+            monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: compiles.append(cmd) or real_run(cmd, *a, **k))
+
+            assert engine.sync_custom_node_files(payload) == []
+            engine.sync_custom_node_files()  # the reconnect / startup reload
+
+            assert [c for c in compiles if c and c[0] == "g++"] == []
+            assert "Navigate" in NODE_REGISTRY
+        finally:
+            NODE_REGISTRY.pop("Navigate", None)
+
+    def test_a_failed_rebuild_keeps_the_previous_build_and_its_tag(self, tmp_path, monkeypatch):
+        import subprocess
+        engine = _make_engine(tmp_path)
+        try:
+            engine.sync_custom_node_files({"navigate": {"language": "cpp", "source": CPP_NAVIGATE_SOURCE, "xml_tag": "Navigate"}})
+            binary = tmp_path / "custom_node_files" / "cpp" / "cpp_build" / "navigate"
+            built = binary.read_bytes()
+
+            def timeout(cmd, *a, **k):
+                raise subprocess.TimeoutExpired(cmd, 120)
+            monkeypatch.setattr(subprocess, "run", timeout)
+            failures = engine.sync_custom_node_files({"navigate": {
+                "language": "cpp", "source": CPP_NAVIGATE_SOURCE + "\n// v2\n", "xml_tag": "Navigate"}})
+
+            assert "Navigate" in NODE_REGISTRY
+            assert binary.read_bytes() == built
+            assert len(failures) == 1 and "timed out" in failures[0]["reason"] and "previous build" in failures[0]["reason"]
+        finally:
+            NODE_REGISTRY.pop("Navigate", None)
+
+
+class TestCrlfNodeFilesAreNotRewritten:
+    def test_an_unchanged_crlf_file_keeps_its_mtime_and_is_not_a_robot_edit(self, tmp_path):
+        import os
+        engine = _make_engine(tmp_path)
+        crlf = ROOM_FREE_SOURCE.replace("\n", "\r\n")
+        payload = {"room_free_check": {"language": "python", "source": crlf}}
+        try:
+            engine.sync_custom_node_files(payload)
+            path = tmp_path / "custom_node_files" / "python" / "room_free_check.py"
+            os.utime(path, (1_000_000, 1_000_000))
+
+            assert engine.sync_custom_node_files(payload) == []
+
+            assert path.stat().st_mtime == 1_000_000
+            assert engine._kept_robot_node_edits == []
+        finally:
+            NODE_REGISTRY.pop("RoomFree", None)

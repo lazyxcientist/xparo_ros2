@@ -1,3 +1,4 @@
+import glob
 import json
 import re
 import threading
@@ -14,6 +15,7 @@ from .bt_engine import run_task
 from .bt_engine import plugin_loader
 from .bt_engine import runners
 from . import sync_hash
+from .bt_engine.xml_parser import tree_file_content, tree_from_file_content
 
 record_bags = False
 xparo_database_size =  80
@@ -27,6 +29,11 @@ HEARTBEAT_INTERVAL_SECONDS = 30
 # apart (xparo_ros.py's timer), and a "Watch live" request lasts this long
 # unless the popup renews it.
 HEALTH_FLUSH_SEC = 2.0
+# A task-history record the server hasn't confirmed (task_history_saved) is
+# sent again after this long, doubling each time, at most this many sends.
+TASK_HISTORY_ACK_WAIT_SEC = 30.0
+TASK_HISTORY_MAX_SENDS = 6
+TASK_HISTORY_MAX_UNCONFIRMED = 100
 HEALTH_WATCH_SEC = 600.0
 
 # Status mapping
@@ -43,13 +50,19 @@ NO_EXECUTOR_ERROR = (
     "This robot's XPARO process is running without its ROS 2 node, so it can't run behaviour trees. "
     "Start XPARO on the robot with its ROS 2 launch file (ros2 launch xparo xparo_launch.py)."
 )
+EMPTY_NODE_FILE_REASON = "the file has no code yet -- write the node's code and save it, then it registers"
 
 
 # Server replies that mean "this connection isn't being served" -- printed
 # with the server's explanation (on_ws_message), and the two with a
 # robot-side remedy act on it: _retry_with_persisted_credential and
-# _reconnect_later.
-SERVER_REJECTION_KEYS = frozenset({"error", "robot_credential_required", "robot_retired"})
+# _reconnect_later. robot_serial_in_use (another unit has this serial) has
+# none: the server's sentence says to set a unique XPARO_DEVICE_ID, and it
+# used to reach only /xparo/response, not the terminal (SANDEEP-13).
+SERVER_REJECTION_KEYS = frozenset({"error", "robot_credential_required", "robot_retired", "robot_serial_in_use"})
+# The server's reply to ADD_robots_info once it has accepted this robot
+# (data_analyis.py) -- only then is the robot live; see on_server_accepted.
+SERVER_ACCEPTED_KEY = "robot_info_added"
 CREDENTIAL_RETRY_BASE_SECONDS = 5
 CREDENTIAL_RETRY_MAX_SECONDS = 300
 RETIRED_RECHECK_SECONDS = 300
@@ -61,6 +74,21 @@ _PRIVATE_KEY_WORDS = ("token", "credential", "secret", "password", "env", "api_k
 def _safe_for_ros_graph(key):
     low = str(key).lower()
     return not any(word in low for word in _PRIVATE_KEY_WORDS)
+
+
+def _write_if_changed(path, content):
+    """True when the file was (re)written; an unchanged file keeps its mtime.
+    Read with newline='' so CRLF content compares as written, not rewritten
+    on every sync."""
+    try:
+        with open(path, 'r', newline='') as file:
+            if file.read() == content:
+                return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    with open(path, 'w') as file:
+        file.write(content)
+    return True
 
 
 class Engine():
@@ -122,6 +150,9 @@ class Engine():
         # mechanisms never unregister tags the OTHER one most recently
         # loaded.
         self._custom_node_file_tags = set()
+        # Node files the last sync left as edited on this robot (see
+        # sync_custom_node_files); on_ws_message reports them at once.
+        self._kept_robot_node_edits = []
         # Base dir for LIST_FILES/DELETE_FILE/FILE_REQ -- deliberately
         # separate from BAG_DIR (rosbag sessions) and the xparo_* config
         # paths below (behavior trees/env/properties, a different concept).
@@ -138,6 +169,14 @@ class Engine():
         # on_connected) -- see _send_important_dict/_flush_pending_important_sends.
         self._pending_important_sends = []
         self._pending_important_sends_lock = threading.Lock()
+        # A send that worked can still be lost when the server's write fails
+        # (a DB hiccup, a restart mid-write; R3 review, fleet-robot-api-9):
+        # a history record waits here for the server's task_history_saved
+        # (its run_id) and is sent again otherwise -- only to a server that
+        # says it answers (task_history_acks), as an older one would store
+        # each resend as another row. See _resend_unacked_task_history.
+        self._unacked_task_history = {}  # run_id -> {"payload", "sent_at", "sends"}
+        self._server_acks_task_history = False
 
         # GET_LIVE_STATUS's uptime field -- when this Engine (this robot's
         # connection/process) itself started, not any Django-tracked
@@ -149,6 +188,8 @@ class Engine():
         self._health_full_report_due = True
         self._running_task_info = {}
         self._last_task_outcome = None
+        self._warned_once = set()  # see _warn_once
+        self._python_node_probes = {}  # see _python_node_classes
         # on_task_event(kind, info), kind "started"|"finished" -- set by
         # xparo_ros.py to log and publish /xparo/task_result.
         self.on_task_event = None
@@ -237,7 +278,8 @@ class Engine():
         self.local_database = XP_Database(xparo_database_size,
                                             xparo_database_path,
                                             xparo_website_url,
-                                            self.BAG_DIR,self.record_bags,rosbag_control)
+                                            self.BAG_DIR,self.record_bags,rosbag_control,
+                                            xparo_stage=self.xparo_stage)
         try:
             threading.Thread(target=self._logging_update_loop, daemon=True).start()
         except:
@@ -318,7 +360,8 @@ class Engine():
 
     def _make_django_transport(self, secret, persisted):
         """persisted: secret is this robot's own ROBOT_CREDENTIAL (a 403
-        then falls back to the launch's xparo_secret_key), not that key."""
+        then falls back to the launch's xparo_secret_key), not that key (a
+        403 then goes back to the credential, if there is one)."""
         self._using_persisted_credential = persisted
         return DjangoWsTransport(
             secret, self.project_id,
@@ -327,7 +370,17 @@ class Engine():
             connection_type=self.connection_type,
             environment=self._environment,
             on_persisted_credential_rejected=self._fall_back_to_raw_secret if persisted else None,
+            on_project_key_rejected=None if persisted else self._retry_with_persisted_credential,
         )
+
+    def _use_new_credential(self, credential):
+        """Reconnects in this process sign in with the credential just
+        issued, not the project secret key (CHAOS-16)."""
+        use = getattr(self.transport, 'use_credential_for_reconnects', None)
+        if use is None or not credential or self._using_persisted_credential:
+            return
+        use(credential, self._fall_back_to_raw_secret)
+        self._using_persisted_credential = True
 
     def _retry_with_persisted_credential(self):
         """The server answered robot_credential_required: this robot has
@@ -338,7 +391,11 @@ class Engine():
         credential that is rejected again doesn't flip-flop every few
         seconds -- and so the robot comes back by itself once the key is
         unfrozen, instead of sitting on a connection the server ignores
-        until someone restarts it on site (SANDEEP-5)."""
+        until someone restarts it on site (SANDEEP-5).
+
+        Also called when the project secret key gets a 403 (deleted, or the
+        robot is retired): the robot alternates between the two, so a
+        Restore is picked up without a restart on site (CHAOS-23)."""
         credential = self._load_persisted_credential()
         if not credential or self._using_persisted_credential:
             return
@@ -347,6 +404,8 @@ class Engine():
         print(f"Signing in again with this robot's own credential in {delay} s.")
 
         def swap():
+            if self._using_persisted_credential:
+                return  # an earlier swap already did it -- don't drop that connection
             self.transport.close()
             self.transport = self._make_django_transport(credential, persisted=True)
             self.transport.connect()
@@ -416,6 +475,7 @@ class Engine():
         board while someone watches. Nothing is sent while the connection
         is down: the tracker keeps counting and everything goes out on the
         first flush after reconnecting."""
+        self._resend_unacked_task_history()
         tracker = self._get_problem_tracker()
         if tracker is None:
             return
@@ -480,10 +540,13 @@ class Engine():
         info = payload.get("TASK_RESULT") or {}
         started = self._running_task_info.pop(info.get("run_id"), {})
         title = info.get("task_title") or started.get("task_title") or info.get("task_id") or "task"
-        self._last_task_outcome = {
-            "title": title, "success": bool(info.get("success")),
-            "explanation": info.get("explanation") or info.get("error") or "",
-        }
+        if info.get("outcome") not in ("busy", "unknown_task"):
+            # A double tap or a mistyped task id isn't "the last task failed"
+            # in Health & Errors; the run that is going on is.
+            self._last_task_outcome = {
+                "title": title, "success": bool(info.get("success")),
+                "explanation": info.get("explanation") or info.get("error") or "",
+            }
         self._send_important_dict(payload)
         self._emit_task_event("finished", info)
 
@@ -612,6 +675,11 @@ class Engine():
         with self._pending_important_sends_lock:
             pending, self._pending_important_sends = self._pending_important_sends, []
         still_pending = [p for p in pending if not self._try_send_dict(p)]
+        now = time.monotonic()
+        with self._pending_important_sends_lock:
+            for entry in self._unacked_task_history.values():
+                if any(entry["payload"] is p for p in pending):
+                    entry["sent_at"] = now  # its answer gets a full wait, not a resend on the next tick
         if still_pending:
             with self._pending_important_sends_lock:
                 self._pending_important_sends = still_pending + self._pending_important_sends
@@ -635,7 +703,44 @@ class Engine():
                                                                 "type": message.get("type", "generic_task"),
                                                                 "created_at": message.get("created_at", datetime.now().isoformat())
                                                                 }}
+        input_data = payload["ADD_Task_history_database"]["input_data"]
+        run_id = input_data.get("run_id") if isinstance(input_data, dict) else None
+        if run_id:
+            with self._pending_important_sends_lock:
+                self._unacked_task_history[str(run_id)] = {"payload": payload, "sent_at": time.monotonic(), "sends": 1}
+                while len(self._unacked_task_history) > TASK_HISTORY_MAX_UNCONFIRMED:
+                    self._unacked_task_history.pop(next(iter(self._unacked_task_history)))
         self._send_important_dict(payload)
+
+    def _resend_unacked_task_history(self, now=None):
+        """flush_health's tick: sends a history record again when the server
+        hasn't confirmed it TASK_HISTORY_ACK_WAIT_SEC after the last send
+        (doubling), and gives up after TASK_HISTORY_MAX_SENDS. A record still
+        in the offline queue is left to the reconnect flush."""
+        if not self._server_acks_task_history or not self._unacked_task_history:
+            return
+        if not getattr(self.transport, 'websocket_connected', True) \
+                and not getattr(self.transport, 'rest_fallback_active', False):
+            return
+        now = time.monotonic() if now is None else now
+        with self._pending_important_sends_lock:
+            queued = list(self._pending_important_sends)
+            due = [(run_id, entry) for run_id, entry in self._unacked_task_history.items()
+                   if now - entry["sent_at"] >= TASK_HISTORY_ACK_WAIT_SEC * 2 ** (entry["sends"] - 1)
+                   and not any(payload is entry["payload"] for payload in queued)]
+        for run_id, entry in due:
+            if entry["sends"] >= TASK_HISTORY_MAX_SENDS:
+                print(f"[Engine] task history of run {run_id}: the server never confirmed it "
+                      f"({entry['sends']} sends) -- not sending it again")
+                with self._pending_important_sends_lock:
+                    self._unacked_task_history.pop(run_id, None)
+            else:
+                # Over the REST fallback _try_send_dict reports False though
+                # the post went out; a send that raised waits its turn too --
+                # either way no resend on every 2 s tick.
+                if self._try_send_dict(entry["payload"]) or getattr(self.transport, 'rest_fallback_active', False):
+                    entry["sends"] += 1
+                entry["sent_at"] = now
 
     def add_live_update(self,message):
         filtered_data = json.dumps({"ADD_live_update_bt":{"unique_id":self.local_database.unique_id,
@@ -781,6 +886,37 @@ class Engine():
         with open(os.path.join(directory, 'sync_state.json'), 'w') as file:
             json.dump(state, file)
 
+    @staticmethod
+    def _read_text(path):
+        try:
+            with open(path, 'r', newline='') as file:  # exact, so CRLF code isn't "changed
+                return file.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _remove_node_files(self, language_dir, name, language):
+        """Deletes what a code node left in its language folder: the source,
+        a .hpp, Python bytecode and a C++ build. Backups (.robot-*) stay."""
+        extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(language)
+        if extension is None:
+            return
+        paths = [remote_ops.safe_path_in(language_dir, name + suffix) for suffix in (extension, '.hpp')]
+        if language == 'python':
+            pycache = os.path.join(language_dir, '__pycache__')
+            paths += [remote_ops.safe_path_in(pycache, os.path.basename(p))
+                      for p in glob.glob(os.path.join(pycache, glob.escape(name) + '.*.pyc'))]
+        if language == 'cpp':
+            build_dir = os.path.join(language_dir, 'cpp_build')
+            paths += [remote_ops.safe_path_in(build_dir, name + suffix)
+                      for suffix in ('', '.cpp', '.hpp', runners.CPP_BUILD_STAMP_SUFFIX)]
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def sync_custom_node_files(self, custom_node_files=None):
         """Multi-language custom BT node system, Phase 5/6/7 -- the robot-
         side half of apps/analytics/models.py's CustomFile/
@@ -803,8 +939,7 @@ class Engine():
         do with code -- reusing it would silently collide two unrelated
         features).
 
-        Bidirectional file sync (see /home/scientist/.claude/plans/
-        breezy-splashing-koala.md): Django-synced source files live one
+        Bidirectional file sync: Django-synced source files live one
         level deeper than before, under a subfolder per language
         (custom_node_files/{python,cpp,javascript,bash}/) -- a real,
         git-trackable, language-separated layout instead of one flat
@@ -867,6 +1002,7 @@ class Engine():
                         previous_manifest = {}
 
             manifest = {}
+            kept_robot_edits = []
             for name, entry in custom_node_files.items():
                 if not isinstance(entry, dict):
                     continue
@@ -875,40 +1011,82 @@ class Engine():
                 if extension is None:
                     continue  # unrecognized language -- not written, not registered
                 language_dir = _language_dir(language)
+                # The name comes from the server: never let it leave its
+                # language folder (custom_aiml's sync has the same guard).
+                safe_path = remote_ops.safe_path_in(language_dir, name + extension)
+                if safe_path is None or os.path.dirname(str(safe_path)) != os.path.realpath(language_dir):
+                    print(f"[custom_node_files sync] refusing unsafe node file name {name!r} (path traversal attempt)")
+                    sync_failures.append({"name": name, "language": language, "reason": "unsafe file name -- not written"})
+                    continue
                 os.makedirs(language_dir, exist_ok=True)
-                source_path = os.path.join(language_dir, name + extension)
-                with open(source_path, 'w') as file:
-                    file.write(entry.get('source', ''))
-                if language == 'bash':
-                    os.chmod(source_path, 0o755)
+                source_path = str(safe_path)
+                source = entry.get('source', '')
+                header_source = entry.get('header_source', '')
+                content_hash = sync_hash.content_hash(source, header_source)
+                previous = previous_manifest.get(name) or {}
+                on_disk = self._read_text(source_path)
+                baseline = previous.get('content_hash') if previous.get('language') == language else None
+                edited_here = (
+                    on_disk is not None and on_disk != source and baseline
+                    and sync_hash.content_hash(on_disk, previous.get('header_source', '')) != baseline
+                )
+                if edited_here and content_hash == baseline:
+                    # Edited on this robot and unchanged in the project: the
+                    # server only re-sent its copy (another node was saved,
+                    # or the robot reconnected). Keep the robot's edit -- it
+                    # is reported in LOCAL_FILE_STATE (disk hash vs. this
+                    # baseline), so the project takes it in or raises a
+                    # sync conflict, instead of it vanishing (NODESYNC-16).
+                    print(f"[custom_node_files sync] kept {language}/{name}{extension}: it was edited on this robot "
+                          f"-- reporting it to the project instead of replacing it")
+                    kept_robot_edits.append(name)
+                else:
+                    if edited_here:
+                        # Changed in the project too: the project's copy
+                        # wins, the robot's edit is kept beside it.
+                        backup = f"{source_path}.robot-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+                        with open(backup, 'w') as file:
+                            file.write(on_disk)
+                        print(f"[custom_node_files sync] {language}/{name}{extension} was edited on this robot and in the "
+                              f"project; the project's copy replaces it, the robot's edit is kept as {os.path.basename(backup)}")
+                        sync_failures.append({"name": name, "language": language, "reason": (
+                            f"this robot's own edit was replaced by the project's copy; it is kept on the robot as "
+                            f"custom_node_files/{language}/{os.path.basename(backup)}"),
+                            # the dashboard shows what that edit was (NODESYNC-33)
+                            "robot_copy": on_disk})
+                    if on_disk != source:
+                        # Unchanged files are not rewritten (NODESYNC-22:
+                        # every save used to touch every node file).
+                        with open(source_path, 'w') as file:
+                            file.write(source)
+                    if language == 'bash':
+                        os.chmod(source_path, 0o755)
                 # A fresh Django sync is by definition the new authoritative
                 # baseline -- content_hash/synced_at get set unconditionally
-                # here (see /home/scientist/.claude/plans/breezy-splashing-
-                # koala.md's Part 2/3: "Django changed -> push to robot,
-                # update baseline" applies to every entry Django just sent).
+                # here ("Django changed -> push to robot, update baseline"
+                # applies to every entry Django just sent); a kept robot
+                # edit keeps the baseline it is measured against.
                 manifest[name] = {
                     'language': language,
                     'xml_tag': entry.get('xml_tag', ''),
                     'node_type': entry.get('node_type', 'action'),
                     'ports': entry.get('ports', []),
-                    'header_source': entry.get('header_source', ''),
-                    'content_hash': sync_hash.content_hash(entry.get('source', ''), entry.get('header_source', '')),
-                    'synced_at': datetime.utcnow().isoformat(),
+                    'header_source': header_source,
+                    'content_hash': content_hash,
+                    'synced_at': previous.get('synced_at') if name in kept_robot_edits and previous.get('synced_at')
+                    else datetime.utcnow().isoformat(),
                 }
 
             for stale_name, stale_entry in previous_manifest.items():
-                if stale_name in manifest:
-                    continue
                 stale_language = stale_entry.get('language')
-                stale_extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(stale_language)
-                if stale_extension is None:
-                    continue  # unrecognized/missing language -- nothing to clean up
-                for suffix in (stale_extension, '.hpp'):
-                    try:
-                        os.remove(os.path.join(_language_dir(stale_language), stale_name + suffix))
-                    except OSError:
-                        pass
+                if stale_name in manifest and manifest[stale_name]['language'] == stale_language:
+                    continue
+                # Gone from the project, or its language changed (a node
+                # created as Python and then saved as Bash left a 0-byte
+                # .py and its bytecode behind -- NODESYNC-21).
+                self._remove_node_files(_language_dir(stale_language), stale_name, stale_language)
 
+            self._kept_robot_node_edits = kept_robot_edits
             with open(manifest_path, 'w') as file:
                 json.dump(manifest, file)
 
@@ -1007,6 +1185,16 @@ class Engine():
         # Confirmed live on a real robot.
         previous_tags = set(self._custom_node_file_tags)
         pending = {}
+
+        def _has_code(path):
+            # An exposed node saved before any code was written arrives as
+            # an empty file; registering it put a tag in the palette that
+            # could only fail when a tree ran it (R2 node-sync test).
+            try:
+                with open(path, 'r') as f:
+                    return bool(f.read().strip())
+            except OSError:
+                return False
         registered_tags = set()
 
         python_paths = [
@@ -1025,9 +1213,13 @@ class Engine():
                 if not xml_tag:
                     sync_failures.append({"name": name, "language": "javascript", "reason": "no xml_tag configured"})
                     continue
+                js_path = os.path.join(js_dir, name + '.js')
+                if not _has_code(js_path):
+                    sync_failures.append({"name": name, "language": "javascript", "reason": EMPTY_NODE_FILE_REASON})
+                    continue
                 output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
                 pending[xml_tag] = runners.make_javascript_node_factory(
-                    os.path.join(js_dir, name + '.js'), js_runtime_dir, output_keys,
+                    js_path, js_runtime_dir, output_keys,
                 )
                 registered_tags.add(xml_tag)
 
@@ -1040,6 +1232,9 @@ class Engine():
                 sync_failures.append({"name": name, "language": "bash", "reason": "no xml_tag configured"})
                 continue
             script_path = os.path.join(bash_dir, name + '.sh')
+            if not _has_code(script_path):
+                sync_failures.append({"name": name, "language": "bash", "reason": EMPTY_NODE_FILE_REASON})
+                continue
 
             def _bash_builder(nm, attrs, blackboard, children, ros_node, script_path=script_path):
                 return runners.BashProcessNode(nm, attrs, blackboard, script_path=script_path, ros_node=ros_node)
@@ -1065,7 +1260,16 @@ class Engine():
                 output_keys = [p['key'] for p in entry.get('ports', []) if p.get('direction') == 'output']
                 executable_path, reason = runners.compile_cpp_node(source, entry.get('header_source', ''), cpp_build_dir, name)
                 if executable_path is None:
-                    sync_failures.append({"name": name, "language": "cpp", "reason": reason or "compile failed"})
+                    reason = reason or "compile failed"
+                    previous_build = os.path.join(cpp_build_dir, name)
+                    if os.path.exists(previous_build):
+                        # A failed or timed-out rebuild keeps the last good
+                        # build and its tag (one timeout dropped
+                        # BatteryOkExampleCpp until the next sync).
+                        pending[xml_tag] = runners.make_cpp_node_factory(previous_build, output_keys)
+                        registered_tags.add(xml_tag)
+                        reason += " -- the robot keeps running the previous build of this node"
+                    sync_failures.append({"name": name, "language": "cpp", "reason": reason})
                     continue
                 pending[xml_tag] = runners.make_cpp_node_factory(executable_path, output_keys)
                 registered_tags.add(xml_tag)
@@ -1139,6 +1343,11 @@ class Engine():
         with open(pth, 'w') as file:
             json.dump(tasks, file)
         print(f"[task_sync] synced {len(tasks)} task(s)")
+        # frozen copies of stage versions no task uses any more
+        from .bt_engine.task_sync import prune_hidden_files
+        removed = prune_hidden_files(self.files, tasks)
+        if removed:
+            print(f"[task_sync] removed {len(removed)} unused marked-version file(s)")
 
     def is_this_robot(self, target):
         """A /xparo/run_task message may name its robot ("robot": device id
@@ -1170,10 +1379,14 @@ class Engine():
             return
         if not allow_parallel and run_task.is_running(task_id):
             # A double tap on a kiosk used to start the same delivery twice at once.
+            # No ROS topic stops a run, so the way to stop it is the dashboard's.
+            cached = task_sync.load_custom_tasks(self.files["xparo_custom_behaviors_folder_path"]).get(task_id) or {}
             self._task_finished(run_task.result_message(
                 task_id, None, "busy",
-                "This task is already running on this robot. Wait for it to finish or cancel it first "
-                '(send "allow_parallel": true to run another copy on purpose).', trigger="ros_topic"))
+                "This task is already running on this robot. Wait for it to finish, or stop it with Cancel on "
+                "the task's Task Overview tab in the dashboard "
+                '(send "allow_parallel": true to run another copy on purpose).', trigger="ros_topic",
+                task_title=cached.get("title") or ""))
             return
         if self.bt_executor is None:
             print("[run_task_from_topic] no live bt_executor -- ignoring")
@@ -1191,7 +1404,52 @@ class Engine():
                 trigger="ros_topic",
             ))
             return
+        if val.get("ignored_inputs"):
+            names = ", ".join(repr(name) for name in val["ignored_inputs"])
+            several = len(val["ignored_inputs"]) > 1
+            self._warn_once(("ignored_inputs", task_id, tuple(val["ignored_inputs"])),
+                            f"Task '{val.get('task_title') or task_id}': input {'mappings' if several else 'mapping'} "
+                            f"{names} ignored -- the tree doesn't read {'them' if several else 'it'} (left from an "
+                            f"earlier version of the tree)")
+        if val.get("ignored_overrides"):
+            # every request: it's this caller's message (KUNAL-25); the result says it too
+            self._warn(f"Task '{val.get('task_title') or task_id}': "
+                       f"{run_task.ignored_overrides_note(val['ignored_overrides'])}")
+        if val.get("resync_files"):
+            # a marked version's copy is missing or changed here: report the
+            # files so the dashboard sends the right copies (the run itself
+            # reports invalid_tree, nothing is run)
+            try:
+                self._send_dict({"LOCAL_FILE_STATE": self.get_local_file_state()})
+            except Exception as e:
+                print(f"[run_task_from_topic] couldn't report the file state: {e}")
+        if val.get("input_problems"):
+            # Started with a mapped input missing, a delivery ran with no
+            # dock and reported success (ROSAPI-14): refuse it instead.
+            reason = ("This robot can't fill every input of the task: " + "; ".join(val["input_problems"])
+                      + " -- connect the robot so the environment syncs, or change the input's mapping")
+            print(f"[run_task_from_topic] task {task_id!r} not started: {reason}")
+            self._task_finished(run_task.result_message(
+                task_id, None, "invalid_request", reason, trigger="ros_topic", task_title=val.get("task_title", "")))
+            return
         self._start_task_thread(val)
+
+    def _warn_once(self, key, message):
+        """One WARN in the node's log (/rosout) per key for this process;
+        printed when no ROS node runs this Engine."""
+        if key in self._warned_once:
+            return
+        self._warned_once.add(key)
+        self._warn(message)
+
+    def _warn(self, message):
+        """A WARN in the node's log (/rosout); printed when no ROS node runs
+        this Engine."""
+        node = getattr(self.bt_executor, "node", None)
+        if node is None or not hasattr(node, "get_logger"):
+            print(f"[WARN] {message}")
+            return
+        node.get_logger().warning(message)
 
     def reject_task_request(self, task_id, reason):
         """invalid_request on /xparo/task_result (and in the log) for a
@@ -1232,7 +1490,10 @@ class Engine():
             kwargs={
                 "add_task_history": self.add_task_history,
                 "xparo_stage": self.xparo_stage,
-                "subtree_resolver": lambda name: task_sync.resolve_tree_xml(name, self.files),
+                # (handle_run_task drops it for a marked version: those carry
+                # every SubTree they run)
+                # None for a tree this robot doesn't have, '' for an empty one
+                "subtree_resolver": lambda name: task_sync.resolve_subtree_xml(name, self.files),
                 "on_started": self._task_started,
             },
             daemon=True,
@@ -1285,9 +1546,17 @@ class Engine():
             message = json.loads(message)
         # Only the keys: messages carry ROBOT_CREDENTIAL / REST_API_TOKEN and
         # whole projects (trees, code), which don't belong in a robot's log.
-        print(f"server message: {', '.join(map(str, message.keys())) if isinstance(message, dict) else type(message).__name__}")
+        # Nothing for an empty reply (every REST heartbeat gets one): those
+        # printed thousands of bare "server message: " lines (SANDEEP-22).
+        if message != {}:
+            print(f"server message: {', '.join(map(str, message.keys())) if isinstance(message, dict) else type(message).__name__}")
         if self._using_persisted_credential and not SERVER_REJECTION_KEYS.intersection(message):
             self._credential_retry_delay = CREDENTIAL_RETRY_BASE_SECONDS  # the credential is being served again
+        if SERVER_ACCEPTED_KEY in message and not SERVER_REJECTION_KEYS.intersection(message):
+            accepted = getattr(self.transport, 'on_server_accepted', None)
+            if accepted is not None:
+                accepted()  # the LIVE banner -- not at socket open (AARAV-16)
+            self._server_acks_task_history = bool(message.get("task_history_acks"))
         unhandled = {}
         for k,val in message.items():
             if k=="title":
@@ -1299,11 +1568,7 @@ class Engine():
             elif k=="rules":
                 pass
             elif k=="aiml":
-                content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
-<BehaviorTree ID="MainTree">
-{val}
-</BehaviorTree>
-</root>'''
+                content = tree_file_content(val)
                 self.local_database.load_or_create_file(self.files["behavior"],content)
                 with open(self.files["behavior"], 'w') as file:
                     file.write(content)
@@ -1357,14 +1622,14 @@ class Engine():
                         print(f"[custom_aiml sync] refusing unsafe tree name {kk!r} (path traversal attempt)")
                         continue
                     pth = str(safe_pth)
-                    content =  f'''<root BTCPP_format="4" main_tree_to_execute="MainTree">
-<BehaviorTree ID="MainTree">
-{vv}
-</BehaviorTree>
-</root>'''
-                    self.local_database.load_or_create_file(pth,content)
-                    with open(pth, 'w') as file:
-                        file.write(content)
+                    # Unchanged content is not rewritten: importing a file
+                    # found on this robot sends it straight back.
+                    os.makedirs(os.path.dirname(pth), exist_ok=True)
+                    _write_if_changed(pth, tree_file_content(vv))
+                    if kk.startswith(".xpv."):
+                        # a marked stage version's frozen copy: not part of
+                        # the file sync (never reported, imported or edited)
+                        continue
                     # Fresh Django content is the new authoritative
                     # baseline -- same "Django changed -> update baseline"
                     # outcome the custom_node_files manifest already
@@ -1473,9 +1738,13 @@ class Engine():
                     "registered_tags": sorted(self._custom_node_file_tags),
                     "failures": sync_failures,
                 }})
+                if self._kept_robot_node_edits and "sync_local_database" not in message:
+                    # A robot-side edit was kept: tell the project now, not
+                    # at the next reconnect (it takes it in or raises a
+                    # sync conflict).
+                    self._send_dict({"LOCAL_FILE_STATE": self.get_local_file_state()})
             elif k=="REQUEST_LOCAL_FILE_CONTENT":
-                # Bidirectional file sync (see /home/scientist/.claude/
-                # plans/breezy-splashing-koala.md, Part 5): Django only
+                # Bidirectional file sync: Django only
                 # ever asks for names whose hash it couldn't already
                 # resolve as a clean push-down -- this always answers with
                 # actual content, never decides anything about conflicts
@@ -1487,6 +1756,7 @@ class Engine():
                 self._send_dict({"LOCAL_FILE_CONTENT": self.get_local_file_content(val)})
             elif k=="ROBOT_CREDENTIAL":
                 self._persist_credential(val)
+                self._use_new_credential(val)
             elif k=="get_initial_local_env_data":
                 self.get_initial_local_env_data()
             elif k=="sync_local_database":
@@ -1539,8 +1809,7 @@ class Engine():
                 self.file_transfer.handle_file_chunk(val, self._send_dict)
             elif k=="FILE_COMPLETE":
                 self.file_transfer.handle_file_complete(self._send_dict)
-            # ---- Fleet-management popups ported from the AUV GCS (see
-            # /home/scientist/.claude/plans/breezy-splashing-koala.md) --
+            # ---- Fleet-management popups ported from the AUV GCS --
             # same remote_ops.py "plain function + send_response callback"
             # shape as the Phase 4 remote-ops handlers just above.
             elif k=="REBOOT_ROBOT":
@@ -1665,7 +1934,8 @@ class Engine():
                         and not (val or {}).get("allow_parallel"):
                     self._task_finished(run_task.result_message(
                         val.get("task_id"), val.get("run_id"), "busy",
-                        "This task is already running on this robot. Wait for it to finish or cancel it first."))
+                        "This task is already running on this robot. Wait for it to finish or cancel it first.",
+                        task_title=val.get("task_title") or ""))
                 elif self.bt_executor is not None:
                     self._start_task_thread(val)
                 else:
@@ -1684,6 +1954,11 @@ class Engine():
                 }})
             elif k=="GET_RUNNING_TASKS":
                 self._send_dict({"RUNNING_TASKS": {"runs": run_task.active_runs()}})
+            elif k=="task_history_saved":
+                with self._pending_important_sends_lock:
+                    self._unacked_task_history.pop(str(val), None)
+            elif k=="task_history_acks":
+                pass  # read with SERVER_ACCEPTED_KEY above
             elif k in SERVER_REJECTION_KEYS:
                 # The server's explanation, not just the key: a frozen key
                 # or a retired robot used to log "server message: error"
@@ -1744,17 +2019,7 @@ class Engine():
         behavior_path = self.files["behavior"]
         if os.path.exists(behavior_path):
             with open(behavior_path, 'r') as f:
-                content = f.read()
-                # Extract the content between <BehaviorTree ID="MainTree"> and </BehaviorTree>
-                start = content.find('<BehaviorTree ID="MainTree">')
-                if start != -1:
-                    start += len('<BehaviorTree ID="MainTree">')
-                    end = content.find('</BehaviorTree>', start)
-                    if end != -1:
-                        result["aiml"] = content[start:end].strip()
-                else:
-                    # Fallback: send the whole file if extraction fails
-                    result["aiml"] = content
+                result["aiml"] = tree_from_file_content(f.read())
 
         # ---- Read maps (env file) ----
         env_path = self.files["env"]
@@ -1778,21 +2043,11 @@ class Engine():
         custom_behaviors_path = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
         if os.path.exists(custom_behaviors_path):
             for filename in os.listdir(custom_behaviors_path):
-                if filename.endswith('.xml'):
+                if filename.endswith('.xml') and not filename.startswith('.xpv.'):
+                    # (.xpv.* are marked stage versions' frozen copies: never synced back)
                     filepath = os.path.join(custom_behaviors_path, filename)
                     with open(filepath, 'r') as f:
-                        content = f.read()
-                        # Extract inner content like for main aiml
-                        start = content.find('<BehaviorTree ID="MainTree">')
-                        if start != -1:
-                            start += len('<BehaviorTree ID="MainTree">')
-                            end = content.find('</BehaviorTree>', start)
-                            if end != -1:
-                                result["custom_aiml"][filename[:-4]] = content[start:end].strip()
-                            else:
-                                result["custom_aiml"][filename[:-4]] = content
-                        else:
-                            result["custom_aiml"][filename[:-4]] = content
+                        result["custom_aiml"][filename[:-4]] = tree_from_file_content(f.read())
 
         # ---- Read custom_maps (all .env files in custom_envs/custom_maps) ----
         custom_envs_path = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
@@ -1814,8 +2069,7 @@ class Engine():
 
         return result
 
-    # Bidirectional file sync, "adopt a disk-added file" (see /home/
-    # scientist/.claude/plans/breezy-splashing-koala.md): a file the owner
+    # Bidirectional file sync, "adopt a disk-added file": a file the owner
     # drops directly into a language folder -- not via the dashboard, not
     # in manifest.json/examples_manifest.json at all -- needs to be
     # DISCOVERED before it can even be reported to Django. Only files that
@@ -1829,21 +2083,36 @@ class Engine():
     # once Django has actually ingested this as a CustomFile).
     _JS_NODE_CLASS_RE = re.compile(r"class\s+\w+\s+extends\s+XparoNode")
 
-    def _looks_like_a_node_file(self, language, source):
-        if language == 'python':
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
+    def _python_node_classes(self, file_name, source):
+        """{XML_TAG: class} a python node file defines, {} if it can't be
+        imported. Discovery runs on every sync and file request, and each
+        time imported the file again from a temp copy: one robot-side file
+        with a bad import logged its error dozens of times under
+        '/tmp/tmpXXXX.py', never its own name (NODESYNC-29). Now each version
+        of a file is imported once, and a failure is logged once, by name."""
+        version = sync_hash.content_hash(source)
+        cached = self._python_node_probes.get(file_name)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+            tmp.write(source)
+            tmp_path = tmp.name
+        try:
+            found = plugin_loader.load_plugins([tmp_path], labels={tmp_path: file_name})
+        except Exception:
+            found = {}
+        finally:
             try:
-                return bool(plugin_loader.load_plugins([tmp_path]))
-            except Exception:
-                return False
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        self._python_node_probes[file_name] = (version, found)
+        return found
+
+    def _looks_like_a_node_file(self, language, source, file_name="a python file"):
+        if language == 'python':
+            return bool(self._python_node_classes(file_name, source))
         if language == 'cpp':
             return bool(runners._CPP_CLASS_RE.search(source))
         if language == 'javascript':
@@ -1879,7 +2148,7 @@ class Engine():
                         source = file.read()
                 except OSError:
                     continue
-                if not self._looks_like_a_node_file(language, source):
+                if not self._looks_like_a_node_file(language, source, os.path.join('custom_node_files', language, filename)):
                     continue
                 header_source = ''
                 if language == 'cpp':
@@ -1915,22 +2184,8 @@ class Engine():
         entry's metadata.
         """
         if language == 'python':
-            import tempfile
-            xml_tag = self._pascal_case(name)
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
-            try:
-                found = plugin_loader.load_plugins([tmp_path])
-                if found:
-                    xml_tag = next(iter(found.keys()))
-            except Exception:
-                pass
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+            found = self._python_node_classes(os.path.join('custom_node_files', language, name + '.py'), source)
+            xml_tag = next(iter(found.keys())) if found else self._pascal_case(name)
             return {"xml_tag": xml_tag, "node_type": "action", "ports": []}
 
         if language == 'cpp':
@@ -1960,8 +2215,7 @@ class Engine():
         return {"xml_tag": self._pascal_case(name), "node_type": "action", "ports": []}
 
     def get_local_file_state(self):
-        """Bidirectional file sync (see /home/scientist/.claude/plans/
-        breezy-splashing-koala.md, Part 3): the robot's half of
+        """Bidirectional file sync: the robot's half of
         LOCAL_FILE_STATE -- hash-only, not full content, matching this
         feature's own "don't over-send" ethos (_get_custom_node_files_for_sync
         only ever sends node-exposed files). Django compares these against
@@ -1978,6 +2232,7 @@ class Engine():
         pure read, and this is the only thing that talks to Django, on
         purpose, with actual conflict detection behind it.
         """
+        from .bt_engine import task_sync
         local = self.get_local_files()
 
         custom_aiml_dir = os.path.join(self.files["xparo_custom_behaviors_folder_path"], 'custom_aiml')
@@ -2003,7 +2258,20 @@ class Engine():
         node_files_state = {}
         for name, entry in manifest.items():
             if entry.get('content_hash'):
-                node_files_state[name] = {"content_hash": entry['content_hash'], "language": entry.get('language', '')}
+                # What is on disk now, not the last synced baseline: the
+                # server compares this with that baseline to see an edit
+                # made on this robot (it never could, so edits were
+                # replaced by the next push -- NODESYNC-16).
+                extension = self._CUSTOM_NODE_FILE_EXTENSIONS.get(entry.get('language'))
+                on_disk = self._read_text(os.path.join(node_files_dir, entry.get('language', ''), name + extension)) \
+                    if extension else None
+                disk_hash = sync_hash.content_hash(on_disk, entry.get('header_source', '')) if on_disk is not None else None
+                # synced_hash: the copy the project last sent this robot. The
+                # server's own baseline only settles at a later report, so
+                # a robot-only edit made before then looked like a change
+                # on both sides (a sync conflict, NODESYNC-27).
+                node_files_state[name] = {"content_hash": disk_hash or entry['content_hash'], "language": entry.get('language', ''),
+                                          "synced_hash": entry['content_hash']}
 
         examples_manifest_path = os.path.join(node_files_dir, 'examples_manifest.json')
         examples_manifest = {}
@@ -2042,8 +2310,12 @@ class Engine():
         return {
             "device_id": self.local_database.unique_id,
             "custom_node_files": node_files_state,
-            "custom_aiml": {name: {"content_hash": s["hash"]} for name, s in custom_aiml_state.items()},
+            "custom_aiml": {name: {"content_hash": s["hash"]} for name, s in custom_aiml_state.items()
+                            if not name.startswith(".xpv.")},
             "custom_maps": {name: {"content_hash": s["hash"]} for name, s in custom_maps_state.items()},
+            # marked stage versions' frozen copies on disk: the dashboard
+            # re-sends any that is missing or different
+            "hidden_files": task_sync.hidden_file_hashes(self.files),
         }
 
     def _bootstrap_and_get_sync_state(self, directory, current_content_by_name):
@@ -2063,8 +2335,7 @@ class Engine():
         return state
 
     def get_local_file_content(self, requested):
-        """Bidirectional file sync (see /home/scientist/.claude/plans/
-        breezy-splashing-koala.md, Part 5): the actual current content for
+        """Bidirectional file sync: the actual current content for
         whatever names Django asked for in REQUEST_LOCAL_FILE_CONTENT
         (`{"custom_node_files": [...], "custom_aiml": [...], "custom_maps": [...]}`).
         A name that's disappeared from disk since LOCAL_FILE_STATE was
@@ -2126,12 +2397,7 @@ class Engine():
                     content = file.read()
             except OSError:
                 continue
-            start = content.find('<BehaviorTree ID="MainTree">')
-            if start != -1:
-                start += len('<BehaviorTree ID="MainTree">')
-                end = content.find('</BehaviorTree>', start)
-                content = content[start:end].strip() if end != -1 else content
-            response["custom_aiml"][name] = content
+            response["custom_aiml"][name] = tree_from_file_content(content)
 
         custom_maps_dir = os.path.join(self.files["xparo_custom_evns_folder_path"], 'custom_maps')
         for name in requested.get("custom_maps", []):

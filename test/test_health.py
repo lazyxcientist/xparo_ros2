@@ -47,6 +47,25 @@ def test_a_new_message_for_the_same_component_is_a_separate_problem():
     assert by_message['overheated: 90C']['active'] is True
 
 
+def test_going_stale_keeps_the_error_active_until_an_ok():
+    """R3 review (ROSAPI-20): STALE counted as 'a different problem replaced
+    the error', so the robot's own list said the error was gone although no
+    OK was ever seen. Back from stale in the same error: still one occurrence."""
+    tracker, _ = _tracker()
+    tracker.record_diagnostic('lidar', 'error', 'no scan data')
+    tracker.record_diagnostic('lidar', 'stale', 'no status for over 30s')
+    by_level = {e['level']: e for e in tracker.entries()}
+    assert by_level['error']['active'] is True and by_level['stale']['active'] is True
+
+    tracker.record_diagnostic('lidar', 'error', 'no scan data')
+    by_level = {e['level']: e for e in tracker.entries()}
+    assert by_level['error']['active'] is True and by_level['error']['count'] == 1
+    assert by_level['stale']['active'] is False
+
+    tracker.record_diagnostic('lidar', 'ok', '')
+    assert [e['active'] for e in tracker.entries()] == [False, False]
+
+
 def test_ok_statuses_never_become_problems():
     tracker, _ = _tracker()
     tracker.record_diagnostic('battery', 'ok', '87%')

@@ -1,5 +1,4 @@
-"""Behaviour Tree redesign Phase 13 (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): inline custom-node code authored in the BT
+"""Behaviour Tree redesign Phase 13: inline custom-node code authored in the BT
 editor, shipped to and run on the robot. Reuses Phase 12's
 plugin_loader.register_plugins() against a custom_behaviors/inline_nodes/
 folder instead of an arbitrary path -- these tests cover the sync/persist/

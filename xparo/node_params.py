@@ -14,24 +14,38 @@ from rcl_interfaces.msg import ParameterDescriptor
 
 HIDDEN = "(hidden)"
 
-# Identity and release stage come from the launch; a live change would be
-# silently ignored (the connection is already made), so the parameter
-# server refuses the write instead.
-READ_ONLY = ParameterDescriptor(read_only=True, description="Set at launch; relaunch xparo to change it.")
+# Identity, release stage, transport and file paths come from the launch;
+# a live change would be silently ignored (the connection is made, the
+# paths are read once), so the parameter server refuses the write instead.
+READ_ONLY_DESCRIPTION = "Set at launch; relaunch xparo to change it."
 
 
-def declare_identity_parameter(node, name, default):
+def _read_only(name):
+    # One descriptor per parameter: declare_parameter writes the name into
+    # the object it is given, so a shared one made `ros2 param describe`
+    # call every read-only parameter "xparo_folder" (ROSAPI-12).
+    return ParameterDescriptor(name=name, read_only=True, description=READ_ONLY_DESCRIPTION)
+
+
+def declare_launch_parameter(node, name, default):
     """Like node.declare_parameter(name, default).value, read-only."""
-    return node.declare_parameter(name, default, READ_ONLY).value
+    return node.declare_parameter(name, default, _read_only(name)).value
+
+
+declare_identity_parameter = declare_launch_parameter
 
 
 def declare_secret_parameter(node, name, default):
-    """Returns the value the launch supplied, then replaces the parameter
-    with a read-only HIDDEN placeholder so the real value is gone from the
-    parameter server (ignore_override: otherwise the launch override would
-    come straight back on re-declaration). The dashboard's ROS2 Parameters
-    tool already masked it; this closes the `ros2 param get` path."""
-    value = node.declare_parameter(name, default).value
-    node.undeclare_parameter(name)
-    node.declare_parameter(name, HIDDEN, READ_ONLY, ignore_override=True)
+    """Returns the value the launch supplied and declares the parameter as
+    a read-only HIDDEN placeholder (ignore_override: the launch's value
+    never reaches the parameter server). The value is read from the node's
+    overrides, not by declaring it: every declaration publishes the value
+    on /parameter_events, so declaring it first and swapping in HIDDEN
+    still showed the key to `ros2 topic echo /parameter_events` (R3 review).
+    The dashboard's ROS2 Parameters tool already masked it."""
+    # rclpy has no public reader for a node's overrides; this is the dict
+    # declare_parameter itself reads them from.
+    override = getattr(node, "_parameter_overrides", {}).get(name)
+    value = default if override is None else override.value
+    node.declare_parameter(name, HIDDEN, _read_only(name), ignore_override=True)
     return value

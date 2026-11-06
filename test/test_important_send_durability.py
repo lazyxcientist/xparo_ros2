@@ -11,6 +11,7 @@ queue a failed important send and retry it on the next successful
 (re)connection (send_initial_data, the transport's own on_connected
 callback) instead of just losing it.
 """
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -131,6 +132,99 @@ class TestAddTaskHistoryIsDurable:
 
         assert len(sent) == 1
         assert engine._pending_important_sends == []
+
+
+class TestAHistoryRecordTheServerDidntStoreIsResent:
+    """R3 review (fleet-robot-api-9): the send worked, the server's write
+    failed (lab: SQLite 'database is locked'; prod: a DB hiccup or a restart
+    mid-write) and that run never showed in Task history -- only a transport
+    failure was ever retried."""
+
+    RECORD = {"input_data": {"task_id": "abc", "run_id": "7e92"}, "output_data": {"success": True},
+              "type": "bt_task", "created_at": "2026-11-04T00:00:00"}
+
+    def _connected_engine(self, acks=True):
+        from xparo import engine as engine_module
+        engine = _make_engine()
+        sent = []
+        engine.private_send = lambda msg, **k: sent.append(msg)
+        engine.transport.websocket_connected = True
+        engine.local_database.dashboard_receive = lambda *a, **k: None
+        reply = {engine_module.SERVER_ACCEPTED_KEY: 1}
+        if acks:
+            reply["task_history_acks"] = True
+        engine.on_ws_message("ws", reply)
+        return engine, sent
+
+    def test_no_answer_means_it_is_sent_again(self):
+        engine, sent = self._connected_engine()
+        engine.add_task_history(self.RECORD)
+        assert len(sent) == 1
+
+        engine._resend_unacked_task_history(now=time.monotonic() + 5)       # still waiting for the answer
+        assert len(sent) == 1
+        engine._resend_unacked_task_history(now=time.monotonic() + 31)
+        assert len(sent) == 2 and sent[1] == sent[0]
+
+    def test_the_servers_answer_stops_the_resends(self):
+        engine, sent = self._connected_engine()
+        engine.add_task_history(self.RECORD)
+
+        engine.on_ws_message("ws", {"task_updated": "41", "task_history_saved": "7e92"})
+        engine._resend_unacked_task_history(now=time.monotonic() + 3600)
+
+        assert len(sent) == 1
+
+    def test_a_server_that_never_answers_this_gets_no_resends(self):
+        # An older server stores every send as a new row: resending to it would double the history.
+        engine, sent = self._connected_engine(acks=False)
+        engine.add_task_history(self.RECORD)
+        engine._resend_unacked_task_history(now=time.monotonic() + 3600)
+        assert len(sent) == 1
+
+    def test_it_gives_up_after_a_few_tries(self):
+        from xparo import engine as engine_module
+        engine, sent = self._connected_engine()
+        engine.add_task_history(self.RECORD)
+        later = time.monotonic()
+        for _ in range(20):
+            later += 3600
+            engine._resend_unacked_task_history(now=later)
+        assert len(sent) == engine_module.TASK_HISTORY_MAX_SENDS
+        assert engine._unacked_task_history == {}
+
+    def test_a_record_waiting_in_the_offline_queue_is_not_sent_twice(self):
+        engine, sent = self._connected_engine()
+        engine.private_send = MagicMock(side_effect=BrokenPipeError("down"))
+        engine.add_task_history(self.RECORD)
+        engine.private_send = lambda msg, **k: sent.append(msg)
+
+        engine._resend_unacked_task_history(now=time.monotonic() + 3600)   # the reconnect flush sends it
+        assert sent == []
+
+    def test_the_reconnect_flush_counts_as_the_send_its_answer_waits_for(self):
+        engine, sent = self._connected_engine()
+        engine.private_send = MagicMock(side_effect=BrokenPipeError("down"))
+        engine.add_task_history(self.RECORD)
+        engine._unacked_task_history["7e92"]["sent_at"] -= 60    # a minute offline
+        engine.private_send = lambda msg, **k: sent.append(msg)
+
+        engine._flush_pending_important_sends()                   # reconnected
+        engine._resend_unacked_task_history(now=time.monotonic() + 2)   # the next tick
+
+        assert len(sent) == 1
+
+    def test_a_resend_over_the_rest_fallback_waits_its_turn_too(self):
+        # Over the REST fallback _try_send_dict says "not delivered" (the
+        # socket is down), so the record was resent on every 2 s tick.
+        engine, sent = self._connected_engine()
+        engine.add_task_history(self.RECORD)
+        engine.transport.websocket_connected = False
+        engine.transport.rest_fallback_active = True
+        later = time.monotonic() + 31
+        for tick in range(10):
+            engine._resend_unacked_task_history(now=later + 2 * tick)
+        assert len(sent) == 2
 
 
 class TestRunTaskResultSurvivesADisconnect:

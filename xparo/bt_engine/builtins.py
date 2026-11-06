@@ -38,13 +38,17 @@ class NodeConfigError(Exception):
     """A node's ports hold a value it can't use (e.g. num_cycles="abc")."""
 
 
-def attr_value(attrs, blackboard, key, default=None):
-    """One port's value: a literal, or blackboard[name] for "{name}"."""
+def attr_value(attrs, blackboard, key, default=None, required=False):
+    """One port's value: a literal, or blackboard[name] for "{name}".
+    A required port whose "{name}" isn't on the blackboard is an error, not
+    the default (<Timeout msec="{t}"> with no t said "timed out after 0 ms")."""
     raw = attrs.get(key)
     if raw is None:
         return default
     match = _PLACEHOLDER_RE.match(raw)
     if match:
+        if required and match.group(1) not in blackboard:
+            raise NodeConfigError(f"{key} comes from blackboard entry {match.group(1)!r}, which isn't set")
         return blackboard.get(match.group(1), default)
     return raw
 
@@ -57,20 +61,32 @@ def output_key(attrs, key):
     return raw
 
 
-def int_value(attrs, blackboard, key, default):
-    value = attr_value(attrs, blackboard, key, default)
+def int_value(attrs, blackboard, key, default, required=False, minimum=None):
+    value = attr_value(attrs, blackboard, key, default, required)
     try:
-        return int(float(value))
+        number = int(float(value))
     except (TypeError, ValueError):
         raise NodeConfigError(f"{key}={value!r} is not a whole number")
+    return _at_least(key, value, number, minimum)
 
 
-def float_value(attrs, blackboard, key, default):
-    value = attr_value(attrs, blackboard, key, default)
+def float_value(attrs, blackboard, key, default, required=False, minimum=None):
+    value = attr_value(attrs, blackboard, key, default, required)
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         raise NodeConfigError(f"{key}={value!r} is not a number")
+    return _at_least(key, value, number, minimum)
+
+
+def _at_least(key, value, number, minimum):
+    """BT.CPP's times are unsigned and its counts take -1 for "forever";
+    delay_msec="-5" used to run as 0 and num_cycles="-5" forever, silently."""
+    if minimum is None or number >= minimum:
+        return number
+    if minimum == -1:
+        raise NodeConfigError(f"{key}={value!r} must be -1 (forever) or 0 or more")
+    raise NodeConfigError(f"{key}={value!r} can't be negative")
 
 
 def count_from(value, n_children):
@@ -141,10 +157,10 @@ class Sleep(_PortsMixin, py_trees.behaviour.Behaviour):
     def update(self):
         if self._until is None:
             try:
-                msec = float_value(self.attrs, self.blackboard, "msec", 0)
+                msec = float_value(self.attrs, self.blackboard, "msec", 0, minimum=0)
             except NodeConfigError as e:
                 return self._fail(str(e))
-            self._until = time.monotonic() + max(msec, 0) / 1000.0
+            self._until = time.monotonic() + msec / 1000.0
         return S.RUNNING if time.monotonic() < self._until else S.SUCCESS
 
 
@@ -266,7 +282,7 @@ class Repeat(_Decorator):
     """num_cycles times while the child succeeds (-1 = forever)."""
 
     def configure(self):
-        self.cycles = int_value(self.attrs, self.blackboard, "num_cycles", 1)
+        self.cycles = int_value(self.attrs, self.blackboard, "num_cycles", 1, required=True, minimum=-1)
         self.done = 0
 
     def step(self):
@@ -287,7 +303,7 @@ class RetryUntilSuccessful(_Decorator):
     """Retries a failing child up to num_attempts times (-1 = forever)."""
 
     def configure(self):
-        self.attempts = int_value(self.attrs, self.blackboard, "num_attempts", 1)
+        self.attempts = int_value(self.attrs, self.blackboard, "num_attempts", 1, required=True, minimum=-1)
         self.failures = 0
 
     def step(self):
@@ -323,7 +339,7 @@ class Delay(_Decorator):
     """Waits delay_msec before ticking its child."""
 
     def configure(self):
-        self.until = time.monotonic() + max(float_value(self.attrs, self.blackboard, "delay_msec", 0), 0) / 1000.0
+        self.until = time.monotonic() + float_value(self.attrs, self.blackboard, "delay_msec", 0, required=True, minimum=0) / 1000.0
 
     def step(self):
         if time.monotonic() < self.until:
@@ -336,8 +352,8 @@ class Timeout(_Decorator):
     """FAILURE if the child is still RUNNING after msec."""
 
     def configure(self):
-        self.msec = float_value(self.attrs, self.blackboard, "msec", 0)
-        self.deadline = time.monotonic() + max(self.msec, 0) / 1000.0
+        self.msec = float_value(self.attrs, self.blackboard, "msec", 0, required=True, minimum=0)
+        self.deadline = time.monotonic() + self.msec / 1000.0
 
     def step(self):
         yield from self.decorated.tick()
@@ -710,8 +726,29 @@ NODE_ARITY.update({f"Switch{n}": (n + 1, n + 1) for n in range(2, 7)})
 # Ports a node can't do anything sensible without: validate_tree rejects
 # the tree before it runs, like a missing child. A <Timeout> with no msec
 # used to pass the pre-run check and then fail at run time with "timed
-# out after 0 ms" (2026-10-31 field test).
-REQUIRED_PORTS = {"Timeout": ("msec",)}
+# out after 0 ms" (2026-10-31 field test); Delay, RetryUntilSuccessful and
+# Repeat without theirs ran silently as "0 ms" / "once" (BT.CPP requires all
+# four, so such a tree also fails in Groot2).
+REQUIRED_PORTS = {"Timeout": ("msec",), "Delay": ("delay_msec",), "RetryUntilSuccessful": ("num_attempts",),
+                  "Repeat": ("num_cycles",)}
+# How each of them is read when the node starts (number kind, smallest value).
+_REQUIRED_PORT_VALUES = {"msec": (float_value, 0), "delay_msec": (float_value, 0), "num_attempts": (int_value, -1),
+                         "num_cycles": (int_value, -1)}
+
+
+def required_port_problem(port, raw):
+    """Why a literal value of a required port can't be used ("" if it can):
+    the same check the node makes when it starts, made before the run."""
+    if port not in _REQUIRED_PORT_VALUES:
+        return ""  # a required port that isn't a number: presence is all validate_tree checks
+    kind, minimum = _REQUIRED_PORT_VALUES[port]
+    try:
+        kind({port: raw}, {}, port, None, minimum=minimum)
+    except NodeConfigError as e:
+        return str(e)
+    return ""
+
+
 for _tag in ("Sequence", "Fallback", "Selector", "ReactiveSequence", "ReactiveFallback", "Parallel", "ParallelAll",
              "SequenceWithMemory", "SequenceStar", "AsyncSequence", "AsyncFallback"):
     # 0, not 1: an empty control is harmless (it just succeeds) and older

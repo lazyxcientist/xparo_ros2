@@ -16,6 +16,7 @@ from threading import Thread
 from .blackbox_manager import BlackboxOrchestrator
 from .connectivity import detect_connectivity
 from .ota import summary as ota_summary
+from .health import CAPABILITIES as HEALTH_CAPABILITIES
 
 
 def _fixed_location(value):
@@ -28,10 +29,15 @@ def _fixed_location(value):
 
 
 class XP_Database():
-    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None):
+    def __init__(self, xparo_database_size, xparo_database_path,xparo_website_url,BAG_DIR,record_bags,rosbag_control=None,
+                 xparo_stage=None):
         # Parameters
         self.xparo_database_size = xparo_database_size  # Size in MB
         self.xparo_database_path = xparo_database_path
+        # The launch's xparo_stage (read-only, so fixed for this process):
+        # sent in the robot info so the project's website doesn't count a
+        # development/testing/review robot as one in service.
+        self.xparo_stage = xparo_stage
         self.unique_id = self.get_device_uuid()
         # self.xparo_website_url = ""
 
@@ -302,7 +308,14 @@ class XP_Database():
             # Whether this install can update itself (git checkout in a
             # colcon workspace) and what it's on -- the dashboard's OTA button.
             "ota": ota_summary(),
+            # How this package reports problems (health.py) -- the dashboard's
+            # Needs Attention handles older packages differently.
+            "health": dict(HEALTH_CAPABILITIES),
         }
+        if self.xparo_stage:
+            # development / testing / review / production: only production
+            # counts as "in service" on the project's website.
+            return_dict['data']['xparo_stage'] = str(self.xparo_stage)
 
         # No command_for override, unlike ROBOT_HEARTBEAT just below this --
         # this is deliberately sent over whichever transport is actually

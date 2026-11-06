@@ -917,6 +917,54 @@ def test_server_rejections_are_printed_with_their_explanation(capsys):
     assert "robot_retired: This robot was retired from the project" in capsys.readouterr().out
 
 
+def test_an_empty_server_reply_prints_nothing(capsys):
+    """SANDEEP-22: every heartbeat's empty REST reply printed a bare
+    "server message: " -- thousands of them on a healthy robot, scrolling
+    the real messages away."""
+    engine = _make_engine()
+    engine.call_message = lambda message, **kwargs: None
+    capsys.readouterr()  # the start-up lines
+
+    engine.on_ws_message('rest', {})
+    assert capsys.readouterr().out == ""
+
+    engine.on_ws_message('ws', {"update_success": 12})
+    engine.on_ws_message('ws', {"error": "Log entry not found"})
+    out = capsys.readouterr().out
+    assert "server message: update_success" in out
+    assert "XPARO server: error: Log entry not found" in out
+
+
+def test_robot_serial_in_use_is_printed_with_its_explanation(capsys):
+    """SANDEEP-13: a unit started with a serial another machine already
+    uses printed only "server message: robot_serial_in_use" -- the
+    server's sentence saying what to do never reached the terminal."""
+    engine = _make_engine()
+    engine.call_message = lambda message, **kwargs: None
+    engine.on_ws_message('ws', {"robot_serial_in_use": "Serial CS-1002 is already registered to another machine. "
+                                                       "Give this unit its own XPARO_DEVICE_ID."})
+    out = capsys.readouterr().out
+    assert "robot_serial_in_use: Serial CS-1002 is already registered to another machine" in out
+    assert "XPARO_DEVICE_ID" in out
+
+
+def test_the_live_banner_is_announced_only_once_the_server_accepts_the_robot():
+    """AARAV-16: the socket opening isn't acceptance -- a refused robot's
+    socket opens too, and the server answers other messages (log_updated)
+    before its refusal. Only ADD_robots_info's accepted reply counts."""
+    engine = _make_engine()
+    engine.call_message = lambda message, **kwargs: None
+    engine.transport = MagicMock()
+
+    engine.on_ws_message('ws', {"message": "hi"})
+    engine.on_ws_message('ws', {"robot_serial_in_use": "Serial CS-1002 is already registered"})
+    engine.on_ws_message('ws', {"robot_credential_required": "This robot signs in with its own credential"})
+    engine.transport.on_server_accepted.assert_not_called()
+
+    engine.on_ws_message('ws', {"robot_info_added": 7})
+    engine.transport.on_server_accepted.assert_called_once()
+
+
 def test_a_rejected_persisted_credential_is_kept_on_disk(tmp_path):
     """CHAOS-6: the robot deleted its own credential.json on a 403, so a
     temporary key freeze left it able to sign in only with a secret key
@@ -960,3 +1008,83 @@ def test_robot_credential_required_swaps_back_to_the_saved_credential(tmp_path):
     assert transport_cls.call_args.kwargs["on_persisted_credential_rejected"] == engine._fall_back_to_raw_secret
     assert engine._using_persisted_credential is True
     transport_cls.return_value.connect.assert_called_once()
+
+    # The second message's timer fires later: the credential is already in
+    # use, so it must not tear that connection down and open another.
+    with patch("xparo.engine.DjangoWsTransport") as transport_cls:
+        timers[1][1]()
+    transport_cls.assert_not_called()
+
+
+def test_a_credential_issued_in_this_process_is_used_for_the_next_reconnect(tmp_path):
+    """CHAOS-16: joined with the project secret, got ROBOT_CREDENTIAL, and
+    the next reconnect still signed in with the secret -> robot_credential_
+    required, a server-side sign-in error, a swap 5 s later."""
+    engine = _make_engine(connection_type="websocket")  # transport made, never connected here
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine.call_message = lambda message, **kwargs: None
+    assert "/secret/" in engine.transport.socket_full_url
+
+    engine.on_ws_message('ws', {"ROBOT_CREDENTIAL": "cred-new"})
+
+    assert json.loads((tmp_path / "credential.json").read_text())["value"] == "cred-new"
+    assert "/ws/chatbot_api/cred-new/proj-engine-test/" in engine.transport.socket_full_url
+    assert "/chatbot_api/cred-new/proj-engine-test/" in engine.transport.website_full_url
+    # A 403 on that credential still falls back to the launch's secret key.
+    assert engine.transport.on_persisted_credential_rejected == engine._fall_back_to_raw_secret
+    assert engine._using_persisted_credential is True
+    timers = []
+    with patch("xparo.engine.threading.Timer", side_effect=lambda delay, fn: timers.append(delay) or MagicMock()):
+        engine.on_ws_message('ws', {"robot_credential_required": "This robot signs in with its own credential"})
+    assert timers == []  # nothing left to swap
+
+
+def test_a_refused_project_key_goes_back_to_the_robots_own_credential(tmp_path, capsys):
+    """CHAOS-23: on its own credential, launch key deleted, robot retired:
+    the credential got a 403, the robot fell back to the (deleted) project
+    key and retried only that, still 403 minutes after Restore, until
+    someone restarted it on site. It now signs in with its own credential
+    again after a wait that grows while both keep being refused."""
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")
+    engine._persist_credential("cred-abc")
+    forbidden = MagicMock()
+    forbidden.status_code = 403
+    timers = []
+
+    with patch("xparo.engine.threading.Timer",
+               side_effect=lambda delay, fn: timers.append((delay, fn)) or MagicMock()):
+        engine._fall_back_to_raw_secret()  # retired: the credential got its 403
+        assert "/secret/" in engine.transport.socket_full_url
+        engine.transport.on_ws_error(None, forbidden)  # the project key is deleted
+        assert "rejected the project secret key" in capsys.readouterr().out
+        assert [delay for delay, _ in timers] == [5]
+
+        timers[0][1]()  # the swap
+        assert "/cred-abc/" in engine.transport.socket_full_url
+        assert engine._using_persisted_credential is True
+
+        # Still retired: the credential is refused, the project key too.
+        engine.transport.on_ws_error(None, forbidden)
+        assert "/secret/" in engine.transport.socket_full_url
+        engine.transport.on_ws_error(None, forbidden)
+        assert [delay for delay, _ in timers] == [5, 10]
+        engine.transport.on_ws_error(None, forbidden)  # once per transport
+        assert len(timers) == 2
+
+        timers[1][1]()  # restored by now: the credential is served again
+        assert "/cred-abc/" in engine.transport.socket_full_url
+    engine.call_message = lambda message, **kwargs: None
+    engine.on_ws_message('ws', {"robot_info_added": 7})
+    assert engine._credential_retry_delay == 5
+
+
+def test_a_refused_project_key_without_a_saved_credential_just_keeps_retrying(tmp_path):
+    engine = _make_engine()
+    engine.xparo_credential_path = str(tmp_path / "credential.json")  # never issued one
+    forbidden = MagicMock()
+    forbidden.status_code = 403
+    with patch("xparo.engine.threading.Timer") as timer:
+        engine.transport.on_ws_error(None, forbidden)
+    timer.assert_not_called()
+    assert "/secret/" in engine.transport.socket_full_url

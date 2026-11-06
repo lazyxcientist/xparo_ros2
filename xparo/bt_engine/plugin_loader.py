@@ -66,19 +66,20 @@ def _load_module(path_or_dotted):
     return importlib.import_module(path_or_dotted)
 
 
-def load_plugins(paths):
+def load_plugins(paths, labels=None):
     """Returns {XML_TAG: class} for every CustomBTNode subclass found
     across every given path. A path that fails to load, or loads cleanly
     but defines no CustomBTNode subclass, contributes nothing -- never
     raises -- so one bad or irrelevant entry in a project's plugin list
-    doesn't take down every other plugin.
+    doesn't take down every other plugin. `labels` ({path: name}) names a
+    temp copy in the log by the file it was made from.
     """
     registry = {}
     for path in paths:
         try:
             module = _load_module(path)
         except Exception as e:
-            print(f"[bt_engine plugin_loader] failed to load {path!r}: {e}")
+            print(f"[bt_engine plugin_loader] failed to load {(labels or {}).get(path, path)!r}: {e}")
             continue
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if obj is CustomBTNode:

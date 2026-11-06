@@ -1,5 +1,4 @@
-"""Bidirectional file sync (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md, Part 3): get_local_files()'s new pure-read
+"""Bidirectional file sync: get_local_files()'s new pure-read
 behavior (no more private_send side effect) and get_local_file_state()'s
 hash-only LOCAL_FILE_STATE shape, including bootstrap-on-read for
 custom_aiml/custom_maps entries with no prior sync_state.json.
@@ -185,3 +184,102 @@ class TestGetLocalFilesSyncStateNotRewritten:
 
         persisted = json.loads((aiml_dir / "sync_state.json").read_text())
         assert persisted["tree"]["synced_at"] == "2020-01-01T00:00:00"  # untouched, not re-stamped
+
+
+# MEG-12: a Groot2 save found on a robot -> "Import into project" sent it to
+# the server whole, the server sent it back, and the robot wrapped it in a
+# second <root><BehaviorTree ID="MainTree">, putting the <?xml?> prolog on
+# line 3 ("XML or text declaration not at start of entity").
+GROOT2_DOC = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<root BTCPP_format="4">\n'
+    '  <BehaviorTree ID="MedDelivery">\n'
+    '    <Sequence><SubTree ID="GoToRoom" goal="{room}"/><Wait name="डिलीवरी"/></Sequence>\n'
+    '  </BehaviorTree>\n'
+    '  <BehaviorTree ID="GoToRoom">\n'
+    '    <RoomIsFree room="{goal}"/>\n'
+    '  </BehaviorTree>\n'
+    '  <TreeNodesModel><Condition ID="RoomIsFree"><input_port name="room"/></Condition></TreeNodesModel>\n'
+    '</root>\n'
+)
+
+
+class TestWholeTreeDocumentsAreKeptAsTheyAre:
+    def test_a_synced_groot2_document_is_written_exactly_as_it_is(self, tmp_path):
+        import xml.etree.ElementTree as ET
+        engine = _make_engine(tmp_path)
+
+        engine.on_ws_message('ws', {"custom_aiml": {"med_delivery_groot": GROOT2_DOC}})
+
+        written = (tmp_path / "custom_behaviors" / "custom_aiml" / "med_delivery_groot.xml").read_text()
+        assert written == GROOT2_DOC
+        assert [t.get("ID") for t in ET.fromstring(written).iter("BehaviorTree")] == ["MedDelivery", "GoToRoom"]
+
+    def test_importing_a_file_found_on_the_robot_leaves_the_robots_file_untouched(self, tmp_path):
+        import os
+        engine = _make_engine(tmp_path)
+        aiml_dir = tmp_path / "custom_behaviors" / "custom_aiml"
+        aiml_dir.mkdir(parents=True)
+        robot_file = aiml_dir / "ward_run.xml"
+        ward_run = '<root BTCPP_format="4">\n<BehaviorTree ID="ward_run">\n<AlwaysSuccess/>\n</BehaviorTree>\n</root>\n'
+        robot_file.write_text(ward_run)
+        os.utime(robot_file, (1_000_000, 1_000_000))
+
+        sent_up = engine.get_local_file_content({"custom_aiml": ["ward_run"]})["custom_aiml"]["ward_run"]
+        engine.on_ws_message('ws', {"custom_aiml": {"ward_run": sent_up}})  # the server's push after the import
+
+        assert sent_up == ward_run
+        assert robot_file.read_text() == ward_run
+        assert robot_file.stat().st_mtime == 1_000_000
+
+    def test_a_document_whose_main_tree_is_maintree_is_sent_whole_with_its_subtrees(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        aiml_dir = tmp_path / "custom_behaviors" / "custom_aiml"
+        aiml_dir.mkdir(parents=True)
+        doc = ('<root BTCPP_format="4" main_tree_to_execute="MainTree">\n'
+               '<BehaviorTree ID="MainTree">\n<SubTree ID="Dock"/>\n</BehaviorTree>\n'
+               '<BehaviorTree ID="Dock">\n<AlwaysSuccess/>\n</BehaviorTree>\n</root>')
+        (aiml_dir / "two_trees.xml").write_text(doc)
+
+        response = engine.get_local_file_content({"custom_aiml": ["two_trees"]})
+
+        assert response["custom_aiml"]["two_trees"] == doc  # not cut down to MainTree's body
+
+    def test_a_file_wrapped_twice_before_the_fix_reads_back_as_the_original_document(self, tmp_path):
+        engine = _make_engine(tmp_path)
+        aiml_dir = tmp_path / "custom_behaviors" / "custom_aiml"
+        aiml_dir.mkdir(parents=True)
+        (aiml_dir / "med_delivery_groot.xml").write_text(
+            f'<root BTCPP_format="4" main_tree_to_execute="MainTree">\n<BehaviorTree ID="MainTree">\n'
+            f'{GROOT2_DOC}\n</BehaviorTree>\n</root>'
+        )
+
+        response = engine.get_local_file_content({"custom_aiml": ["med_delivery_groot"]})
+
+        assert response["custom_aiml"]["med_delivery_groot"] == GROOT2_DOC.strip()
+
+    def test_a_plain_fragment_is_still_wrapped(self, tmp_path):
+        engine = _make_engine(tmp_path)
+
+        engine.on_ws_message('ws', {"custom_aiml": {"t": "<Sequence></Sequence>"}})
+
+        written = (tmp_path / "custom_behaviors" / "custom_aiml" / "t.xml").read_text()
+        assert written.startswith('<root BTCPP_format="4" main_tree_to_execute="MainTree">\n<BehaviorTree ID="MainTree">\n')
+        assert engine.get_local_file_content({"custom_aiml": ["t"]})["custom_aiml"]["t"] == "<Sequence></Sequence>"
+
+    def test_a_task_on_a_groot2_tree_runs_it_with_its_subtrees(self, tmp_path):
+        from xparo.bt_engine import task_sync
+        engine = _make_engine(tmp_path)
+        engine.on_ws_message('ws', {"custom_aiml": {"med": GROOT2_DOC}})
+
+        tree_xml = task_sync.resolve_tree_xml("med", engine.files)
+
+        assert tree_xml == GROOT2_DOC
+
+    def test_a_document_saved_with_a_utf8_bom_is_not_wrapped(self, tmp_path):
+        engine = _make_engine(tmp_path)
+
+        engine.on_ws_message('ws', {"custom_aiml": {"bom_doc": "﻿" + GROOT2_DOC}})
+
+        written = (tmp_path / "custom_behaviors" / "custom_aiml" / "bom_doc.xml").read_text()
+        assert written == "﻿" + GROOT2_DOC

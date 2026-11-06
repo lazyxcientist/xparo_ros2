@@ -71,6 +71,73 @@ def test_handle_run_command_truncates_to_tail():
     assert lines[-1] == "199"
 
 
+def test_handle_run_command_caps_one_huge_line_by_bytes():
+    """RO-1: a single 3 MB line passed the line cap whole and the server
+    dropped the robot's connection over the oversized message."""
+    cmd = "head -c 3000000 /dev/zero | tr '\\0' 'x'; echo; echo END-OF-LONG-LINE"
+    responses = []
+    remote_ops.handle_run_command(cmd, "req-big", 30.0, responses.append)
+    result = responses[0]["COMMAND_RESULT"]
+    assert result["exit_code"] == 0
+    assert result["truncated"] is True
+    assert len(result["output"].encode()) <= remote_ops.MAX_COMMAND_OUTPUT_BYTES + 100
+    assert result["output"].endswith("END-OF-LONG-LINE")
+
+
+def _process_is_gone(pid, wait_sec=3.0):
+    deadline = time.monotonic() + wait_sec
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().split(")")[-1].split()[0] == "Z":
+                    return True
+        except FileNotFoundError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_handle_run_command_timeout_kills_the_commands_children_too(tmp_path):
+    """RO-2: only the /bin/sh wrapper used to die on timeout; whatever it
+    had started kept running while the dashboard said "killed"."""
+    pid_file = tmp_path / "child.pid"
+    cmd = f"sleep 60 & echo $! > {pid_file}; wait; echo never-printed"
+    responses = []
+    remote_ops.handle_run_command(cmd, "req-orphan", 1.0, responses.append)
+    result = responses[0]["COMMAND_RESULT"]
+    assert result["timed_out"] is True
+    assert "never-printed" not in result["output"]
+    child_pid = int(pid_file.read_text().strip())
+    try:
+        assert _process_is_gone(child_pid), "the command's child outlived its timeout"
+    finally:
+        try:
+            os.kill(child_pid, 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_handle_run_command_timeout_keeps_output_printed_before_the_kill():
+    responses = []
+    remote_ops.handle_run_command("echo started; sleep 30", "req-partial", 1.0, responses.append)
+    result = responses[0]["COMMAND_RESULT"]
+    assert result["timed_out"] is True
+    assert "started" in result["output"]
+    assert "timeout" in result["output"]
+
+
+def test_handle_run_command_survives_non_utf8_output():
+    """RO-3: one bad byte used to lose the whole output and the exit code."""
+    responses = []
+    remote_ops.handle_run_command("printf 'before\\n\\377\\376 binary\\nafter\\n'", "req-bin", 5.0, responses.append)
+    result = responses[0]["COMMAND_RESULT"]
+    assert result["exit_code"] == 0
+    assert result["success"] is True
+    assert "before" in result["output"]
+    assert "after" in result["output"]
+    assert "binary" in result["output"]
+
+
 # ------------------------------------------------------------------
 # Teleop
 # ------------------------------------------------------------------
@@ -643,6 +710,16 @@ def test_handle_list_ros2_params_real_subprocess_reports_a_clean_error_for_a_mis
     assert "/definitely_not_a_real_node_xyz" in result["errors"][0]
 
 
+def test_handle_list_ros2_params_skips_hidden_ros_internal_nodes():
+    """RO-10: the ros2 CLI daemon showed up as a node that "couldn't be read"."""
+    node = _FakeRos2Node(nodes=[("_ros2cli_daemon_129_abc", "/"), ("_hidden", "/ns")])
+    responses = []
+    with patch('xparo.remote_ops.subprocess.run') as run:
+        remote_ops.handle_list_ros2_params(node, responses.append)
+    run.assert_not_called()
+    assert responses[0]["ROS2_PARAMS"] == {"params": [], "errors": []}
+
+
 def test_handle_list_ros2_params_stops_within_its_total_time_budget():
     node = _FakeRos2Node(nodes=[("definitely_not_a_real_node_xyz", "/")])
     responses = []
@@ -724,6 +801,36 @@ def test_get_rosbag_status_flags_a_process_recorder_control_cant_identify():
         status = remote_ops.get_rosbag_status(control)
     assert status["recorder_alive"] is False
     assert status["process_detected"] is True
+
+
+class _FakeDiscoveryClient:
+    def __init__(self, ready):
+        self.ready = ready
+
+    def service_is_ready(self):
+        return self.ready
+
+
+def test_rosbag_start_without_a_recorder_says_why():
+    """RO-8: Start on a robot with no recorder answered state 'unknown'
+    and nothing else; the robot only logged the reason."""
+    control = _FakeRosbagControl(state="unknown", recorder_alive=False)
+    control.handle_start = lambda: None  # the real one just waits for a recorder
+    control.is_discovery_client = _FakeDiscoveryClient(ready=False)
+    responses = []
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=False):
+        remote_ops.handle_rosbag_action(control, "start", responses.append)
+    result = responses[0]["ROSBAG_ACTION_RESULT"]
+    assert result["no_recorder"] is True
+    assert "record_bags:=true" in result["message"]
+
+
+def test_rosbag_status_has_no_reason_when_a_recorder_is_up_but_not_settled():
+    control = _FakeRosbagControl(state="unknown", recorder_alive=False)
+    control.is_discovery_client = _FakeDiscoveryClient(ready=True)
+    with patch('xparo.rosbag_control.is_any_rosbag_process_running', return_value=False):
+        status = remote_ops.get_rosbag_status(control)
+    assert "no_recorder" not in status and "message" not in status
 
 
 def test_handle_rosbag_action_start_calls_handle_start():
@@ -816,6 +923,58 @@ def test_handle_run_command_default_max_lines_unchanged_when_not_specified():
     result = responses[0]["COMMAND_RESULT"]
     assert len(result["output"].splitlines()) == remote_ops.RUN_COMMAND_MAX_LINES
     assert result["max_lines"] == remote_ops.RUN_COMMAND_MAX_LINES
+
+
+def _cli_result(stdout="", stderr="", returncode=0):
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_set_param_refused_by_the_node_is_not_reported_as_success():
+    """RO-9: `ros2 param set` exits 0 when the node refuses the value; the
+    refusal came back as success:true (green check in the dashboard)."""
+    refusal = "Setting parameter failed: Wrong parameter type, expected 'Type.BOOL' got 'Type.STRING'\n"
+    replies = []
+    with patch('xparo.remote_ops.subprocess.run', return_value=_cli_result(stderr=refusal)) as run:
+        remote_ops.handle_set_ros2_param("/xparo", "record_bags", "maybe", "r1", replies.append)
+    result = replies[0]["SET_ROS2_PARAM_RESULT"]
+    assert result["success"] is False
+    assert "Wrong parameter type" in result["message"]
+    assert run.call_count == 1  # 'maybe' isn't a bool: no retry
+
+
+def test_set_param_retries_text_as_the_type_the_node_wants():
+    replies = []
+    with patch('xparo.remote_ops.subprocess.run', side_effect=[
+        _cli_result(stderr="Setting parameter failed: Wrong parameter type, expected 'Type.DOUBLE' got 'Type.INTEGER'"),
+        _cli_result(stdout="Set parameter successful"),
+    ]) as run:
+        remote_ops.handle_set_ros2_param("/cam", "gain", "5", "r2", replies.append)
+    assert run.call_args_list[1][0][0] == ["ros2", "param", "set", "/cam", "gain", "5.0"]
+    assert replies[0]["SET_ROS2_PARAM_RESULT"]["success"] is True
+
+
+def test_set_param_retries_for_a_cpp_node_too():
+    """rclcpp words the refusal differently from rclpy."""
+    replies = []
+    with patch('xparo.remote_ops.subprocess.run', side_effect=[
+        _cli_result(stderr="Setting parameter failed: Wrong parameter type, parameter {gain} is of type "
+                           "{double}, setting it to {integer} is not allowed."),
+        _cli_result(stdout="Set parameter successful"),
+    ]) as run:
+        remote_ops.handle_set_ros2_param("/cam", "gain", "5", "r3", replies.append)
+    assert run.call_args_list[1][0][0] == ["ros2", "param", "set", "/cam", "gain", "5.0"]
+    assert replies[0]["SET_ROS2_PARAM_RESULT"]["success"] is True
+
+
+def test_value_as_type_only_converts_honestly():
+    assert remote_ops._value_as_type("True", "BOOL") == "true"
+    assert remote_ops._value_as_type("0", "BOOL") == "false"
+    assert remote_ops._value_as_type("maybe", "BOOL") is None
+    assert remote_ops._value_as_type("7.0", "INTEGER") == "7"
+    assert remote_ops._value_as_type("7.5", "INTEGER") is None
+    assert remote_ops._value_as_type("1e20", "DOUBLE") == "1.0e+20"
+    assert remote_ops._value_as_type("nan", "DOUBLE") is None
+    assert remote_ops._value_as_type("123", "STRING") == '"123"'
 
 
 def test_list_rows_hide_secrets_and_mark_identity_params():

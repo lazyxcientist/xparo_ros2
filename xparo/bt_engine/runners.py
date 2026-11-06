@@ -6,6 +6,7 @@ sync_custom_node_files (not through plugin_loader.load_plugins' class-
 scanning, which is Python-source-specific) -- see that method's own
 docstring for the registration flow.
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -228,6 +229,8 @@ def make_javascript_node_factory(source_path, runtime_dir, output_keys):
 # compilation+execution against the real library, not assumed from docs).
 # ---------------------------------------------------------------------------
 
+# Beside a built C++ node: the hash of the code it was built from.
+CPP_BUILD_STAMP_SUFFIX = ".build_hash"
 _CPP_CLASS_RE = re.compile(r"class\s+(\w+)\s*:\s*public\s+BT::(?:SyncActionNode|ConditionNode)")
 
 # Real ROS2 installs always set ROS_DISTRO once the workspace's setup.bash
@@ -351,23 +354,37 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     header_path = os.path.join(build_dir, f"{node_name}.hpp")
     source_path = os.path.join(build_dir, f"{node_name}.cpp")
     executable_path = os.path.join(build_dir, node_name)
+    stamp_path = executable_path + CPP_BUILD_STAMP_SUFFIX
 
-    header_include = ""
+    header_include = f'#include "{node_name}.hpp"\n' if header_source.strip() else ""
+    full_source = header_include + source + _CPP_HOST_MAIN.format(class_name=class_name)
+    # Same code as the binary was built from: no g++ run. Every sync (each
+    # node save, each reconnect) used to rebuild every C++ node (NODESYNC-22).
+    build_hash = hashlib.sha256(f"{header_source}\0{full_source}\0{_ROS_LIB_DIR}".encode()).hexdigest()
+    try:
+        with open(stamp_path, "r") as file:
+            if file.read() == build_hash and os.path.exists(executable_path):
+                return executable_path, None
+    except OSError:
+        pass
+
     if header_source.strip():
         with open(header_path, "w") as file:
             file.write(header_source)
-        header_include = f'#include "{node_name}.hpp"\n'
     elif os.path.exists(header_path):
         os.remove(header_path)
 
     with open(source_path, "w") as file:
-        file.write(header_include + source + _CPP_HOST_MAIN.format(class_name=class_name))
+        file.write(full_source)
 
+    # Built beside the old binary and swapped in only on success, so a
+    # failed or timed-out rebuild leaves the previous build runnable.
+    new_executable_path = executable_path + ".new"
     compile_cmd = [
         "g++", "-std=c++17", source_path,
         "-I", _ROS_INCLUDE_DIR,
         "-L", _ROS_LIB_DIR, "-lbehaviortree_cpp",
-        "-o", executable_path,
+        "-o", new_executable_path,
     ]
     try:
         result = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=120)
@@ -378,6 +395,9 @@ def compile_cpp_node(source, header_source, build_dir, node_name):
     if result.returncode != 0:
         print(f"[bt_engine cpp runner] {node_name}: compile failed:\\n{result.stderr[-2000:]}")
         return None, result.stderr[-500:]
+    os.replace(new_executable_path, executable_path)
+    with open(stamp_path, "w") as file:
+        file.write(build_hash)
     return executable_path, None
 
 

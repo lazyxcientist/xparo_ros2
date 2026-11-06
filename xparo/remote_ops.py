@@ -11,9 +11,12 @@ see transports/base.py) without caring which one delivered the message --
 that's the actual point of Phase 2's Transport abstraction.
 """
 import base64
+import json
 import math
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,6 +37,9 @@ RUN_COMMAND_MAX_LINES = 50
 MAX_COMMAND_MAX_LINES = 1000
 DEFAULT_COMMAND_TIMEOUT_SEC = 30.0
 MAX_COMMAND_TIMEOUT_SEC = 300.0
+# Hard cap on one COMMAND_RESULT's output, whatever max_lines says.
+MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
+KILL_COLLECT_TIMEOUT_SEC = 2.0
 
 
 def clamp_command_timeout(value):
@@ -61,21 +67,33 @@ def handle_run_command(command, request_id, timeout, send_response, max_lines=No
     that can't afford to block their dispatch loop must run this in its
     own thread (engine.py's on_ws_message does exactly that, one thread
     per command, matching the original).
+
+    The command runs in its own session (process group) so a timeout
+    kills everything it started, not just the /bin/sh wrapper -- killing
+    only the shell left `sleep 1000` (or a motor test, or a `ros2 topic
+    pub`) running orphaned while the dashboard said "killed" (2026-11
+    field test RO-2). Output is read as bytes and decoded leniently: one
+    non-UTF-8 byte used to throw away the whole output and the real exit
+    code (RO-3).
     """
     max_lines = clamp_command_max_lines(max_lines) if max_lines is not None else RUN_COMMAND_MAX_LINES
     timed_out = False
     exit_code = None
     try:
-        proc = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout,
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        exit_code = proc.returncode
-        output = (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        stdout = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        stderr = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-        output = f"{stdout}{stderr}\n[killed - exceeded {timeout:.0f}s timeout]"
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_group(proc)
+            stdout, stderr = _collect_after_kill(proc)
+        output = _decode_output(stdout) + _decode_output(stderr)
+        if timed_out:
+            output += f"\n[killed - exceeded {timeout:.0f}s timeout]"
     except Exception as e:
         output = f"Failed to run command: {e}"
 
@@ -83,6 +101,17 @@ def handle_run_command(command, request_id, timeout, send_response, max_lines=No
     truncated = len(lines) > max_lines
     if truncated:
         lines = lines[-max_lines:]
+    output = "\n".join(lines)
+
+    # The line cap alone doesn't bound the size: one 3 MB line (minified
+    # JSON, base64, a log with no newlines) went out whole and the server
+    # dropped the robot's whole connection over it (RO-1). Keep the tail,
+    # like the line cap does.
+    encoded = output.encode("utf-8")
+    if len(encoded) > MAX_COMMAND_OUTPUT_BYTES:
+        truncated = True
+        tail = encoded[-MAX_COMMAND_OUTPUT_BYTES:].decode("utf-8", "ignore")
+        output = f"[output cut to its last {MAX_COMMAND_OUTPUT_BYTES // 1024} KB]\n" + tail
 
     send_response({"COMMAND_RESULT": {
         "request_id": request_id,
@@ -90,10 +119,41 @@ def handle_run_command(command, request_id, timeout, send_response, max_lines=No
         "success": (exit_code == 0) and not timed_out,
         "exit_code": exit_code,
         "timed_out": timed_out,
-        "output": "\n".join(lines),
+        "output": output,
         "truncated": truncated,
         "max_lines": max_lines,
     }})
+
+
+def _decode_output(data):
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return data or ""
+
+
+def _kill_process_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except OSError:
+        proc.kill()
+
+
+def _collect_after_kill(proc):
+    """Whatever the command printed before it was killed. Bounded: a
+    child that moved itself to another session (setsid/nohup daemon) can
+    keep the pipes open forever, and that must not hang this thread."""
+    try:
+        return proc.communicate(timeout=KILL_COLLECT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except Exception:
+                pass
+        proc.wait()
+        return b"", b""
 
 
 # ----------------------------------------------------------------------
@@ -277,9 +337,14 @@ def handle_list_ros2_params(node, send_response):
     params = []
     errors = []
     try:
+        # Hidden nodes (a leading underscore -- e.g. the `_ros2cli_daemon_*`
+        # every `ros2` CLI call starts) are ROS internals, not the robot's:
+        # dumping them fails "Node not found" and showed customers a red
+        # "1 node couldn't be read" (RO-10).
         node_names = sorted(
             (ns.rstrip('/') + '/' + name if ns not in ('', '/') else '/' + name)
             for name, ns in node.get_node_names_and_namespaces()
+            if not name.startswith('_')
         )
     except Exception as e:
         send_response({"ROS2_PARAMS": {"params": [], "errors": [f"could not list nodes: {e}"]}})
@@ -334,6 +399,59 @@ def redact_param(param):
     return out
 
 
+# rclpy: "Wrong parameter type, expected 'Type.DOUBLE' got 'Type.INTEGER'"
+# rclcpp: "Wrong parameter type, parameter {gain} is of type {double},
+#          setting it to {integer} is not allowed."
+_WRONG_TYPE_RE = re.compile(r"expected '?Type\.(\w+)'?|is of type \{(\w+)\}")
+
+
+def _wanted_type(message):
+    match = _WRONG_TYPE_RE.search(message or "")
+    return (match.group(1) or match.group(2)).upper() if match else None
+
+
+def _ros2_param_set(node_name, param_name, value_text):
+    """`ros2 param set` exits 0 even when the node refuses the value (it
+    only prints "Setting parameter failed: ..." to stderr), so success is
+    read from its output, not its exit code -- a refused set used to come
+    back success:true with the refusal as the message (RO-9)."""
+    result = subprocess.run(
+        ["ros2", "param", "set", node_name, param_name, value_text],
+        capture_output=True, text=True, timeout=SET_PARAM_TIMEOUT_SEC,
+    )
+    message = ((result.stdout or "") + (result.stderr or "")).strip()
+    success = result.returncode == 0 and (result.stdout or "").strip().startswith("Set parameter successful")
+    return success, message
+
+
+def _value_as_type(value, type_name):
+    """`value` written so `ros2 param set` parses it as `type_name` (BOOL,
+    INTEGER, DOUBLE, STRING), or None when it can't honestly be one."""
+    text = str(value).strip()
+    if type_name == "BOOL":
+        low = text.lower()
+        if low in ("true", "1", "yes", "on"):
+            return "true"
+        if low in ("false", "0", "no", "off"):
+            return "false"
+        return None
+    if type_name in ("INTEGER", "DOUBLE"):
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(number):
+            return None
+        if type_name == "INTEGER":
+            return str(int(number)) if number.is_integer() else None
+        out = repr(number)
+        # YAML (which the CLI parses with) reads "1e+20" as a string.
+        return out.replace("e", ".0e") if "e" in out and "." not in out else out
+    if type_name == "STRING":
+        return json.dumps(text)  # a quoted YAML scalar always stays a string
+    return None
+
+
 def handle_set_ros2_param(node_name, param_name, value, request_id, send_response):
     """Runs `ros2 param set` as an argv list, deliberately NOT shell=True
     -- node_name/param_name/value all arrive over the network."""
@@ -344,12 +462,16 @@ def handle_set_ros2_param(node_name, param_name, value, request_id, send_respons
         }})
         return
     try:
-        result = subprocess.run(
-            ["ros2", "param", "set", node_name, param_name, str(value)],
-            capture_output=True, text=True, timeout=SET_PARAM_TIMEOUT_SEC,
-        )
-        success = result.returncode == 0
-        message = (result.stdout or "") + (result.stderr or "")
+        success, message = _ros2_param_set(node_name, param_name, str(value))
+        # The dashboard's text box always sends text, and `ros2 param set`
+        # guesses the type from it ("5" is an int, "maybe" a string), so a
+        # double param can't take "5" and a string param can't take "123".
+        # The node's own refusal names the type it wants: retry once with
+        # the value written as that type.
+        wanted = _wanted_type(message) if not success else None
+        retry_value = _value_as_type(value, wanted) if wanted else None
+        if retry_value is not None and retry_value != str(value):
+            success, message = _ros2_param_set(node_name, param_name, retry_value)
     except subprocess.TimeoutExpired:
         success = False
         message = f"set_param timed out after {SET_PARAM_TIMEOUT_SEC:.0f}s"
@@ -387,10 +509,25 @@ def get_rosbag_status(rosbag_control):
     process_detected = is_any_rosbag_process_running()
     if rosbag_control is None:
         return {"state": "unavailable", "recorder_alive": False, "process_detected": process_detected}
-    return {
+    status = {
         "state": rosbag_control.state, "recorder_alive": rosbag_control.recorder_alive,
         "process_detected": process_detected,
     }
+    # Say why Start can't work rather than leave the panel at "Unknown"
+    # with no reason (RO-8). A recorder whose services are up but whose
+    # state hasn't settled yet is not "missing".
+    client = getattr(rosbag_control, "is_discovery_client", None)
+    recorder_up = rosbag_control.recorder_alive or (client is not None and client.service_is_ready())
+    if not recorder_up and not process_detected:
+        status["no_recorder"] = True
+        status["message"] = NO_RECORDER_MESSAGE
+    return status
+
+
+NO_RECORDER_MESSAGE = (
+    "No rosbag2 recorder is running on this robot, so recording can't start. "
+    "Launch it with record_bags:=true (or run `ros2 bag record` on the robot)."
+)
 
 
 def handle_rosbag_action(rosbag_control, action, send_response):

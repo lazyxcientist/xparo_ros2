@@ -46,7 +46,12 @@ Confirmed interfaces (from the original's bench testing):
   IsDiscoveryRunning.srv   : (empty)     ---  bool running
 
 State determination (two-signal check):
-  discovery.running == False                        -> CLOSED
+  discovery.running == False, is_paused.paused == True  -> CLOSED
+  discovery.running == False, is_paused.paused == False -> WRITING
+      (RO-17: a named-topics `ros2 bag record /a /b` stops discovery once
+      every topic is subscribed and keeps writing; an open-but-paused
+      named-topics session reads CLOSED, and handle_start resumes it
+      when Record answers 'already recording')
   discovery.running == True, is_paused.paused == True  -> PAUSED
   discovery.running == True, is_paused.paused == False -> WRITING
 
@@ -357,8 +362,23 @@ class RosbagControl:
                 return
 
             if not discovery_res.running:
-                # No open session.
-                self._set_state(CLOSED, on_done)
+                # No discovery is not "no session": a `ros2 bag record
+                # /a /b` (named topics) stops discovering once every topic
+                # is subscribed and keeps writing (RO-17, checked live on
+                # Jazzy). A closed recorder is always paused (stop()
+                # pauses), so not paused here means writing.
+                if not self.is_paused_client.service_is_ready():
+                    self._set_state(CLOSED, on_done)
+                    return
+
+                def _closed_or_writing(pf):
+                    try:
+                        paused = pf.result().paused
+                    except Exception:
+                        paused = True
+                    self._set_state(CLOSED if paused else WRITING, on_done)
+
+                self.is_paused_client.call_async(IsPaused.Request()).add_done_callback(_closed_or_writing)
                 return
 
             # Session is open -- now check whether it's actively writing.
@@ -477,6 +497,13 @@ class RosbagControl:
         )
 
         def on_record_response(res):
+            if res.return_code != 0 and 'already recording' in (res.error_string or ''):
+                # A named-topics session that is open but paused reads the
+                # same as a closed one (see resync): resume it instead.
+                self.node.get_logger().info('A session is already open -- resuming it.')
+                self._call(self.resume_client, Resume.Request(), 'resume',
+                           on_ok=lambda: self._verify_after(WRITING, 'Recording resumed.'))
+                return
             if res.return_code != 0:
                 self.node.get_logger().error(f'Record REJECTED: {res.error_string}. State left as-is.')
                 self.resync()

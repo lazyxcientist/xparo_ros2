@@ -107,6 +107,17 @@ def _blackboard_diff(before, after):
     return {"added": added, "changed": changed, "removed": removed}
 
 
+def ignored_overrides_note(names):
+    """What a run says about /xparo/run_task override_params that match no
+    param of the task (KUNAL-25): they used to be dropped without a word."""
+    listed = ", ".join(repr(name) for name in names)
+    if len(names) > 1:
+        return (f"override_params {listed} were ignored: this task has no params with those names -- add them "
+                f"under Params in the task form and map the tree's inputs to them.")
+    return (f"override_params {listed} was ignored: this task has no param named {listed} -- add it under "
+            f"Params in the task form and map the tree's input to it.")
+
+
 def result_message(task_id, run_id, outcome, error, explanation="", **extra):
     """A TASK_RESULT for a run that never started (no executor, unknown
     task, empty tree) -- same shape as a real one."""
@@ -136,7 +147,21 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         "tree_name": tree_name,
         "trigger": val.get("trigger") or "",
         "attempt": val.get("attempt") or 1,
+        # Stage versions (dashboard History -> Stages): the stage whose
+        # marked version ran ('' = the working copy), that saved version's
+        # id and time, and the hash of the tree. They flow into
+        # TASK_STARTED, TASK_RESULT and Task history. Older dashboards
+        # don't send them.
+        "tree_stage": val.get("tree_stage") or "",
+        "tree_version": val.get("tree_version") or "",
+        "tree_version_at": val.get("tree_version_at") or "",
+        "tree_hash": val.get("tree_hash") or "",
     }
+    if val.get("tree_version") or val.get("verified_bundle"):
+        # A marked version: its SubTrees all came with it (the dashboard's
+        # payload, or the checked hidden copies). Never load a SubTree from
+        # disk for it -- that would be a working copy.
+        subtree_resolver = None
     # Unknown/missing stage (a stale locally-cached task from before this
     # feature, or a malformed dispatch) is treated as "development" -- NOT
     # "production". This is the task's own stage, the opposite direction
@@ -205,7 +230,13 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         event.wait(min(delay, 300))
 
     try:
-        if not tree_xml.strip():
+        if val.get("tree_error"):
+            # The task's tree no longer exists, or this robot's copy of a
+            # marked version is missing/changed (the sentence says). Checked after
+            # the stage check: a robot that may not run the stage still says
+            # stage_mismatch first. invalid_tree is never retried.
+            report = make_report("invalid_tree", str(val["tree_error"]), blackboard, run_id)
+        elif not tree_xml.strip():
             where = f"Behaviour tree {tree_name!r}" if tree_name else "The project's main behaviour tree"
             report = make_report("invalid_tree", (
                 f"{where} is empty or missing on this robot -- open it in the Behaviour editor, add nodes "
@@ -226,6 +257,11 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
     failed = report.get("failed_node")
     if report.get("outcome") == "failed" and failed:
         report["explanation"] = f"The tree finished with FAILURE at {failed['name']} ({failed['tag']}): {failed['reason']}."
+    ignored_overrides = list(val.get("ignored_overrides") or [])
+    if ignored_overrides:
+        # next to the failure it likely caused ("'location' ... resolved to None")
+        report["explanation"] = " ".join(filter(None, [report.get("explanation", ""),
+                                                       ignored_overrides_note(ignored_overrides)]))
 
     final_blackboard = _json_safe(report.get("blackboard") or {})
     report["blackboard"] = final_blackboard
@@ -256,6 +292,7 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         "user_message": user_message,
         "failed_node": report.get("failed_node"),
         "stats": report.get("stats") or {},
+        **({"ignored_override_params": ignored_overrides} if ignored_overrides else {}),
         **context,
     }})
 
@@ -270,7 +307,9 @@ def handle_run_task(executor, val, send_response, add_task_history=None, xparo_s
         history_report = {k: v for k, v in report.items() if k not in ("blackboard",)}
         add_task_history({
             "input_data": {"task_id": task_id, "run_id": run_id, "blackboard": _json_safe(blackboard),
-                           "stage": task_stage, "timeout_s": timeout_s, **context},
+                           "stage": task_stage, "timeout_s": timeout_s, **context,
+                           # the dashboard's run report names them (KUNAL-28)
+                           **({"ignored_override_params": ignored_overrides} if ignored_overrides else {})},
             "output_data": {"success": success, "blackboard": final_blackboard, "duration_s": duration_s,
                             "outcome": outcome, "error": report.get("error", ""), "report": _json_safe(history_report)},
             "type": "bt_task",

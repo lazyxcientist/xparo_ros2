@@ -1,6 +1,5 @@
 """_derive_source_folder (launch/xparo_launch.py) -- bidirectional file
-sync (see /home/scientist/.claude/plans/breezy-splashing-koala.md): a
-"local" launch (developing against a local Django server, this exact
+sync: a "local" launch (developing against a local Django server, this exact
 machine/checkout -- xparo_environment's own existing meaning) should sync
 custom_behaviors/custom_envs content into the real, git-tracked SOURCE
 tree the owner actually hand-edits, not only ever the colcon-generated

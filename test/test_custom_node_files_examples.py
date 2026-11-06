@@ -1,5 +1,4 @@
-"""Bidirectional file sync (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md, Part 1): the 8 git-tracked example custom node
+"""Bidirectional file sync: the 8 git-tracked example custom node
 files (one Action + one Condition per language) register with ZERO Django
 connection -- exactly the real files this repo ships under
 custom_behaviors/custom_node_files/, exercised end to end (real subprocess/

@@ -297,6 +297,53 @@ def test_handle_stop_from_writing_calls_stop():
     assert len(control.stop_client.calls) == 1
 
 
+class TestNamedTopicsRecording:
+    """RO-17: `ros2 bag record /joy /diagnostics` stops topic discovery once
+    both topics are subscribed and keeps writing -- checked live on Jazzy:
+    is_discovery_running False + is_paused False while writing; after Stop
+    False + True; Record while open -> return_code 1 'Recorder is already
+    recording.'. The panel said "Not recording" and Stop/Save were off."""
+
+    def test_a_recording_whose_discovery_stopped_is_writing_not_closed(self):
+        control = _make_control()
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.is_paused_client.queue_response(_paused_response(False))
+
+        control.resync()
+
+        assert control.state == WRITING
+
+    def test_stop_acts_on_it(self):
+        control = _make_control()
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.is_paused_client.queue_response(_paused_response(False))
+        control.resync()
+
+        control.handle_stop()
+
+        assert len(control.stop_client.calls) == 1
+
+    def test_a_stopped_recorder_is_still_closed(self):
+        control = _make_control()
+        control.is_discovery_client.queue_response(_discovery_response(False))
+        control.is_paused_client.queue_response(_paused_response(True))
+
+        control.resync()
+
+        assert control.state == CLOSED
+
+    def test_start_on_an_open_paused_session_resumes_it(self):
+        control = _make_control()
+        assert control.state == CLOSED
+        control.record_client.queue_response(
+            FakeFuture(result=MagicMock(return_code=1, error_string='Recorder is already recording.'))
+        )
+
+        control.handle_start()
+
+        assert len(control.resume_client.calls) == 1
+
+
 def test_split_disabled_via_control_cb_never_reaches_split_client():
     control = _make_control()
     msg = MagicMock(data='split')

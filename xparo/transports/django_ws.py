@@ -31,6 +31,25 @@ DEFAULT_ENVIRONMENT = "production"
 RECONNECT_DELAY_SECONDS = 5
 MAX_RECONNECT_DELAY_SECONDS = 60
 
+# The close code the server ends a connection with when it refuses to
+# serve it after the handshake opened (consumers_API.py: a retired robot,
+# robot_credential_required, a serial already online, a revoked key). Such
+# a connection opened, but it is a failed attempt for the backoff -- reset
+# to 5 s, a retired robot re-handshook every 5 s forever.
+SERVER_REFUSED_CLOSE_CODE = 4403
+
+
+def _close_code_of(frame):
+    """The status code of a websocket close frame (opcode 8: the first two
+    payload bytes, big-endian), or None."""
+    try:
+        data = frame.data
+        if getattr(frame, 'opcode', None) == 8 and data and len(data) >= 2:
+            return int.from_bytes(bytes(data[:2]), 'big')
+    except Exception:
+        pass
+    return None
+
 # "hybrid" connection_type: roughly how many of websocket-client's own
 # reconnect cycles (each RECONNECT_DELAY_SECONDS apart) to let pass before
 # falling back to REST polling. Framed as a cycle count rather than a raw
@@ -61,7 +80,7 @@ class DjangoWsTransport(Transport):
 
     def __init__(self, secret_key, project_id, on_message, on_connected=None,
                  connection_type="websocket", environment=None,
-                 on_persisted_credential_rejected=None):
+                 on_persisted_credential_rejected=None, on_project_key_rejected=None):
         super().__init__(on_message, on_connected)
         self.connection_type = connection_type
         # Backing store for the websocket_connected property below -- used
@@ -83,6 +102,10 @@ class DjangoWsTransport(Transport):
         # engine.py only wires the callback above for a persisted
         # ROBOT_CREDENTIAL, so its presence is that distinction.
         self.secret_kind = "this robot's own credential" if on_persisted_credential_rejected else "the project secret key"
+        # The other way round: a 403 on the project secret key (deleted, or
+        # the robot is retired), for a robot that has its own credential to
+        # go back to -- engine.py tries that again after a wait (CHAOS-23).
+        self.on_project_key_rejected = on_project_key_rejected
         self.project_id = project_id
         # _run_websocket_loop bookkeeping: close() sets _closed and _stop
         # (the loop's between-attempts wait is interruptible, so a close()
@@ -91,6 +114,10 @@ class DjangoWsTransport(Transport):
         self._closed = False
         self._stop = threading.Event()
         self._opened = False
+        self._refused = False
+        # Open socket the server hasn't accepted yet -- on_server_accepted
+        # prints the LIVE banner once per connection, on_ws_close clears it.
+        self._awaiting_acceptance = False
 
         environment = environment or DEFAULT_ENVIRONMENT
         is_local = environment == "local"
@@ -101,8 +128,24 @@ class DjangoWsTransport(Transport):
         # separately for XP_Database's BlackboxOrchestrator, which uploads
         # against a different path on the same host.
         self.website_base_url = website_url
-        self.website_full_url = website_url +'/chatbot_api/'+secret_key+'/'+project_id+'/'
-        self.socket_full_url = socket_url + '/ws/chatbot_api/'+str(secret_key)+'/'+str(project_id)+'/'
+        self._socket_base_url = socket_url
+        self._set_secret(secret_key)
+
+    def _set_secret(self, secret_key):
+        self.website_full_url = self.website_base_url +'/chatbot_api/'+str(secret_key)+'/'+str(self.project_id)+'/'
+        self.socket_full_url = self._socket_base_url + '/ws/chatbot_api/'+str(secret_key)+'/'+str(self.project_id)+'/'
+
+    def use_credential_for_reconnects(self, credential, on_rejected):
+        """The server just issued this robot its own credential: every later
+        handshake of this transport presents it (the open connection is
+        kept). Reconnects used to sign in with the project secret key again,
+        be told robot_credential_required and swap 5 s later -- a sign-in
+        error on the server each time (CHAOS-16). on_rejected is the same
+        403 fallback a transport started from a saved credential gets."""
+        self._set_secret(credential)
+        self.on_persisted_credential_rejected = on_rejected
+        self.on_project_key_rejected = None
+        self.secret_kind = "this robot's own credential"
 
     @property
     def websocket_connected(self):
@@ -129,7 +172,7 @@ class DjangoWsTransport(Transport):
     def connect(self):
         print('''
 
-        connencting to ...
+        connecting to ...
         ██╗░░██╗██████╗░░█████╗░██████╗░░█████╗░
         ╚██╗██╔╝██╔══██╗██╔══██╗██╔══██╗██╔══██╗
         ░╚███╔╝░██████╔╝███████║██████╔╝██║░░██║
@@ -138,7 +181,6 @@ class DjangoWsTransport(Transport):
         ╚═╝░░╚═╝╚═╝░░░░░╚═╝░░╚═╝╚═╝░░╚═╝░╚════╝░
 
         ''')
-        print("the AI Engine")
         # "hybrid" opens a websocket exactly like "websocket" does -- the
         # only difference is _hybrid_watchdog_loop, started below, which
         # falls back to REST polling if it stays down too long.
@@ -189,6 +231,7 @@ class DjangoWsTransport(Transport):
         failures = 0
         while not self._closed:
             self._opened = False
+            self._refused = False
             self.ws = Xparo_socket(str(self.socket_full_url),
                             on_message=self.on_message,
                             on_error=self.on_ws_error,
@@ -198,7 +241,7 @@ class DjangoWsTransport(Transport):
             self.ws.run_forever()
             if self._closed:
                 break
-            failures = 0 if self._opened else failures + 1
+            failures = 0 if self._opened and not self._refused else failures + 1
             delay = min(RECONNECT_DELAY_SECONDS * 2 ** max(failures - 1, 0), MAX_RECONNECT_DELAY_SECONDS)
             print(f"reconnecting to the XPARO server in {delay} s ...")
             if self._stop.wait(delay):
@@ -307,6 +350,14 @@ class DjangoWsTransport(Transport):
                 callback = self.on_persisted_credential_rejected
                 self.on_persisted_credential_rejected = None
                 callback()
+            elif self.on_project_key_rejected is not None:
+                # Back to the robot's own credential after a wait: a Restore
+                # (or an unfrozen key) used to need a restart on site while
+                # this key kept getting its 403 (CHAOS-23). Once per
+                # transport, like the swap above.
+                callback = self.on_project_key_rejected
+                self.on_project_key_rejected = None
+                callback()
             return
         if status is not None:
             hint = ("check xparo_project_id -- the server knows no such project." if status == 404
@@ -315,7 +366,12 @@ class DjangoWsTransport(Transport):
             return
         if not isinstance(error, BaseException):
             # websocket-client hands the server's own close frame here
-            # when the server ends the connection (a deploy, a key change).
+            # when the server ends the connection (a deploy, a key change),
+            # and then calls on_close(None, None) -- so the close code (4403
+            # = refused) has to be read from this frame or the refusal
+            # backoff never happens and a retired robot re-handshakes every
+            # 5 s (found 2026-11-03 against websocket-client 1.9.0).
+            self._last_close_code = _close_code_of(error)
             print("The XPARO server closed the connection -- reconnecting.")
             return
         if isinstance(error, websocket.WebSocketConnectionClosedException):
@@ -333,18 +389,35 @@ class DjangoWsTransport(Transport):
         self.websocket_connected = True
         self._opened = True  # resets _run_websocket_loop's backoff
         self.rest_fallback_active = False  # no-op unless hybrid fallback was active
+        # Open is not accepted: the server still checks which robot this is
+        # (on_connected sends ADD_robots_info) and may refuse it -- retired,
+        # credential required, serial in use. The LIVE banner used to print
+        # here, right before every refusal (AARAV-16 / SANDEEP-13).
+        self._awaiting_acceptance = True
+        print(f"Connected to the XPARO server at {self.server_host} -- waiting for it to accept this robot ...")
+        self.on_connected()
+
+    def on_server_accepted(self):
+        """engine.py calls this when the server accepts this robot (its
+        reply to ADD_robots_info); later replies on the same connection
+        and anything after it closed are ignored."""
+        if not self._awaiting_acceptance:
+            return
+        self._awaiting_acceptance = False
         print('''
         \\\\Connection Successful//
            \\\\X.P.A.R.O remote//
             \\\\is 🄻🄸🅅🄴 now//
         ''')
-        self.on_connected()
 
     def on_ws_close(self, ws, *args):
         self.websocket_connected = False
+        self._awaiting_acceptance = False
         # (close_status_code, close_reason) when the server sent a close
         # frame -- e.g. 4403 is "your key/credential was revoked".
-        code = args[0] if args else None
+        code = args[0] if args and args[0] is not None else getattr(self, '_last_close_code', None)
+        self._last_close_code = None
+        self._refused = code == SERVER_REFUSED_CLOSE_CODE  # backs _run_websocket_loop off
         print(f'''
 
             xparo brain is
@@ -366,8 +439,13 @@ class DjangoWsTransport(Transport):
         """
         fallback_threshold_seconds = MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK * RECONNECT_DELAY_SECONDS
         disconnected_since = None
-        while True:
-            time.sleep(RECONNECT_DELAY_SECONDS)
+        while not self._closed:
+            # Ends with close(): a transport the engine swapped out (credential
+            # <-> project key, which repeats for as long as both are refused)
+            # used to keep this loop running, start REST polling on its old
+            # key and poll it every 2 s forever -- one more poller per swap.
+            if self._stop.wait(RECONNECT_DELAY_SECONDS) or self._closed:
+                return
             if self.websocket_connected:
                 disconnected_since = None
                 continue
@@ -380,7 +458,7 @@ class DjangoWsTransport(Transport):
     def _hybrid_rest_fallback_loop(self):
         print(f"hybrid mode: websocket has been down for over {MAX_CONSECUTIVE_WS_FAILURES_BEFORE_REST_FALLBACK} "
               "reconnect attempts -- falling back to REST polling until it recovers")
-        while self.rest_fallback_active:
+        while self.rest_fallback_active and not self._closed:
             try:
                 response = requests.get(self.website_full_url)
                 if response.status_code == 201:

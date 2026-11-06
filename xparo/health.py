@@ -24,6 +24,14 @@ _RANK = {'ok': 0, 'warn': 1, 'stale': 2, 'error': 3, 'fatal': 4}
 MAX_ENTRIES = 300
 MAX_MESSAGE_CHARS = 2000
 
+# Sent in the robot info (data["health"], database.py) so the dashboard
+# knows how this package reports problems. stale_keeps_error: a component
+# that goes STALE (silent) while in a problem keeps that problem active
+# until it reports OK (ROSAPI-20). Older packages marked it inactive, so
+# the dashboard still treats "inactive error + active STALE row" as
+# "went silent" for a robot that doesn't send this.
+CAPABILITIES = {"stale_keeps_error": True}
+
 
 def problem_id(source, name, level, message):
     raw = f"{source}\x1f{name}\x1f{level}\x1f{message}".encode('utf-8', 'replace')
@@ -62,6 +70,19 @@ class ProblemTracker:
             if not entry['active']:
                 entry['active'] = True
                 self._dirty.add(entry_id)
+            return
+        if level == 'stale':
+            # Gone silent says nothing about the problem it was in: only an
+            # OK resolves that (ROSAPI-20, R3 review) -- STALE used to mark
+            # the error inactive, i.e. "resolved" with no OK ever seen.
+            self._set_component_inactive(name, only_level='stale')
+            self._occurrence('diagnostics', name, level, message, active=True, hardware_id=hardware_id)
+            return
+        entry = self._entries.get(entry_id)
+        if previous is not None and previous[0] == 'stale' and entry is not None and entry['active']:
+            # Back from silence in the problem it never left: not a new occurrence.
+            self._set_component_inactive(name, keep=entry_id)
+            entry['last_seen'] = self._clock()
             return
         # A different problem for the same component replaces the old one
         # as "the active one".
@@ -114,9 +135,10 @@ class ProblemTracker:
         self._pending[entry_id] = self._pending.get(entry_id, 0) + 1
         self._dirty.add(entry_id)
 
-    def _set_component_inactive(self, name):
+    def _set_component_inactive(self, name, only_level=None, keep=None):
         for entry_id, entry in self._entries.items():
-            if entry['source'] == 'diagnostics' and entry['name'] == name and entry['active']:
+            if entry['source'] == 'diagnostics' and entry['name'] == name and entry['active'] \
+                    and entry_id != keep and only_level in (None, entry['level']):
                 entry['active'] = False
                 self._dirty.add(entry_id)
 

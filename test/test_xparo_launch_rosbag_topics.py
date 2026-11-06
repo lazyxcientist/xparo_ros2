@@ -77,8 +77,12 @@ class TestRosbagRecordTopicArgs:
 
         assert xparo_launch._rosbag_record_topic_args(str(tmp_path)) == '-a'
 
-    def test_rosbag_storage_options_are_distro_aware(self, xparo_launch):
-        assert xparo_launch.get_rosbag_storage_args('jazzy') == [
-            '--storage', 'mcap', '--compression-mode', 'file', '--compression-format', 'zstd'
-        ]
-        assert xparo_launch.get_rosbag_storage_args('humble') == ['--storage', 'sqlite3']
+    def test_the_recorder_writes_the_mcap_files_the_blackbox_uploads(self):
+        """XPARO runs on ROS 2 Jazzy only (docs/robot/install.rst), and
+        blackbox_manager uploads *.mcap / *.mcap.zstd bags. This test used to
+        call a get_rosbag_storage_args(distro) that was never written: a
+        Humble/sqlite3 path whose bags the blackbox could not have found."""
+        with open(LAUNCH_FILE, encoding='utf-8') as f:
+            source = f.read()
+        assert '--storage mcap' in source
+        assert '--compression-mode file --compression-format zstd' in source

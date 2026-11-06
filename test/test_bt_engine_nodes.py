@@ -1,5 +1,4 @@
-"""Behaviour Tree redesign Phase 10 (see /home/scientist/.claude/plans/
-breezy-splashing-koala.md): concrete leaf node implementations.
+"""Behaviour Tree redesign Phase 10: concrete leaf node implementations.
 FakeClient/FakeFuture below mirror test_rosbag_control.py's own fake-ROS
 harness (a minimal add_done_callback-free stand-in), not imported from
 there since each test file in this repo is self-contained by convention.

@@ -13,8 +13,7 @@ ROS_DISTRO = os.environ.get("ROS_DISTRO", "").lower()
 
 
 def _derive_source_folder(install_share_dir, subfolder):
-    """Bidirectional file sync (see /home/scientist/.claude/plans/breezy-
-    splashing-koala.md): a "local" launch (this exact machine, developing
+    """Bidirectional file sync: a "local" launch (this exact machine, developing
     against a local Django server -- xparo_environment's own existing
     meaning) means custom_behaviors/custom_envs content should land in the
     real, git-tracked SOURCE tree the owner actually hand-edits, not only
