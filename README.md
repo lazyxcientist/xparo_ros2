@@ -57,7 +57,7 @@ production tasks.
 |---|---|
 | [Install and run](https://xparo.in/docs/robot/install.html) | Step by step, with the messages you should see |
 | [Configuration](https://xparo.in/docs/robot/configuration.html) | Every launch parameter, with a command builder |
-| [ROS 2 topics](https://xparo.in/docs/robot/topics.html) | `/xparo/ask`, `/xparo/run_task`, `/joy`, ... |
+| [ROS 2 topics](https://xparo.in/docs/robot/topics.html) | `/xparo/ask`, `/xparo/ask_task`, `/xparo/run_task`, `/joy`, ... |
 | [Behaviour trees](https://xparo.in/docs/robot/behaviour-trees.html) | Nodes, expressions and run results |
 | [Custom nodes](https://xparo.in/docs/robot/custom-nodes.html) | Python, C++, JavaScript and Bash nodes |
 | [Troubleshooting](https://xparo.in/docs/robot/troubleshooting.html) | When the robot doesn't show up |
